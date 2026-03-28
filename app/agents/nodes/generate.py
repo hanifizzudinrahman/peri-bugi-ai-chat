@@ -33,12 +33,12 @@ def _build_system_prompt(state: AgentState) -> str:
     )
 
     ctx = state.get("user_context", {})
-    user = ctx.get("user", {})
-    child = ctx.get("child", {})
+    user = ctx.get("user") or {}
+    child = ctx.get("child") or {}
 
     user_name = user.get("nickname") or user.get("full_name") or "Bunda/Ayah"
     child_name = child.get("nickname") or child.get("full_name") or "si kecil"
-    child_age = f"{child.get('age_years', '?')} tahun" if child else "?"
+    child_age = f"{child.get('age_years', '?')} tahun" if child.get("age_years") else "?"
 
     system = persona.replace("{user_name}", user_name)
     system = system.replace("{child_name}", child_name)
@@ -214,5 +214,5 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
 
 def _get_child_name(state: AgentState) -> str:
     ctx = state.get("user_context", {})
-    child = ctx.get("child", {})
+    child = ctx.get("child") or {}
     return child.get("nickname") or child.get("full_name") or "si kecil"
