@@ -56,12 +56,10 @@ async def run_agent(initial_state: AgentState) -> AsyncIterator[str]:
         if intent == "dental_qa":
             async for event in retrieve_node(state):
                 yield event
-            async for event in check_clarification_node(state):
-                yield event
+            await check_clarification_node(state)
 
         elif intent == "context_query":
-            async for event in check_clarification_node(state):
-                yield event
+            await check_clarification_node(state)
 
         elif intent == "image":
             async for event in image_node(state):
