@@ -1,0 +1,36 @@
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# LangGraph + LangChain
+langgraph==0.2.60
+langchain==0.3.13
+langchain-core==0.3.28
+langchain-community==0.3.13
+langchain-ollama==0.2.2        # Ollama (dev lokal)
+langchain-google-genai==2.0.8  # Gemini (production)
+langchain-openai==0.2.14       # OpenAI (production)
+
+# Vector store
+qdrant-client==1.12.1
+langchain-qdrant==0.2.0
+
+# HTTP client (untuk call peri-bugi-api-cv)
+httpx==0.27.2
+
+# PDF processing (untuk ingest knowledge base)
+pypdf==5.1.0
+langchain-text-splitters==0.3.3
+
+# Embeddings
+sentence-transformers==3.3.1   # local embedding (dev)
+
+# Config & validation
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+
+# Utilities
+python-jose[cryptography]==3.3.0  # JWT verify (internal secret)
+tenacity==9.0.0                   # retry logic
+structlog==24.4.0                 # structured logging

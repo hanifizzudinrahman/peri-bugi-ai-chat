@@ -1,0 +1,153 @@
+"""
+Node: router
+Klasifikasi intent user dengan pendekatan hybrid:
+1. Rule-based keyword matching (instant, zero latency)
+2. Fallback ke LLM classify jika tidak ada keyword match
+
+Intent yang didukung:
+- dental_qa           : pertanyaan umum kesehatan gigi
+- context_query       : tanya tentang data anak/brushing/scan milik user
+- image               : user kirim gambar atau minta analisis foto
+- clarification_answer: user menjawab checkpoint klarifikasi sebelumnya
+- smalltalk           : sapaan, pertanyaan umum, basa-basi
+"""
+import re
+from typing import AsyncIterator
+
+from app.schemas.chat import AgentState, make_thinking_event
+
+# =============================================================================
+# Rule-based keyword maps
+# Order matters: lebih spesifik di atas
+# =============================================================================
+
+_RULES: list[tuple[str, list[str]]] = [
+    # clarification_answer — deteksi jawaban checkpoint (huruf/angka tunggal atau "pilih X")
+    ("clarification_answer", [
+        r"^[a-d]$",
+        r"^[1-4]$",
+        r"^pilih\s+[a-d1-4]",
+        r"^jawaban",
+        r"^opsi",
+    ]),
+    # image — user kirim gambar atau sebut foto/gambar/foto gigi
+    ("image", [
+        r"foto",
+        r"gambar",
+        r"image",
+        r"scan",
+        r"kirim foto",
+        r"lihat foto",
+    ]),
+    # context_query — tanya tentang data personal user
+    ("context_query", [
+        r"streak",
+        r"sikat gigi (anak|dia|si kecil)",
+        r"rapot",
+        r"hasil scan",
+        r"mata peri",
+        r"riwayat",
+        r"kebiasaan (anak|dia)",
+        r"progress",
+        r"pencapaian",
+        r"achievement",
+        r"berapa (hari|streak|sesi)",
+    ]),
+    # smalltalk — sapaan dan basa-basi
+    ("smalltalk", [
+        r"^(halo|hai|hi|hey|assalam|pagi|siang|sore|malam)\b",
+        r"^apa kabar",
+        r"^siapa kamu",
+        r"^kamu (siapa|apa|bisa)",
+        r"^terima kasih",
+        r"^makasih",
+        r"^thanks",
+        r"^oke$",
+        r"^ok$",
+    ]),
+    # dental_qa — catch-all untuk pertanyaan gigi (paling bawah)
+    ("dental_qa", [
+        r"gigi",
+        r"karies",
+        r"berlubang",
+        r"plak",
+        r"karang gigi",
+        r"sikat",
+        r"pasta gigi",
+        r"fluoride",
+        r"dokter gigi",
+        r"orthodon",
+        r"behel",
+        r"gusi",
+        r"mulut",
+        r"nafas",
+        r"bau mulut",
+        r"susu",  # gigi susu
+        r"permanen",
+    ]),
+]
+
+
+def _classify_by_rules(message: str) -> str | None:
+    """
+    Coba klasifikasi dengan keyword rules.
+    Return intent string jika match, None jika tidak ada yang cocok.
+    """
+    text = message.lower().strip()
+    for intent, patterns in _RULES:
+        for pattern in patterns:
+            if re.search(pattern, text):
+                return intent
+    return None
+
+
+async def _classify_by_llm(message: str, prompt_template: str) -> str:
+    """
+    Fallback: klasifikasi via LLM jika rule-based tidak match.
+    Pakai model kecil/cepat, temperature=0 untuk output deterministik.
+    """
+    from langchain_core.messages import HumanMessage
+    from app.config.llm import get_llm
+
+    llm = get_llm(temperature=0, max_tokens=10, streaming=False)
+
+    prompt = prompt_template.replace("{user_message}", message)
+    result = await llm.ainvoke([HumanMessage(content=prompt)])
+
+    intent = result.content.strip().lower()
+
+    # Validasi output LLM — fallback ke dental_qa jika tidak valid
+    valid_intents = {"dental_qa", "context_query", "image", "clarification_answer", "smalltalk"}
+    return intent if intent in valid_intents else "dental_qa"
+
+
+async def router_node(state: AgentState) -> AsyncIterator[str]:
+    """
+    LangGraph node: router.
+    Emit thinking event, lalu klasifikasi intent.
+    Update state dengan intent yang diklasifikasi.
+    """
+    # Ambil pesan terakhir dari user
+    user_messages = [m for m in state["messages"] if m["role"] == "user"]
+    last_message = user_messages[-1]["content"] if user_messages else ""
+
+    # Emit thinking step
+    yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=False)
+
+    # 1. Coba rule-based dulu
+    intent = _classify_by_rules(last_message)
+
+    if intent is None:
+        # 2. Fallback ke LLM
+        router_prompt = state.get("prompts", {}).get("router_classify", "")
+        if router_prompt:
+            intent = await _classify_by_llm(last_message, router_prompt)
+        else:
+            # Tidak ada prompt → default ke dental_qa
+            intent = "dental_qa"
+
+    yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=True)
+
+    # Update state
+    state["intent"] = intent
+    state["thinking_steps"].append({"step": 1, "label": "Memahami pertanyaanmu...", "done": True})
