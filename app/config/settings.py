@@ -30,7 +30,7 @@ class Settings(BaseSettings):
 
     # Ollama
     OLLAMA_BASE_URL: str = "http://host.docker.internal:11434"
-    OLLAMA_MODEL: str = "qwen3.5"
+    OLLAMA_MODEL: str = "gemma2:2b"
 
     # Gemini
     GEMINI_API_KEY: str = ""
