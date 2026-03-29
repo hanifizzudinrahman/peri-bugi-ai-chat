@@ -45,6 +45,9 @@ def _get_ollama(temperature: float, max_tokens: int, streaming: bool) -> BaseCha
         temperature=temperature,
         num_predict=max_tokens,
         streaming=streaming,
+        # Disable thinking mode untuk model seperti qwen3.5, deepseek-r1
+        # Tanpa ini, thinking tokens menyebabkan TTFT 60+ detik
+        extra_body={"think": False},
     )
 
 
