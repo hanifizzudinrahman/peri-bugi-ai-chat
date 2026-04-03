@@ -2,15 +2,22 @@
 ai-chat — Tanya Peri AI Service
 """
 import json
+import logging
+import time
 from typing import AsyncIterator, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+import structlog
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.agents.peri_agent import _build_initial_state, _build_rnd_state, run_agent
 from app.config.settings import settings
+from app.middleware.rate_limit import (
+    check_benchmark_rate_limit,
+    check_rnd_rate_limit,
+)
 from app.schemas.chat import (
     ChatRequest,
     RnDChatRequest,
@@ -18,13 +25,56 @@ from app.schemas.chat import (
 )
 from app.services.llm_logger import send_llm_call_logs
 
+# =============================================================================
+# Structured Logging Setup
+# =============================================================================
+# FIX: filter_by_level hanya kompatibel dengan stdlib LoggerFactory.
+# Karena kita pakai PrintLoggerFactory (simpler, tidak butuh stdlib),
+# hapus filter_by_level dari processor chain.
+#
+# Perbedaan:
+# - PrintLoggerFactory : sederhana, output langsung ke stdout, cocok untuk FastAPI
+# - stdlib LoggerFactory: integrasi dengan Python logging module, perlu setup lebih banyak
+#
+# Untuk kebutuhan kita (log ke stdout Docker), PrintLoggerFactory sudah cukup.
+
+structlog.configure(
+    processors=[
+        # HAPUS structlog.stdlib.filter_by_level — tidak kompatibel dengan PrintLogger
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.PositionalArgumentsFormatter(),
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.UnicodeDecoder(),
+        # Dev: ConsoleRenderer (colorful, readable di terminal)
+        # Production: JSONRenderer (machine-readable, untuk log aggregator)
+        structlog.dev.ConsoleRenderer() if not settings.is_production
+        else structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.BoundLogger,
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),  # Tetap pakai PrintLogger
+    cache_logger_on_first_use=True,
+)
+
+# Suppress verbose log dari library lain
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+log = structlog.get_logger()
+
+
+# =============================================================================
+# App init
+# =============================================================================
+
 app = FastAPI(
     title="Tanya Peri — AI Chat Service",
-    description=(
-        "Internal AI service untuk chatbot Tanya Peri. "
-        "Endpoint /chat/rnd tersedia untuk RnD jika RND_MODE=True."
-    ),
-    version="1.1.0",
+    description="Internal AI service untuk chatbot Tanya Peri.",
+    version="1.2.0",
     docs_url="/docs" if not settings.is_production else None,
     redoc_url=None,
 )
@@ -35,6 +85,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =============================================================================
+# Request logging middleware
+# =============================================================================
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log setiap request dengan timing. Skip health check endpoints."""
+    # Skip health check agar logs tidak terlalu noisy
+    if request.url.path in ("/health", "/health/gpu", "/health/llm"):
+        return await call_next(request)
+
+    start = time.monotonic()
+    response = await call_next(request)
+    duration_ms = int((time.monotonic() - start) * 1000)
+
+    log.info(
+        "http_request",
+        method=request.method,
+        path=request.url.path,
+        status=response.status_code,
+        duration_ms=duration_ms,
+        client_ip=request.client.host if request.client else "unknown",
+    )
+    return response
 
 
 # =============================================================================
@@ -66,7 +142,6 @@ async def _stream_with_logging(state) -> AsyncIterator[str]:
 
     async for event_str in run_agent(state):
         yield event_str
-
         try:
             if event_str.startswith("data: "):
                 parsed = json.loads(event_str[6:])
@@ -128,6 +203,93 @@ async def health_gpu():
     return info
 
 
+@app.get(
+    "/health/llm",
+    summary="Health check LLM provider",
+    description=(
+        "Cek apakah LLM provider aktif bisa diakses.\n\n"
+        "- **ollama**: cek server jalan + model tersedia + warm status\n"
+        "- **gemini/openai**: cek API key diset\n\n"
+        "Tidak melakukan LLM call — hanya cek konektivitas."
+    ),
+)
+async def health_llm():
+    """Health check provider-agnostic."""
+    provider = settings.LLM_PROVIDER
+    result: dict = {"provider": provider, "model": settings.llm_model_name}
+
+    if provider == "ollama":
+        import urllib.request
+        import json as _json
+
+        try:
+            with urllib.request.urlopen(
+                f"{settings.OLLAMA_BASE_URL}/api/tags", timeout=5
+            ) as resp:
+                data = _json.loads(resp.read())
+                models = [m["name"] for m in data.get("models", [])]
+                result["ollama_status"] = "ok"
+                result["available_models"] = models
+
+                target = settings.OLLAMA_MODEL
+                model_available = any(
+                    target in m or m.startswith(target.split(":")[0])
+                    for m in models
+                )
+                result["configured_model_available"] = model_available
+
+                if not model_available:
+                    result["warning"] = (
+                        f"Model '{target}' tidak ada. "
+                        f"Jalankan: ollama pull {target}"
+                    )
+
+                # Cek model yang sedang di-load di VRAM
+                try:
+                    with urllib.request.urlopen(
+                        f"{settings.OLLAMA_BASE_URL}/api/ps", timeout=3
+                    ) as ps_resp:
+                        ps_data = _json.loads(ps_resp.read())
+                        loaded = [m.get("name", "") for m in ps_data.get("models", [])]
+                        result["models_in_vram"] = loaded
+                        result["configured_model_warm"] = any(
+                            target.split(":")[0] in m for m in loaded
+                        )
+                except Exception:
+                    result["models_in_vram"] = "unknown"
+                    result["configured_model_warm"] = False
+
+        except Exception as e:
+            result["ollama_status"] = "error"
+            result["error"] = str(e)
+            result["hint"] = (
+                f"Ollama tidak bisa diakses di {settings.OLLAMA_BASE_URL}. "
+                "Pastikan Ollama jalan di host."
+            )
+
+    elif provider == "gemini":
+        if not settings.GEMINI_API_KEY:
+            result["status"] = "error"
+            result["error"] = "GEMINI_API_KEY belum diset di .env"
+        else:
+            result["status"] = "ok"
+            result["api_key_set"] = True
+            result["note"] = "API key tersedia."
+
+    elif provider == "openai":
+        if not settings.OPENAI_API_KEY:
+            result["status"] = "error"
+            result["error"] = "OPENAI_API_KEY belum diset di .env"
+        else:
+            result["status"] = "ok"
+            result["api_key_set"] = True
+            result["note"] = "API key tersedia."
+
+    has_error = result.get("ollama_status") == "error" or result.get("status") == "error"
+    result["overall"] = "error" if has_error else "ok"
+    return result
+
+
 @app.post("/chat/stream")
 async def chat_stream(
     request: ChatRequest,
@@ -146,14 +308,25 @@ async def chat_stream(
     "/chat/rnd",
     summary="RnD endpoint — standalone testing & research",
     description=(
-        "Endpoint untuk RnD dan eksperimen. Tidak perlu internal secret.\n\n"
-        "**stream: false** → return JSON (cocok untuk Swagger & batch experiment)\n"
-        "**stream: true** → SSE streaming"
+        "Endpoint untuk RnD. Tidak perlu internal secret.\n\n"
+        "Rate limit: 30 request/menit per IP.\n"
+        "Aktif hanya jika RND_MODE=True."
     ),
 )
-async def chat_rnd(request: RnDChatRequest):
+async def chat_rnd(
+    request: RnDChatRequest,
+    _rl: None = Depends(check_rnd_rate_limit),
+):
     _require_rnd_mode()
     initial_state = _build_rnd_state(request)
+
+    log.info(
+        "rnd_request",
+        model=request.model or settings.llm_model_name,
+        provider=request.provider or settings.LLM_PROVIDER,
+        stream=request.stream,
+        experiment_id=request.experiment_id,
+    )
 
     if request.stream:
         return StreamingResponse(
@@ -166,21 +339,12 @@ async def chat_rnd(request: RnDChatRequest):
 
 
 # =============================================================================
-# Benchmark endpoint
+# Benchmark
 # =============================================================================
 
 class BenchmarkRequest(BaseModel):
-    """
-    Kirim pertanyaan yang sama N kali untuk melihat latency pattern.
-
-    Cara baca hasil:
-    - Kalau cold TTFT jauh lebih tinggi dari warm → GPU aktif, ada cold start
-    - Kalau semua TTFT hampir sama dan rendah → model sudah warm sebelum benchmark
-      (ini BAGUS, artinya keep_alive aktif atau model baru saja dipakai)
-    - Kalau semua TTFT tinggi dan konsisten → kemungkinan CPU, tidak ada GPU warmup
-    """
     message: str = Field(..., description="Pertanyaan yang akan dikirim N kali")
-    n: int = Field(default=3, ge=1, le=10, description="Jumlah run (default: 3)")
+    n: int = Field(default=3, ge=1, le=10)
     provider: Optional[str] = Field(default=None)
     model: Optional[str] = Field(default=None)
     temperature: Optional[float] = Field(default=0.1)
@@ -189,18 +353,20 @@ class BenchmarkRequest(BaseModel):
 
 @app.post(
     "/chat/rnd/benchmark",
-    summary="Benchmark latency — analisa warm/cold pattern",
+    summary="Benchmark latency",
     description=(
-        "Kirim pertanyaan yang sama N kali dan bandingkan latency setiap run.\n\n"
-        "**Cara baca:**\n"
-        "- `ttft_cold_ms` tinggi, `ttft_warm_avg_ms` rendah → GPU aktif, cold start normal\n"
-        "- Semua TTFT rendah dan konsisten → model sudah warm (keep_alive aktif) — ini normal & bagus\n"
-        "- Semua TTFT tinggi dan konsisten → kemungkinan CPU\n\n"
+        "Kirim pertanyaan N kali dan bandingkan latency.\n\n"
+        "Rate limit: 5 benchmark/menit per IP.\n"
         "Aktif hanya jika RND_MODE=True."
     ),
 )
-async def benchmark(request: BenchmarkRequest):
+async def benchmark(
+    request: BenchmarkRequest,
+    _rl: None = Depends(check_benchmark_rate_limit),
+):
     _require_rnd_mode()
+
+    log.info("benchmark_start", model=request.model or settings.llm_model_name, n=request.n)
 
     results = []
     for i in range(request.n):
@@ -225,12 +391,9 @@ async def benchmark(request: BenchmarkRequest):
     tps_list = [r["metrics"]["tokens_per_second"] for r in results if r["metrics"].get("tokens_per_second")]
 
     cold_ttft = ttfts[0] if ttfts else None
-    warm_ttfts = ttfts[1:] if len(ttfts) > 1 else []
-    warm_ttft_avg = int(sum(warm_ttfts) / len(warm_ttfts)) if warm_ttfts else None
-
+    warm_ttft_avg = int(sum(ttfts[1:]) / len(ttfts[1:])) if len(ttfts) > 1 else None
     cold_latency = latencies[0] if latencies else None
-    warm_latencies = latencies[1:] if len(latencies) > 1 else []
-    warm_avg = int(sum(warm_latencies) / len(warm_latencies)) if warm_latencies else None
+    warm_avg = int(sum(latencies[1:]) / len(latencies[1:])) if len(latencies) > 1 else None
 
     summary = {
         "model": request.model or settings.llm_model_name,
@@ -245,55 +408,45 @@ async def benchmark(request: BenchmarkRequest):
         "interpretation": _interpret_benchmark(cold_ttft, warm_ttft_avg, tps_list),
     }
 
+    log.info("benchmark_done", model=summary["model"], avg_tps=summary["avg_tokens_per_second"])
     return {"summary": summary, "runs": results}
 
 
 def _interpret_benchmark(cold_ttft_ms, warm_ttft_avg_ms, tps_list) -> str:
-    """
-    Interpretasi hasil benchmark berdasarkan TTFT pattern, bukan latency ratio.
-
-    TTFT adalah indikator paling reliable:
-    - TTFT tinggi di cold run = model di-load ke VRAM (cold start)
-    - TTFT rendah di semua run = model sudah warm (keep_alive aktif / baru dipakai)
-    - TTFT tinggi di semua run = kemungkinan CPU (tidak ada GPU warmup effect)
-    """
     if cold_ttft_ms is None:
         return "Data tidak cukup untuk interpretasi."
 
     avg_tps = round(sum(tps_list) / len(tps_list), 1) if tps_list else 0
 
-    # Analisa throughput dulu — ini indikator GPU paling kuat
     if avg_tps >= 80:
         gpu_verdict = "✅ GPU aktif"
-        gpu_detail = f"throughput {avg_tps} tok/s (typical GPU range untuk model kecil)"
+        gpu_detail = f"throughput {avg_tps} tok/s"
     elif avg_tps >= 30:
         gpu_verdict = "⚠️ Mungkin GPU"
-        gpu_detail = f"throughput {avg_tps} tok/s (bisa GPU low-end atau CPU modern)"
+        gpu_detail = f"throughput {avg_tps} tok/s"
     elif avg_tps > 0:
         gpu_verdict = "❌ Kemungkinan CPU"
-        gpu_detail = f"throughput {avg_tps} tok/s (terlalu lambat untuk GPU)"
+        gpu_detail = f"throughput {avg_tps} tok/s"
     else:
         gpu_verdict = "❓ Tidak dapat dideteksi"
         gpu_detail = "data throughput tidak tersedia"
 
-    # Analisa TTFT pattern
     if warm_ttft_avg_ms is not None and cold_ttft_ms > warm_ttft_avg_ms * 3:
-        warm_status = f"Cold start terdeteksi (TTFT cold {cold_ttft_ms}ms vs warm {warm_ttft_avg_ms}ms)"
+        warm_status = f"Cold start terdeteksi (cold {cold_ttft_ms}ms → warm {warm_ttft_avg_ms}ms)"
     elif cold_ttft_ms < 300:
-        warm_status = f"Model sudah warm dari awal (TTFT cold {cold_ttft_ms}ms) — keep_alive aktif atau baru dipakai"
+        warm_status = f"Model sudah warm dari awal (TTFT {cold_ttft_ms}ms) — keep_alive aktif"
     else:
         warm_status = f"TTFT {cold_ttft_ms}ms"
 
-    # Speed verdict
-    effective_latency = warm_ttft_avg_ms or cold_ttft_ms or 9999
-    if effective_latency < 300:
-        speed = "🚀 Sangat responsif untuk UX streaming"
-    elif effective_latency < 800:
+    effective = warm_ttft_avg_ms or cold_ttft_ms or 9999
+    if effective < 300:
+        speed = "🚀 Sangat responsif"
+    elif effective < 800:
         speed = "✅ Responsif"
-    elif effective_latency < 2000:
-        speed = "⚠️ Agak lambat untuk streaming UX"
+    elif effective < 2000:
+        speed = "⚠️ Agak lambat"
     else:
-        speed = "❌ Terlalu lambat untuk streaming UX"
+        speed = "❌ Terlalu lambat"
 
     return f"{gpu_verdict} — {gpu_detail}. {warm_status}. {speed}."
 
