@@ -12,9 +12,10 @@ Intent yang didukung:
 - smalltalk           : sapaan, pertanyaan umum, basa-basi
 """
 import re
+import time
 from typing import AsyncIterator
 
-from app.schemas.chat import AgentState, make_thinking_event
+from app.schemas.chat import AgentState, LLMCallLogPayload, make_thinking_event
 
 # =============================================================================
 # Rule-based keyword maps
@@ -101,24 +102,66 @@ def _classify_by_rules(message: str) -> str | None:
     return None
 
 
-async def _classify_by_llm(message: str, prompt_template: str) -> str:
+async def _classify_by_llm(
+    message: str,
+    prompt_template: str,
+    provider: str | None = None,
+    model: str | None = None,
+) -> tuple[str, LLMCallLogPayload]:
     """
     Fallback: klasifikasi via LLM jika rule-based tidak match.
     Pakai model kecil/cepat, temperature=0 untuk output deterministik.
+    Return (intent, log_payload).
     """
     from langchain_core.messages import HumanMessage
-    from app.config.llm import get_llm
+    from app.config.llm import get_llm, get_model_name, get_provider_name
 
-    llm = get_llm(temperature=0, max_tokens=10, streaming=False)
+    llm = get_llm(
+        temperature=0,
+        max_tokens=10,
+        streaming=False,
+        provider=provider,
+        model=model,
+    )
 
     prompt = prompt_template.replace("{user_message}", message)
-    result = await llm.ainvoke([HumanMessage(content=prompt)])
 
-    intent = result.content.strip().lower()
+    start_time = time.monotonic()
+    ttft: float | None = None
+    success = True
+    error_msg: str | None = None
+    intent = "dental_qa"
 
-    # Validasi output LLM — fallback ke dental_qa jika tidak valid
-    valid_intents = {"dental_qa", "context_query", "image", "clarification_answer", "smalltalk"}
-    return intent if intent in valid_intents else "dental_qa"
+    try:
+        result = await llm.ainvoke([HumanMessage(content=prompt)])
+        ttft = (time.monotonic() - start_time) * 1000
+        intent_raw = result.content.strip().lower()
+
+        # Validasi output LLM — fallback ke dental_qa jika tidak valid
+        valid_intents = {"dental_qa", "context_query", "image", "clarification_answer", "smalltalk"}
+        intent = intent_raw if intent_raw in valid_intents else "dental_qa"
+
+    except Exception as e:
+        success = False
+        error_msg = str(e)
+        ttft = (time.monotonic() - start_time) * 1000
+
+    latency_ms = int((time.monotonic() - start_time) * 1000)
+
+    log = LLMCallLogPayload(
+        prompt_key="router_classify",
+        model=get_model_name(provider=provider, model=model),
+        provider=get_provider_name(provider=provider),
+        node="router",
+        latency_ms=latency_ms,
+        ttft_ms=int(ttft) if ttft else None,
+        output_tokens=1,  # router hanya output 1 token (intent)
+        success=success,
+        error_message=error_msg,
+        metadata={"intent_result": intent},
+    )
+
+    return intent, log
 
 
 async def router_node(state: AgentState) -> AsyncIterator[str]:
@@ -126,13 +169,28 @@ async def router_node(state: AgentState) -> AsyncIterator[str]:
     LangGraph node: router.
     Emit thinking event, lalu klasifikasi intent.
     Update state dengan intent yang diklasifikasi.
+
+    FIX: handle message dict yang tidak punya key 'role'
+    (defensive check untuk avoid KeyError).
     """
-    # Ambil pesan terakhir dari user
-    user_messages = [m for m in state["messages"] if m["role"] == "user"]
-    last_message = user_messages[-1]["content"] if user_messages else ""
+    # Ambil pesan terakhir dari user — defensive: skip message tanpa 'role'
+    user_messages = [
+        m for m in state.get("messages", [])
+        if isinstance(m, dict) and m.get("role") == "user"
+    ]
+    last_message = user_messages[-1].get("content", "") if user_messages else ""
 
     # Emit thinking step
     yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=False)
+
+    # Check force_intent (RnD mode — skip router sepenuhnya)
+    force_intent = state.get("force_intent")
+    if force_intent:
+        intent = force_intent
+        yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=True)
+        state["intent"] = intent
+        state["thinking_steps"].append({"step": 1, "label": "Memahami pertanyaanmu...", "done": True})
+        return
 
     # 1. Coba rule-based dulu
     intent = _classify_by_rules(last_message)
@@ -141,7 +199,14 @@ async def router_node(state: AgentState) -> AsyncIterator[str]:
         # 2. Fallback ke LLM
         router_prompt = state.get("prompts", {}).get("router_classify", "")
         if router_prompt:
-            intent = await _classify_by_llm(last_message, router_prompt)
+            intent, log = await _classify_by_llm(
+                last_message,
+                router_prompt,
+                provider=state.get("llm_provider_override"),
+                model=state.get("llm_model_override"),
+            )
+            # Simpan log untuk dikirim ke api
+            state["llm_call_logs"].append(log.model_dump())
         else:
             # Tidak ada prompt → default ke dental_qa
             intent = "dental_qa"

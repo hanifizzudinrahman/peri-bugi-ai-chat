@@ -1,0 +1,19 @@
+# =============================================================================
+# requirements-gpu.txt
+# Hanya torch + sentence-transformers.
+# File ini diinstall di layer TERPISAH di Dockerfile supaya:
+#
+# - Torch ~2.5 GB hanya didownload sekali, tersimpan di Docker layer cache
+# - Kalau kamu ubah requirements-base.txt atau app code, layer torch TIDAK
+#   didownload ulang — langsung pakai cache
+# - Layer ini hanya rebuild kalau versi torch atau sentence-transformers berubah
+#
+# PENTING: Jangan tambahkan library lain di sini. Satu file = satu tujuan.
+# =============================================================================
+
+# PyTorch dengan CUDA 12.1 support
+# --index-url harus diset supaya pip ambil versi CUDA, bukan versi CPU
+--index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+torchaudio==2.5.1+cu121

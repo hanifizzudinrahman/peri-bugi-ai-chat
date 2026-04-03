@@ -1,0 +1,9 @@
+# =============================================================================
+# requirements-sentence-transformers.txt
+# sentence-transformers dipisah di layer tersendiri karena:
+# - Download model HuggingFace saat pertama load (~500MB)
+# - Dengan layer terpisah, kalau base requirements berubah, layer ini tetap cached
+# - Harus diinstall SETELAH torch (torch adalah dependency-nya)
+# =============================================================================
+
+sentence-transformers==3.3.1

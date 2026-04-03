@@ -1,13 +1,12 @@
 # =============================================================================
-# requirements.txt
-# Untuk install manual (conda, pip langsung) — bukan untuk Docker.
-# Docker pakai: requirements-gpu.txt + requirements-sentence-transformers.txt
-#               + requirements-base.txt (layer terpisah untuk cache optimal)
+# requirements-base.txt
+# Semua dependency KECUALI torch/sentence-transformers.
+# Dipisah supaya Docker layer cache tidak invalidate saat torch sudah terdownload.
 #
-# Install urutan ini untuk conda/venv:
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-#   pip install sentence-transformers==3.3.1
-#   pip install -r requirements.txt
+# Strategy layer caching di Dockerfile:
+#   Layer 1: Install torch (2.5 GB) → cache selama torch version tidak berubah
+#   Layer 2: Install requirements-base.txt ini → cache kalau tidak ada perubahan
+#   Layer 3: Copy app code → selalu rebuild, tapi cepat karena tidak ada download
 # =============================================================================
 
 # Web framework
@@ -33,9 +32,6 @@ httpx==0.27.2
 # PDF processing
 pypdf==5.1.0
 langchain-text-splitters==0.3.3
-
-# Embeddings (untuk conda/venv, install manual dulu torch sebelum ini)
-# sentence-transformers==3.3.1
 
 # Config & validation
 pydantic==2.10.4

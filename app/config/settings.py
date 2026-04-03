@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     # Internal Security
     # Shared secret dengan peri-bugi-api — wajib diisi
     # -------------------------------------------------------------------------
-    INTERNAL_SECRET: str
+    INTERNAL_SECRET: str = ""
 
     # -------------------------------------------------------------------------
     # LLM Provider
@@ -57,11 +57,26 @@ class Settings(BaseSettings):
     # -------------------------------------------------------------------------
     EMBEDDING_PROVIDER: str = "local"   # local | gemini | openai
     EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    # GPU support untuk embedding lokal
+    # auto   = deteksi otomatis (cuda jika tersedia, fallback cpu)
+    # cuda   = paksa GPU (error jika tidak ada)
+    # cpu    = paksa CPU
+    EMBEDDING_DEVICE: str = "auto"
 
     # -------------------------------------------------------------------------
     # External APIs
     # -------------------------------------------------------------------------
     AI_CV_URL: str = ""                 # kosong = skip image inference
+    # URL peri-bugi-api untuk kirim LLM call logs
+    # Kosong = logging dinonaktifkan (misal: saat RnD standalone)
+    PERI_API_URL: str = ""
+
+    # -------------------------------------------------------------------------
+    # RnD / Standalone mode
+    # Jika True, endpoint /chat/rnd aktif tanpa perlu internal secret.
+    # Aktifkan saat development/research, matikan di production.
+    # -------------------------------------------------------------------------
+    RND_MODE: bool = True
 
     # -------------------------------------------------------------------------
     # Helpers

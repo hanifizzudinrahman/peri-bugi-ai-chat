@@ -1,21 +1,55 @@
 services:
   ai-chat:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: peri_bugi_ai_chat
     ports:
       - "8003:8003"
     env_file: .env
     volumes:
-      - ./app:/app/app   # hot reload saat development
+      # Hot reload: sync app code tanpa perlu rebuild image
+      - ./app:/app/app
+      # Cache model HuggingFace (sentence-transformers) ke volume persisten.
+      # Tanpa ini, model ~500MB didownload ulang setiap container recreate.
+      - huggingface_cache:/root/.cache/huggingface
     command: uvicorn app.main:app --host 0.0.0.0 --port 8003 --reload
     extra_hosts:
-      - "host.docker.internal:host-gateway"  # akses Ollama di host
+      # Supaya container bisa akses Ollama yang jalan di host Windows
+      - "host.docker.internal:host-gateway"
+    # ── GPU Support ──────────────────────────────────────────────────────────
+    # Ini yang biasanya lupa/gagal dikonfigurasi.
+    # deploy.resources.reservations.devices adalah cara Docker Compose v2
+    # untuk request GPU ke NVIDIA Container Toolkit.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1           # pakai 1 GPU (set ke "all" kalau mau semua)
+              capabilities: [gpu]
+    # ── Environment override ─────────────────────────────────────────────────
+    # Variable ini bisa override apa yang ada di .env
+    # Uncomment kalau perlu paksa device tertentu
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # EMBEDDING_DEVICE=auto sudah handle otomatis, tapi bisa paksa di sini:
+      # - EMBEDDING_DEVICE=cuda
+    restart: unless-stopped
 
   qdrant:
     image: qdrant/qdrant:latest
+    container_name: peri_bugi_qdrant
     ports:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+    restart: unless-stopped
 
 volumes:
   qdrant_data:
+  # Volume khusus untuk cache model HuggingFace.
+  # Model sentence-transformers (~500MB) tersimpan di sini dan tidak
+  # didownload ulang setiap container recreate.
+  huggingface_cache:
