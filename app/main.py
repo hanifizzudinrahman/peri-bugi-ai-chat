@@ -1,10 +1,11 @@
 """
 ai-chat — Tanya Peri AI Service
 FastAPI app + endpoints:
-  POST /chat/stream   — production endpoint (internal, perlu X-Internal-Secret)
-  POST /chat/rnd      — RnD standalone endpoint (perlu RND_MODE=True)
-  GET  /health        — health check
-  GET  /health/gpu    — GPU/device info untuk debugging
+  POST /chat/stream          — production (internal, perlu X-Internal-Secret)
+  POST /chat/rnd             — RnD standalone (perlu RND_MODE=True)
+  POST /chat/rnd/benchmark   — benchmark: kirim pertanyaan N kali, lihat warm vs cold latency
+  GET  /health               — health check
+  GET  /health/gpu           — GPU/device info untuk debugging
 """
 import json
 from typing import AsyncIterator, Optional
@@ -12,6 +13,7 @@ from typing import AsyncIterator, Optional
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from app.agents.peri_agent import _build_initial_state, _build_rnd_state, run_agent
 from app.config.settings import settings
@@ -28,61 +30,55 @@ app = FastAPI(
     title="Tanya Peri — AI Chat Service",
     description=(
         "Internal AI service untuk chatbot Tanya Peri. "
-        "Tidak diakses langsung oleh frontend — selalu melalui peri-bugi-api. "
-        "Endpoint /chat/rnd tersedia untuk RnD dan eksperimen (jika RND_MODE=True)."
+        "Endpoint /chat/rnd tersedia untuk RnD jika RND_MODE=True."
     ),
     version="1.1.0",
-    # Docs hanya aktif di development
     docs_url="/docs" if not settings.is_production else None,
     redoc_url=None,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # private service, tidak perlu restrict
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
 # =============================================================================
-# Security: validasi internal secret
+# Security
 # =============================================================================
 
 def _verify_internal_secret(x_internal_secret: str | None) -> None:
-    """Validasi bahwa request berasal dari peri-bugi-api."""
     if not settings.INTERNAL_SECRET:
-        return  # Secret belum diset — skip validasi (dev mode)
+        return
     if x_internal_secret != settings.INTERNAL_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized: invalid internal secret")
 
 
+def _require_rnd_mode() -> None:
+    if not settings.RND_MODE:
+        raise HTTPException(
+            status_code=403,
+            detail="RnD mode tidak aktif. Set RND_MODE=True di .env untuk mengaktifkan.",
+        )
+
+
 # =============================================================================
-# Stream wrapper: intercept done event untuk kirim LLM logs ke api
+# Stream wrapper: proxy + kirim LLM logs ke api setelah done
 # =============================================================================
 
 async def _stream_with_logging(state) -> AsyncIterator[str]:
-    """
-    Wrapper di atas run_agent yang:
-    1. Proxy semua event ke client
-    2. Setelah event 'done', fire-and-forget kirim LLM logs ke peri-bugi-api
-
-    Kenapa di sini bukan di dalam run_agent:
-    - run_agent tidak tahu soal HTTP/logging — murni agent logic
-    - Separation of concerns: transport layer yang handle logging
-    """
     llm_call_logs: list[dict] = []
     session_id: str = state.get("session_id", "")
 
     async for event_str in run_agent(state):
         yield event_str
 
-        # Parse event untuk cek apakah ini done event
         try:
             if event_str.startswith("data: "):
                 parsed = json.loads(event_str[6:])
                 if parsed.get("event") == "done":
-                    # Ambil logs dari metadata done event
                     data = parsed.get("data", {})
                     if isinstance(data, dict):
                         metadata = data.get("metadata", {})
@@ -91,7 +87,6 @@ async def _stream_with_logging(state) -> AsyncIterator[str]:
         except (json.JSONDecodeError, Exception):
             pass
 
-    # Fire-and-forget kirim logs ke api setelah streaming selesai
     if llm_call_logs:
         import asyncio
         asyncio.create_task(send_llm_call_logs(llm_call_logs, session_id))
@@ -103,7 +98,6 @@ async def _stream_with_logging(state) -> AsyncIterator[str]:
 
 @app.get("/health")
 async def health():
-    """Health check untuk Cloud Run dan monitoring."""
     return {
         "status": "ok",
         "service": "tanya-peri-ai-chat",
@@ -115,10 +109,7 @@ async def health():
 
 @app.get("/health/gpu")
 async def health_gpu():
-    """
-    Info GPU/device — berguna saat debugging performa embedding.
-    Cek apakah embedding berjalan di GPU atau CPU.
-    """
+    """Info GPU/device — untuk debugging performa embedding."""
     info: dict = {
         "embedding_device_setting": settings.EMBEDDING_DEVICE,
         "embedding_provider": settings.EMBEDDING_PROVIDER,
@@ -140,39 +131,24 @@ async def health_gpu():
                 torch.cuda.memory_reserved(0) / 1024 / 1024, 1
             )
         else:
-            info["cuda_available"] = False
-            info["note"] = "CUDA tidak tersedia — embedding akan berjalan di CPU"
+            info["note"] = "CUDA tidak tersedia — embedding berjalan di CPU"
     except ImportError:
         info["torch_installed"] = False
-        info["note"] = "torch tidak terinstall — embedding device tidak bisa dideteksi"
 
     return info
 
 
-@app.post(
-    "/chat/stream",
-    summary="Stream response Tanya Peri (SSE) — internal",
-    description=(
-        "Endpoint internal — hanya dipanggil oleh peri-bugi-api. "
-        "Terima ChatRequest lengkap dengan user context + prompts, "
-        "return SSE stream: thinking | token | clarify | tool | done | error"
-    ),
-)
+@app.post("/chat/stream")
 async def chat_stream(
     request: ChatRequest,
     x_internal_secret: str | None = Header(default=None),
 ):
     _verify_internal_secret(x_internal_secret)
-
     initial_state = _build_initial_state(request)
-
     return StreamingResponse(
         _stream_with_logging(initial_state),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -182,46 +158,144 @@ async def chat_stream(
     description=(
         "Endpoint untuk RnD dan eksperimen. Tidak perlu internal secret. "
         "Support override semua parameter LLM, embedding, dan prompt. "
-        "Aktif hanya jika RND_MODE=True di .env. "
-        "MATIKAN di production! "
-        "\n\nContoh use case:\n"
-        "- Test berbagai model (gemma2:2b vs qwen3.5 vs gemini-flash)\n"
-        "- Experiment dengan temperature dan max_tokens\n"
-        "- Test custom system prompt tanpa ubah DB\n"
-        "- Collect metrics TTFT, latency, token count untuk paper\n"
-        "- Evaluate router accuracy dengan expected_intent\n"
-        "- Evaluate response quality dengan expected_keywords"
+        "Aktif hanya jika RND_MODE=True di .env.\n\n"
+        "**stream: false** → return JSON langsung (cocok untuk Swagger & batch experiment)\n"
+        "**stream: true** → SSE streaming (cocok untuk test UX real-time)"
     ),
 )
 async def chat_rnd(request: RnDChatRequest):
-    if not settings.RND_MODE:
-        raise HTTPException(
-            status_code=403,
-            detail="RnD mode tidak aktif. Set RND_MODE=True di .env untuk mengaktifkan.",
-        )
-
+    _require_rnd_mode()
     initial_state = _build_rnd_state(request)
 
     if request.stream:
-        # SSE streaming mode
         return StreamingResponse(
             _rnd_stream_with_metrics(initial_state, request),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
     else:
-        # Non-streaming mode: tunggu selesai, return JSON
         return await _rnd_collect_response(initial_state, request)
 
 
+# =============================================================================
+# Benchmark endpoint
+# =============================================================================
+
+class BenchmarkRequest(BaseModel):
+    """
+    Request untuk benchmark latency.
+    Kirim pertanyaan yang sama N kali dan lihat warm vs cold latency.
+
+    Kenapa berguna:
+    - Request pertama: model mungkin masih cold (Ollama load ke VRAM)
+    - Request 2+: model sudah warm, ini latency "sesungguhnya"
+    - Bisa detect apakah GPU benar-benar dipakai (warm latency jauh lebih rendah)
+    """
+    message: str = Field(..., description="Pertanyaan yang akan dikirim N kali")
+    n: int = Field(default=3, ge=1, le=10, description="Jumlah kali pengiriman (default: 3)")
+    provider: Optional[str] = Field(default=None)
+    model: Optional[str] = Field(default=None)
+    temperature: Optional[float] = Field(default=0.1, description="Rendah untuk hasil konsisten")
+    max_tokens: Optional[int] = Field(default=200, description="Batasi output supaya benchmark lebih cepat")
+
+
+@app.post(
+    "/chat/rnd/benchmark",
+    summary="Benchmark latency — warm vs cold",
+    description=(
+        "Kirim pertanyaan yang sama N kali dan bandingkan latency setiap run.\n\n"
+        "**Cara baca hasil:**\n"
+        "- Run ke-1: biasanya paling lambat (cold start, model load ke VRAM)\n"
+        "- Run ke-2+: warm latency (model sudah di VRAM)\n"
+        "- TTFT rendah = model sudah warm = GPU dipakai dengan benar\n"
+        "- Kalau semua run sama lambatnya = GPU mungkin tidak dipakai\n\n"
+        "Aktif hanya jika RND_MODE=True."
+    ),
+)
+async def benchmark(request: BenchmarkRequest):
+    _require_rnd_mode()
+
+    import asyncio
+
+    results = []
+
+    for i in range(request.n):
+        rnd_request = RnDChatRequest(
+            message=request.message,
+            provider=request.provider,
+            model=request.model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            stream=False,
+            experiment_id=f"benchmark-run-{i+1}",
+            experiment_tags=[f"run-{i+1}", "benchmark"],
+        )
+        state = _build_rnd_state(rnd_request)
+        result = await _rnd_collect_response_raw(state, rnd_request)
+        result["run"] = i + 1
+        result["is_cold"] = (i == 0)
+        results.append(result)
+
+    # Summary
+    latencies = [r["metrics"]["latency_ms"] for r in results if r["metrics"].get("latency_ms")]
+    ttfts = [r["metrics"]["ttft_ms"] for r in results if r["metrics"].get("ttft_ms")]
+    tps_list = [r["metrics"].get("tokens_per_second") for r in results if r["metrics"].get("tokens_per_second")]
+
+    cold_latency = latencies[0] if latencies else None
+    warm_latencies = latencies[1:] if len(latencies) > 1 else []
+    warm_avg = int(sum(warm_latencies) / len(warm_latencies)) if warm_latencies else None
+
+    summary = {
+        "model": request.model or settings.llm_model_name,
+        "provider": request.provider or settings.LLM_PROVIDER,
+        "n_runs": request.n,
+        "cold_latency_ms": cold_latency,
+        "warm_avg_latency_ms": warm_avg,
+        "speedup_warm_vs_cold": round(cold_latency / warm_avg, 2) if cold_latency and warm_avg else None,
+        "ttft_cold_ms": ttfts[0] if ttfts else None,
+        "ttft_warm_avg_ms": int(sum(ttfts[1:]) / len(ttfts[1:])) if len(ttfts) > 1 else None,
+        "avg_tokens_per_second": round(sum(tps_list) / len(tps_list), 1) if tps_list else None,
+        # Interpretasi otomatis
+        "interpretation": _interpret_benchmark(cold_latency, warm_avg, ttfts),
+    }
+
+    return {
+        "summary": summary,
+        "runs": results,
+    }
+
+
+def _interpret_benchmark(cold_ms, warm_ms, ttfts) -> str:
+    """Generate interpretasi otomatis dari hasil benchmark."""
+    if not cold_ms or not warm_ms:
+        return "Data tidak cukup untuk interpretasi."
+
+    speedup = cold_ms / warm_ms if warm_ms > 0 else 1
+
+    if speedup > 2:
+        gpu_status = "✅ GPU aktif — cold start terdeteksi, warm run jauh lebih cepat"
+    elif speedup > 1.3:
+        gpu_status = "⚠️ GPU mungkin aktif — ada sedikit perbedaan cold vs warm"
+    else:
+        gpu_status = "❌ GPU mungkin tidak dipakai — cold dan warm latency hampir sama"
+
+    if warm_ms < 1000:
+        speed = "🚀 Sangat cepat (< 1 detik)"
+    elif warm_ms < 3000:
+        speed = "✅ Cepat (1-3 detik)"
+    elif warm_ms < 6000:
+        speed = "⚠️ Sedang (3-6 detik) — pertimbangkan model lebih kecil"
+    else:
+        speed = "❌ Lambat (> 6 detik) — ganti model atau cek GPU"
+
+    return f"{gpu_status}. {speed}."
+
+
+# =============================================================================
+# RnD helpers
+# =============================================================================
+
 async def _rnd_stream_with_metrics(state, request: RnDChatRequest) -> AsyncIterator[str]:
-    """
-    Stream untuk RnD mode. Setelah done event, emit metrics event tambahan
-    dengan hasil evaluasi (intent_correct, keyword_hit_rate, dll).
-    """
     final_metadata: dict = {}
 
     async for event_str in run_agent(state):
@@ -237,16 +311,17 @@ async def _rnd_stream_with_metrics(state, request: RnDChatRequest) -> AsyncItera
         except (json.JSONDecodeError, Exception):
             pass
 
-    # Emit metrics event setelah done
     metrics = _build_rnd_metrics(state, request, final_metadata)
     yield make_metrics_event(metrics)
 
 
 async def _rnd_collect_response(state, request: RnDChatRequest) -> JSONResponse:
-    """
-    Non-streaming mode untuk RnD: collect semua events, return JSON.
-    Berguna untuk batch experiment (loop banyak pertanyaan, collect semua results).
-    """
+    data = await _rnd_collect_response_raw(state, request)
+    return JSONResponse(content=data)
+
+
+async def _rnd_collect_response_raw(state, request: RnDChatRequest) -> dict:
+    """Collect response sebagai dict — dipakai oleh rnd dan benchmark."""
     events = []
     full_content = ""
     final_metadata = {}
@@ -268,7 +343,7 @@ async def _rnd_collect_response(state, request: RnDChatRequest) -> JSONResponse:
 
     metrics = _build_rnd_metrics(state, request, final_metadata)
 
-    response_data = {
+    result = {
         "response": full_content,
         "intent": state.get("intent"),
         "thinking_steps": state.get("thinking_steps", []),
@@ -279,33 +354,17 @@ async def _rnd_collect_response(state, request: RnDChatRequest) -> JSONResponse:
     }
 
     if request.include_prompt_in_response and state.get("prompt_debug"):
-        response_data["prompt_debug"] = state["prompt_debug"]
+        result["prompt_debug"] = state["prompt_debug"]
 
-    return JSONResponse(content=response_data)
+    return result
 
 
 def _build_rnd_metrics(state, request: RnDChatRequest, metadata: dict) -> dict:
-    """
-    Build metrics dict untuk evaluasi RnD.
-
-    Metrics yang tersedia:
-    - latency_ms         : total waktu dari request sampai last token (ms)
-    - ttft_ms            : time-to-first-token (ms) — penting untuk UX streaming
-    - output_tokens_approx: estimasi jumlah output tokens
-    - intent_detected    : intent yang dideteksi router
-    - intent_correct     : apakah intent sesuai expected (jika diisi)
-    - keyword_hit_rate   : % expected keywords yang ada di response (0.0-1.0)
-    - keywords_found     : list keywords yang ketemu di response
-    - keywords_missing   : list keywords yang tidak ada di response
-    - model              : model yang dipakai
-    - provider           : provider yang dipakai
-    - experiment_id      : dari request
-    - experiment_tags    : dari request
-    - llm_call_count     : jumlah LLM call dalam satu request
-    """
     metrics: dict = {
         "latency_ms": metadata.get("latency_ms"),
         "ttft_ms": metadata.get("ttft_ms"),
+        "generation_ms": metadata.get("generation_ms"),
+        "tokens_per_second": metadata.get("tokens_per_second"),
         "output_tokens_approx": metadata.get("output_tokens_approx"),
         "intent_detected": state.get("intent"),
         "model": metadata.get("model"),
@@ -316,21 +375,18 @@ def _build_rnd_metrics(state, request: RnDChatRequest, metadata: dict) -> dict:
         "rag_docs_retrieved": len(state.get("retrieved_docs", [])),
     }
 
-    # Evaluasi intent accuracy
     if request.expected_intent:
         metrics["intent_correct"] = (state.get("intent") == request.expected_intent)
         metrics["expected_intent"] = request.expected_intent
 
-    # Evaluasi keyword coverage
     if request.expected_keywords:
         response_text = (state.get("final_response") or "").lower()
         found = [kw for kw in request.expected_keywords if kw.lower() in response_text]
         missing = [kw for kw in request.expected_keywords if kw.lower() not in response_text]
-        metrics["keyword_hit_rate"] = len(found) / len(request.expected_keywords) if request.expected_keywords else 1.0
+        metrics["keyword_hit_rate"] = round(len(found) / len(request.expected_keywords), 3)
         metrics["keywords_found"] = found
         metrics["keywords_missing"] = missing
 
-    # LLM call breakdown (per node)
     call_logs = state.get("llm_call_logs", [])
     if call_logs:
         metrics["llm_calls"] = [
@@ -338,6 +394,8 @@ def _build_rnd_metrics(state, request: RnDChatRequest, metadata: dict) -> dict:
                 "node": log.get("node"),
                 "latency_ms": log.get("latency_ms"),
                 "ttft_ms": log.get("ttft_ms"),
+                "generation_ms": log.get("metadata", {}).get("generation_ms") if log.get("metadata") else None,
+                "tokens_per_second": log.get("metadata", {}).get("tokens_per_second") if log.get("metadata") else None,
                 "output_tokens": log.get("output_tokens"),
                 "success": log.get("success"),
             }

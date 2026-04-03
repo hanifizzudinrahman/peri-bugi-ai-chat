@@ -1,13 +1,6 @@
 """
 Node: generate
 Generate response dari LLM dengan streaming token per token.
-Menggabungkan semua konteks: user data, retrieved docs, image analysis.
-Juga handle clarification checkpoint sebelum generate.
-
-Perubahan dari versi sebelumnya:
-- Setiap LLM call menghasilkan LLMCallLogPayload yang disimpan di state
-- Support override provider/model/temperature per-request (RnD mode)
-- include_prompt_debug untuk capture full prompt ke LLM
 """
 import json
 import time
@@ -26,14 +19,6 @@ from app.schemas.chat import (
 
 
 def _build_system_prompt(state: AgentState) -> str:
-    """
-    Bangun system prompt dengan inject variabel user context.
-    Template dari DB, variabel dari state.
-    Fallback ke default hardcoded jika prompt tidak tersedia di DB.
-
-    Support override system_prompt langsung dari RnD request
-    (via prompts["_override_system"]).
-    """
     # Cek apakah ada override langsung (dari RnD)
     if "_override_system" in state.get("prompts", {}):
         return state["prompts"]["_override_system"]
@@ -58,7 +43,6 @@ def _build_system_prompt(state: AgentState) -> str:
     system = system.replace("{child_name}", child_name)
     system = system.replace("{child_age}", child_age)
 
-    # Tambahkan konteks brushing jika tersedia
     brushing = ctx.get("brushing")
     if brushing:
         system += (
@@ -67,7 +51,6 @@ def _build_system_prompt(state: AgentState) -> str:
             f"rekor terbaik {brushing.get('best_streak', 0)} hari."
         )
 
-    # Tambahkan hasil scan terakhir jika tersedia
     mata_peri = ctx.get("mata_peri_last_result")
     if mata_peri and mata_peri.get("summary_text"):
         system += (
@@ -77,13 +60,11 @@ def _build_system_prompt(state: AgentState) -> str:
             f"Status: {mata_peri.get('summary_status', 'tidak diketahui')}."
         )
 
-    # Tambahkan retrieved docs jika ada (dari RAG)
     docs = state.get("retrieved_docs", [])
     if docs:
-        docs_text = "\n\n".join(docs[:3])  # max 3 chunks
+        docs_text = "\n\n".join(docs[:3])
         system += f"\n\nReferensi dari knowledge base:\n{docs_text}"
 
-    # Tambahkan hasil image analysis jika ada
     image_analysis = state.get("image_analysis")
     if image_analysis:
         system += (
@@ -95,9 +76,7 @@ def _build_system_prompt(state: AgentState) -> str:
 
 
 def _build_messages(state: AgentState, system_prompt: str) -> list:
-    """Convert conversation history ke format LangChain messages."""
     lc_messages = [SystemMessage(content=system_prompt)]
-
     for msg in state.get("messages", []):
         if not isinstance(msg, dict):
             continue
@@ -108,17 +87,10 @@ def _build_messages(state: AgentState, system_prompt: str) -> list:
         elif role == "assistant":
             from langchain_core.messages import AIMessage
             lc_messages.append(AIMessage(content=content))
-
     return lc_messages
 
 
 async def check_clarification_node(state: AgentState) -> None:
-    """
-    Node: check_clarification
-    Tentukan apakah perlu klarifikasi dari user sebelum generate.
-    Hanya dijalankan untuk intent dental_qa dan context_query.
-    """
-    # Skip jika sudah ada jawaban klarifikasi
     if state.get("clarification_selected"):
         state["needs_clarification"] = False
         return
@@ -134,7 +106,6 @@ async def check_clarification_node(state: AgentState) -> None:
     ]
     last_message = user_messages[-1].get("content", "") if user_messages else ""
 
-    # Ambil history sebagai string singkat
     history_preview = " | ".join([
         f"{m.get('role', '?')}: {m.get('content', '')[:50]}"
         for m in state.get("messages", [])[-4:]
@@ -187,16 +158,8 @@ async def check_clarification_node(state: AgentState) -> None:
 
 
 async def generate_node(state: AgentState) -> AsyncIterator[str]:
-    """
-    Node: generate
-    Stream response LLM token per token.
-    Emit clarification event jika perlu, atau stream tokens langsung.
-
-    Setiap LLM call menghasilkan LLMCallLogPayload di state["llm_call_logs"].
-    """
     thinking_step = len(state.get("thinking_steps", [])) + 1
 
-    # Emit thinking sebelum generate
     intent = state.get("intent", "dental_qa")
     thinking_label = {
         "dental_qa": "Mencari informasi kesehatan gigi...",
@@ -208,7 +171,6 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
 
     yield make_thinking_event(step=thinking_step, label=thinking_label, done=False)
 
-    # Cek apakah perlu clarification
     if state.get("needs_clarification") and state.get("clarification_data"):
         clarify = state["clarification_data"]
         yield make_thinking_event(step=thinking_step, label=thinking_label, done=True)
@@ -220,11 +182,9 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
         state["thinking_steps"].append({"step": thinking_step, "label": thinking_label, "done": True})
         return
 
-    # Build prompt dan messages
     system_prompt = _build_system_prompt(state)
     lc_messages = _build_messages(state, system_prompt)
 
-    # Simpan prompt untuk debug (RnD mode)
     if state.get("include_prompt_debug"):
         state["prompt_debug"] = {
             "system": system_prompt,
@@ -234,20 +194,26 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
             ],
         }
 
-    # Build LLM dengan override jika ada
+    _provider = state.get("llm_provider_override") or None
+    _model = state.get("llm_model_override") or None
+
     llm = get_llm(
         streaming=True,
-        provider=state.get("llm_provider_override"),
-        model=state.get("llm_model_override"),
+        provider=_provider,
+        model=_model,
         temperature=state.get("llm_temperature_override"),
         max_tokens=state.get("llm_max_tokens_override"),
     )
 
-    _provider = state.get("llm_provider_override") or None
-    _model = state.get("llm_model_override") or None
-
-    start_time = time.monotonic()
-    ttft: float | None = None
+    # ── Timing breakdown ──────────────────────────────────────────────────
+    # t_start      : saat kita mulai kirim request ke LLM
+    # t_first_token: saat token pertama keluar (TTFT)
+    # t_end        : saat token terakhir keluar (total latency)
+    #
+    # TTFT tinggi = model sedang load ke VRAM (cold start Ollama)
+    # TTFT rendah tapi total tinggi = model jalan tapi output panjang
+    t_start = time.monotonic()
+    t_first_token: float | None = None
     full_response = ""
     output_tokens = 0
     success = True
@@ -256,53 +222,69 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
     yield make_thinking_event(step=thinking_step, label=thinking_label, done=True)
     state["thinking_steps"].append({"step": thinking_step, "label": thinking_label, "done": True})
 
-    # Stream tokens
     try:
         async for chunk in llm.astream(lc_messages):
             token = chunk.content
             if not token:
                 continue
 
-            if ttft is None:
-                ttft = (time.monotonic() - start_time) * 1000  # ms
+            if t_first_token is None:
+                t_first_token = time.monotonic()
 
             full_response += token
-            output_tokens += 1  # estimasi — token sebenarnya dari usage metadata
+            output_tokens += 1
             yield make_token_event(token)
 
     except Exception as e:
         success = False
         error_msg = str(e)
-        # Tetap lanjut, biar done event tetap kekirim dengan content yang sudah ada
 
-    latency_ms = int((time.monotonic() - start_time) * 1000)
+    t_end = time.monotonic()
 
-    # Simpan ke state
+    # Semua timing dalam ms
+    total_latency_ms = int((t_end - t_start) * 1000)
+    ttft_ms = int((t_first_token - t_start) * 1000) if t_first_token else None
+    # generation_ms = waktu dari token pertama sampai token terakhir
+    # = pure LLM throughput tanpa overhead cold start
+    generation_ms = int((t_end - t_first_token) * 1000) if t_first_token else None
+    # tokens_per_second = throughput generate (hanya bagian setelah token pertama)
+    tps = round(output_tokens / (generation_ms / 1000), 1) if generation_ms and generation_ms > 0 else None
+
     state["final_response"] = full_response
     state["llm_metadata"] = {
         "model": get_model_name(provider=_provider, model=_model),
         "provider": get_provider_name(provider=_provider),
         "intent": intent,
-        "latency_ms": latency_ms,
-        "ttft_ms": int(ttft) if ttft else None,
+        # Total: dari kirim request sampai token terakhir
+        "latency_ms": total_latency_ms,
+        # TTFT: dari kirim request sampai token PERTAMA
+        # Tinggi = cold start (model baru di-load ke VRAM)
+        # Rendah = model sudah warm di VRAM
+        "ttft_ms": ttft_ms,
+        # Generation: dari token pertama sampai token terakhir
+        # Ini adalah pure LLM throughput
+        "generation_ms": generation_ms,
+        # Tokens per second setelah warm (useful untuk compare model)
+        "tokens_per_second": tps,
         "output_tokens_approx": output_tokens,
     }
 
-    # Simpan LLM call log ke state
     log = LLMCallLogPayload(
         prompt_key="generate",
         model=get_model_name(provider=_provider, model=_model),
         provider=get_provider_name(provider=_provider),
         node="generate",
         output_tokens=output_tokens,
-        latency_ms=latency_ms,
-        ttft_ms=int(ttft) if ttft else None,
+        latency_ms=total_latency_ms,
+        ttft_ms=ttft_ms,
         success=success,
         error_message=error_msg,
         metadata={
             "intent": intent,
-            "temperature": state.get("llm_temperature_override") or None,
-            "max_tokens": state.get("llm_max_tokens_override") or None,
+            "generation_ms": generation_ms,
+            "tokens_per_second": tps,
+            "temperature": state.get("llm_temperature_override"),
+            "max_tokens": state.get("llm_max_tokens_override"),
         },
     )
     state["llm_call_logs"].append(log.model_dump())
