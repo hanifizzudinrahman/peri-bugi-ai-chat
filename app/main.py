@@ -28,38 +28,36 @@ from app.services.llm_logger import send_llm_call_logs
 # =============================================================================
 # Structured Logging Setup
 # =============================================================================
-# FIX: filter_by_level hanya kompatibel dengan stdlib LoggerFactory.
-# Karena kita pakai PrintLoggerFactory (simpler, tidak butuh stdlib),
-# hapus filter_by_level dari processor chain.
-#
-# Perbedaan:
-# - PrintLoggerFactory : sederhana, output langsung ke stdout, cocok untuk FastAPI
-# - stdlib LoggerFactory: integrasi dengan Python logging module, perlu setup lebih banyak
-#
-# Untuk kebutuhan kita (log ke stdout Docker), PrintLoggerFactory sudah cukup.
+import logging
+import structlog
+
+logging.basicConfig(
+    format="%(message)s",
+    level=logging.INFO,
+)
 
 structlog.configure(
     processors=[
-        # HAPUS structlog.stdlib.filter_by_level — tidak kompatibel dengan PrintLogger
-        structlog.stdlib.add_logger_name,
+        # FIX: JANGAN pakai processor stdlib kalau pakai PrintLogger
         structlog.stdlib.add_log_level,
         structlog.stdlib.PositionalArgumentsFormatter(),
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
         structlog.processors.UnicodeDecoder(),
-        # Dev: ConsoleRenderer (colorful, readable di terminal)
-        # Production: JSONRenderer (machine-readable, untuk log aggregator)
-        structlog.dev.ConsoleRenderer() if not settings.is_production
+
+        # DEV = readable
+        structlog.dev.ConsoleRenderer()
+        if not settings.is_production
         else structlog.processors.JSONRenderer(),
     ],
     wrapper_class=structlog.BoundLogger,
     context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),  # Tetap pakai PrintLogger
+    logger_factory=structlog.PrintLoggerFactory(),
     cache_logger_on_first_use=True,
 )
 
-# Suppress verbose log dari library lain
+# Suppress verbose logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
