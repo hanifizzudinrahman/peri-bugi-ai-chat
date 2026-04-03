@@ -1,13 +1,8 @@
 """
 Tool: retrieve_knowledge
 Ambil dokumen relevan dari Qdrant vector store (RAG).
-Dipanggil untuk intent dental_qa.
-
-Perubahan dari versi sebelumnya:
-- GPU support untuk embedding lokal (CUDA auto-detect)
-- top_k bisa di-override dari state (untuk RnD experiment)
-- embedding_provider dan embedding_model bisa di-override dari state
 """
+import warnings
 from typing import AsyncIterator
 
 from app.config.settings import settings
@@ -17,10 +12,7 @@ from app.schemas.chat import AgentState, make_thinking_event
 def _detect_embedding_device() -> str:
     """
     Deteksi device terbaik untuk embedding lokal.
-    EMBEDDING_DEVICE di .env bisa: auto | cuda | cpu
-
-    auto = coba CUDA dulu, fallback ke CPU jika tidak ada.
-    Ini penting untuk performa: embedding di CPU bisa 10-50x lebih lambat.
+    EMBEDDING_DEVICE di .env: auto | cuda | cpu
     """
     device_setting = settings.EMBEDDING_DEVICE.lower()
 
@@ -28,13 +20,12 @@ def _detect_embedding_device() -> str:
         return "cpu"
 
     if device_setting == "cuda":
-        # Paksa CUDA — error jika tidak tersedia
         try:
             import torch
             if not torch.cuda.is_available():
                 raise RuntimeError(
-                    "EMBEDDING_DEVICE=cuda tapi CUDA tidak tersedia di sistem ini. "
-                    "Ganti ke EMBEDDING_DEVICE=auto atau EMBEDDING_DEVICE=cpu"
+                    "EMBEDDING_DEVICE=cuda tapi CUDA tidak tersedia. "
+                    "Ganti ke EMBEDDING_DEVICE=auto atau cpu"
                 )
             return "cuda"
         except ImportError:
@@ -43,9 +34,7 @@ def _detect_embedding_device() -> str:
     # auto mode (default)
     try:
         import torch
-        if torch.cuda.is_available():
-            return "cuda"
-        return "cpu"
+        return "cuda" if torch.cuda.is_available() else "cpu"
     except ImportError:
         return "cpu"
 
@@ -57,17 +46,28 @@ def _get_embeddings(
     """
     Return embedding model berdasarkan EMBEDDING_PROVIDER.
     Support override untuk RnD experiment.
+
+    Menggunakan langchain_huggingface (bukan langchain_community yang deprecated).
     """
     provider = provider_override or settings.EMBEDDING_PROVIDER
     model = model_override or settings.EMBEDDING_MODEL
 
     if provider == "local":
-        from langchain_community.embeddings import HuggingFaceEmbeddings
+        # Pakai langchain_huggingface, bukan langchain_community.HuggingFaceEmbeddings
+        # yang sudah deprecated sejak LangChain 0.2.2
+        try:
+            from langchain_huggingface import HuggingFaceEmbeddings
+        except ImportError:
+            # Fallback ke yang lama kalau langchain_huggingface belum terinstall
+            # Suppress deprecation warning supaya logs tidak berisik
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                from langchain_community.embeddings import HuggingFaceEmbeddings
+
         device = _detect_embedding_device()
         return HuggingFaceEmbeddings(
             model_name=model,
             model_kwargs={"device": device},
-            # Cache model di memori supaya tidak reload setiap request
             encode_kwargs={"normalize_embeddings": True},
         )
 
@@ -97,10 +97,15 @@ def _get_qdrant_retriever(
     from langchain_qdrant import QdrantVectorStore
     from qdrant_client import QdrantClient
 
-    client = QdrantClient(
-        url=settings.QDRANT_URL,
-        api_key=settings.QDRANT_API_KEY or None,
-    )
+    # Suppress warning "Api key is used with an insecure connection"
+    # Warning ini normal untuk local dev (Qdrant tanpa HTTPS)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        client = QdrantClient(
+            url=settings.QDRANT_URL,
+            api_key=settings.QDRANT_API_KEY or None,
+        )
+
     embeddings = _get_embeddings(
         provider_override=provider_override,
         model_override=model_override,
@@ -118,8 +123,6 @@ async def retrieve_node(state: AgentState) -> AsyncIterator[str]:
     """
     LangGraph node: retrieve_knowledge
     Cari dokumen relevan dari knowledge base.
-
-    top_k diambil dari state (bisa di-override per-request untuk RnD).
     """
     thinking_step = len(state.get("thinking_steps", [])) + 1
     yield make_thinking_event(
@@ -134,10 +137,8 @@ async def retrieve_node(state: AgentState) -> AsyncIterator[str]:
     ]
     query = user_messages[-1].get("content", "") if user_messages else ""
 
-    # Ambil top_k dari state (support override untuk RnD)
     top_k = state.get("top_k_docs", 3)
 
-    # Kalau top_k = 0, skip RAG
     if top_k == 0:
         state["retrieved_docs"] = []
         state["tool_calls"].append({
@@ -172,7 +173,6 @@ async def retrieve_node(state: AgentState) -> AsyncIterator[str]:
             "result": {"doc_count": len(retrieved)},
         })
     except Exception as e:
-        # Qdrant belum ada atau error — lanjut tanpa RAG
         state["tool_calls"].append({
             "tool": "retrieve_knowledge",
             "input": {"query": query[:100]},

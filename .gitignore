@@ -1,0 +1,64 @@
+# =============================================================================
+# peri-bugi-ai-chat — .gitignore
+# =============================================================================
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# Virtual environments
+.env
+.venv
+venv/
+env/
+
+# Secrets & credentials
+*.key
+*.pem
+*.cert
+*.crt
+secrets/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Logs
+*.log
+logs/
+
+# Test & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Model cache (jangan commit model HuggingFace — ukurannya ratusan MB)
+# Model disimpan di Docker volume, bukan di repo
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Qdrant local data (kalau ada local storage)
+qdrant_storage/
+
+# Scripts output
+scripts/output/
+experiment_results*.json
+benchmark_results*.json

@@ -1,9 +1,10 @@
 # =============================================================================
 # requirements-sentence-transformers.txt
-# sentence-transformers dipisah di layer tersendiri karena:
-# - Download model HuggingFace saat pertama load (~500MB)
-# - Dengan layer terpisah, kalau base requirements berubah, layer ini tetap cached
-# - Harus diinstall SETELAH torch (torch adalah dependency-nya)
+# Diinstall setelah torch (torch adalah dependency sentence-transformers).
 # =============================================================================
 
 sentence-transformers==3.3.1
+
+# Paket baru — ganti langchain_community.HuggingFaceEmbeddings yang deprecated
+# sejak LangChain 0.2.2. Harus diinstall terpisah.
+langchain-huggingface==0.1.2

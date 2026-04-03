@@ -1,11 +1,5 @@
 """
 ai-chat — Tanya Peri AI Service
-FastAPI app + endpoints:
-  POST /chat/stream          — production (internal, perlu X-Internal-Secret)
-  POST /chat/rnd             — RnD standalone (perlu RND_MODE=True)
-  POST /chat/rnd/benchmark   — benchmark: kirim pertanyaan N kali, lihat warm vs cold latency
-  GET  /health               — health check
-  GET  /health/gpu           — GPU/device info untuk debugging
 """
 import json
 from typing import AsyncIterator, Optional
@@ -20,8 +14,6 @@ from app.config.settings import settings
 from app.schemas.chat import (
     ChatRequest,
     RnDChatRequest,
-    make_done_event,
-    make_error_event,
     make_metrics_event,
 )
 from app.services.llm_logger import send_llm_call_logs
@@ -60,12 +52,12 @@ def _require_rnd_mode() -> None:
     if not settings.RND_MODE:
         raise HTTPException(
             status_code=403,
-            detail="RnD mode tidak aktif. Set RND_MODE=True di .env untuk mengaktifkan.",
+            detail="RnD mode tidak aktif. Set RND_MODE=True di .env.",
         )
 
 
 # =============================================================================
-# Stream wrapper: proxy + kirim LLM logs ke api setelah done
+# Stream wrapper
 # =============================================================================
 
 async def _stream_with_logging(state) -> AsyncIterator[str]:
@@ -115,7 +107,6 @@ async def health_gpu():
         "embedding_provider": settings.EMBEDDING_PROVIDER,
         "embedding_model": settings.EMBEDDING_MODEL,
     }
-
     try:
         import torch
         info["torch_version"] = torch.__version__
@@ -134,7 +125,6 @@ async def health_gpu():
             info["note"] = "CUDA tidak tersedia — embedding berjalan di CPU"
     except ImportError:
         info["torch_installed"] = False
-
     return info
 
 
@@ -156,11 +146,9 @@ async def chat_stream(
     "/chat/rnd",
     summary="RnD endpoint — standalone testing & research",
     description=(
-        "Endpoint untuk RnD dan eksperimen. Tidak perlu internal secret. "
-        "Support override semua parameter LLM, embedding, dan prompt. "
-        "Aktif hanya jika RND_MODE=True di .env.\n\n"
-        "**stream: false** → return JSON langsung (cocok untuk Swagger & batch experiment)\n"
-        "**stream: true** → SSE streaming (cocok untuk test UX real-time)"
+        "Endpoint untuk RnD dan eksperimen. Tidak perlu internal secret.\n\n"
+        "**stream: false** → return JSON (cocok untuk Swagger & batch experiment)\n"
+        "**stream: true** → SSE streaming"
     ),
 )
 async def chat_rnd(request: RnDChatRequest):
@@ -183,42 +171,38 @@ async def chat_rnd(request: RnDChatRequest):
 
 class BenchmarkRequest(BaseModel):
     """
-    Request untuk benchmark latency.
-    Kirim pertanyaan yang sama N kali dan lihat warm vs cold latency.
+    Kirim pertanyaan yang sama N kali untuk melihat latency pattern.
 
-    Kenapa berguna:
-    - Request pertama: model mungkin masih cold (Ollama load ke VRAM)
-    - Request 2+: model sudah warm, ini latency "sesungguhnya"
-    - Bisa detect apakah GPU benar-benar dipakai (warm latency jauh lebih rendah)
+    Cara baca hasil:
+    - Kalau cold TTFT jauh lebih tinggi dari warm → GPU aktif, ada cold start
+    - Kalau semua TTFT hampir sama dan rendah → model sudah warm sebelum benchmark
+      (ini BAGUS, artinya keep_alive aktif atau model baru saja dipakai)
+    - Kalau semua TTFT tinggi dan konsisten → kemungkinan CPU, tidak ada GPU warmup
     """
     message: str = Field(..., description="Pertanyaan yang akan dikirim N kali")
-    n: int = Field(default=3, ge=1, le=10, description="Jumlah kali pengiriman (default: 3)")
+    n: int = Field(default=3, ge=1, le=10, description="Jumlah run (default: 3)")
     provider: Optional[str] = Field(default=None)
     model: Optional[str] = Field(default=None)
-    temperature: Optional[float] = Field(default=0.1, description="Rendah untuk hasil konsisten")
-    max_tokens: Optional[int] = Field(default=200, description="Batasi output supaya benchmark lebih cepat")
+    temperature: Optional[float] = Field(default=0.1)
+    max_tokens: Optional[int] = Field(default=200)
 
 
 @app.post(
     "/chat/rnd/benchmark",
-    summary="Benchmark latency — warm vs cold",
+    summary="Benchmark latency — analisa warm/cold pattern",
     description=(
         "Kirim pertanyaan yang sama N kali dan bandingkan latency setiap run.\n\n"
-        "**Cara baca hasil:**\n"
-        "- Run ke-1: biasanya paling lambat (cold start, model load ke VRAM)\n"
-        "- Run ke-2+: warm latency (model sudah di VRAM)\n"
-        "- TTFT rendah = model sudah warm = GPU dipakai dengan benar\n"
-        "- Kalau semua run sama lambatnya = GPU mungkin tidak dipakai\n\n"
+        "**Cara baca:**\n"
+        "- `ttft_cold_ms` tinggi, `ttft_warm_avg_ms` rendah → GPU aktif, cold start normal\n"
+        "- Semua TTFT rendah dan konsisten → model sudah warm (keep_alive aktif) — ini normal & bagus\n"
+        "- Semua TTFT tinggi dan konsisten → kemungkinan CPU\n\n"
         "Aktif hanya jika RND_MODE=True."
     ),
 )
 async def benchmark(request: BenchmarkRequest):
     _require_rnd_mode()
 
-    import asyncio
-
     results = []
-
     for i in range(request.n):
         rnd_request = RnDChatRequest(
             message=request.message,
@@ -236,10 +220,13 @@ async def benchmark(request: BenchmarkRequest):
         result["is_cold"] = (i == 0)
         results.append(result)
 
-    # Summary
     latencies = [r["metrics"]["latency_ms"] for r in results if r["metrics"].get("latency_ms")]
     ttfts = [r["metrics"]["ttft_ms"] for r in results if r["metrics"].get("ttft_ms")]
-    tps_list = [r["metrics"].get("tokens_per_second") for r in results if r["metrics"].get("tokens_per_second")]
+    tps_list = [r["metrics"]["tokens_per_second"] for r in results if r["metrics"].get("tokens_per_second")]
+
+    cold_ttft = ttfts[0] if ttfts else None
+    warm_ttfts = ttfts[1:] if len(ttfts) > 1 else []
+    warm_ttft_avg = int(sum(warm_ttfts) / len(warm_ttfts)) if warm_ttfts else None
 
     cold_latency = latencies[0] if latencies else None
     warm_latencies = latencies[1:] if len(latencies) > 1 else []
@@ -252,43 +239,63 @@ async def benchmark(request: BenchmarkRequest):
         "cold_latency_ms": cold_latency,
         "warm_avg_latency_ms": warm_avg,
         "speedup_warm_vs_cold": round(cold_latency / warm_avg, 2) if cold_latency and warm_avg else None,
-        "ttft_cold_ms": ttfts[0] if ttfts else None,
-        "ttft_warm_avg_ms": int(sum(ttfts[1:]) / len(ttfts[1:])) if len(ttfts) > 1 else None,
+        "ttft_cold_ms": cold_ttft,
+        "ttft_warm_avg_ms": warm_ttft_avg,
         "avg_tokens_per_second": round(sum(tps_list) / len(tps_list), 1) if tps_list else None,
-        # Interpretasi otomatis
-        "interpretation": _interpret_benchmark(cold_latency, warm_avg, ttfts),
+        "interpretation": _interpret_benchmark(cold_ttft, warm_ttft_avg, tps_list),
     }
 
-    return {
-        "summary": summary,
-        "runs": results,
-    }
+    return {"summary": summary, "runs": results}
 
 
-def _interpret_benchmark(cold_ms, warm_ms, ttfts) -> str:
-    """Generate interpretasi otomatis dari hasil benchmark."""
-    if not cold_ms or not warm_ms:
+def _interpret_benchmark(cold_ttft_ms, warm_ttft_avg_ms, tps_list) -> str:
+    """
+    Interpretasi hasil benchmark berdasarkan TTFT pattern, bukan latency ratio.
+
+    TTFT adalah indikator paling reliable:
+    - TTFT tinggi di cold run = model di-load ke VRAM (cold start)
+    - TTFT rendah di semua run = model sudah warm (keep_alive aktif / baru dipakai)
+    - TTFT tinggi di semua run = kemungkinan CPU (tidak ada GPU warmup effect)
+    """
+    if cold_ttft_ms is None:
         return "Data tidak cukup untuk interpretasi."
 
-    speedup = cold_ms / warm_ms if warm_ms > 0 else 1
+    avg_tps = round(sum(tps_list) / len(tps_list), 1) if tps_list else 0
 
-    if speedup > 2:
-        gpu_status = "✅ GPU aktif — cold start terdeteksi, warm run jauh lebih cepat"
-    elif speedup > 1.3:
-        gpu_status = "⚠️ GPU mungkin aktif — ada sedikit perbedaan cold vs warm"
+    # Analisa throughput dulu — ini indikator GPU paling kuat
+    if avg_tps >= 80:
+        gpu_verdict = "✅ GPU aktif"
+        gpu_detail = f"throughput {avg_tps} tok/s (typical GPU range untuk model kecil)"
+    elif avg_tps >= 30:
+        gpu_verdict = "⚠️ Mungkin GPU"
+        gpu_detail = f"throughput {avg_tps} tok/s (bisa GPU low-end atau CPU modern)"
+    elif avg_tps > 0:
+        gpu_verdict = "❌ Kemungkinan CPU"
+        gpu_detail = f"throughput {avg_tps} tok/s (terlalu lambat untuk GPU)"
     else:
-        gpu_status = "❌ GPU mungkin tidak dipakai — cold dan warm latency hampir sama"
+        gpu_verdict = "❓ Tidak dapat dideteksi"
+        gpu_detail = "data throughput tidak tersedia"
 
-    if warm_ms < 1000:
-        speed = "🚀 Sangat cepat (< 1 detik)"
-    elif warm_ms < 3000:
-        speed = "✅ Cepat (1-3 detik)"
-    elif warm_ms < 6000:
-        speed = "⚠️ Sedang (3-6 detik) — pertimbangkan model lebih kecil"
+    # Analisa TTFT pattern
+    if warm_ttft_avg_ms is not None and cold_ttft_ms > warm_ttft_avg_ms * 3:
+        warm_status = f"Cold start terdeteksi (TTFT cold {cold_ttft_ms}ms vs warm {warm_ttft_avg_ms}ms)"
+    elif cold_ttft_ms < 300:
+        warm_status = f"Model sudah warm dari awal (TTFT cold {cold_ttft_ms}ms) — keep_alive aktif atau baru dipakai"
     else:
-        speed = "❌ Lambat (> 6 detik) — ganti model atau cek GPU"
+        warm_status = f"TTFT {cold_ttft_ms}ms"
 
-    return f"{gpu_status}. {speed}."
+    # Speed verdict
+    effective_latency = warm_ttft_avg_ms or cold_ttft_ms or 9999
+    if effective_latency < 300:
+        speed = "🚀 Sangat responsif untuk UX streaming"
+    elif effective_latency < 800:
+        speed = "✅ Responsif"
+    elif effective_latency < 2000:
+        speed = "⚠️ Agak lambat untuk streaming UX"
+    else:
+        speed = "❌ Terlalu lambat untuk streaming UX"
+
+    return f"{gpu_verdict} — {gpu_detail}. {warm_status}. {speed}."
 
 
 # =============================================================================
@@ -297,10 +304,8 @@ def _interpret_benchmark(cold_ms, warm_ms, ttfts) -> str:
 
 async def _rnd_stream_with_metrics(state, request: RnDChatRequest) -> AsyncIterator[str]:
     final_metadata: dict = {}
-
     async for event_str in run_agent(state):
         yield event_str
-
         try:
             if event_str.startswith("data: "):
                 parsed = json.loads(event_str[6:])
@@ -310,7 +315,6 @@ async def _rnd_stream_with_metrics(state, request: RnDChatRequest) -> AsyncItera
                         final_metadata = data.get("metadata", {})
         except (json.JSONDecodeError, Exception):
             pass
-
     metrics = _build_rnd_metrics(state, request, final_metadata)
     yield make_metrics_event(metrics)
 
@@ -321,16 +325,12 @@ async def _rnd_collect_response(state, request: RnDChatRequest) -> JSONResponse:
 
 
 async def _rnd_collect_response_raw(state, request: RnDChatRequest) -> dict:
-    """Collect response sebagai dict — dipakai oleh rnd dan benchmark."""
-    events = []
     full_content = ""
     final_metadata = {}
-
     async for event_str in run_agent(state):
         if event_str.startswith("data: "):
             try:
                 parsed = json.loads(event_str[6:])
-                events.append(parsed)
                 if parsed.get("event") == "token":
                     full_content += parsed.get("data", "")
                 elif parsed.get("event") == "done":
@@ -342,7 +342,6 @@ async def _rnd_collect_response_raw(state, request: RnDChatRequest) -> dict:
                 pass
 
     metrics = _build_rnd_metrics(state, request, final_metadata)
-
     result = {
         "response": full_content,
         "intent": state.get("intent"),
@@ -352,10 +351,8 @@ async def _rnd_collect_response_raw(state, request: RnDChatRequest) -> dict:
         "metadata": final_metadata,
         "metrics": metrics,
     }
-
     if request.include_prompt_in_response and state.get("prompt_debug"):
         result["prompt_debug"] = state["prompt_debug"]
-
     return result
 
 
@@ -374,11 +371,9 @@ def _build_rnd_metrics(state, request: RnDChatRequest, metadata: dict) -> dict:
         "llm_call_count": len(state.get("llm_call_logs", [])),
         "rag_docs_retrieved": len(state.get("retrieved_docs", [])),
     }
-
     if request.expected_intent:
         metrics["intent_correct"] = (state.get("intent") == request.expected_intent)
         metrics["expected_intent"] = request.expected_intent
-
     if request.expected_keywords:
         response_text = (state.get("final_response") or "").lower()
         found = [kw for kw in request.expected_keywords if kw.lower() in response_text]
@@ -386,7 +381,6 @@ def _build_rnd_metrics(state, request: RnDChatRequest, metadata: dict) -> dict:
         metrics["keyword_hit_rate"] = round(len(found) / len(request.expected_keywords), 3)
         metrics["keywords_found"] = found
         metrics["keywords_missing"] = missing
-
     call_logs = state.get("llm_call_logs", [])
     if call_logs:
         metrics["llm_calls"] = [
@@ -394,12 +388,11 @@ def _build_rnd_metrics(state, request: RnDChatRequest, metadata: dict) -> dict:
                 "node": log.get("node"),
                 "latency_ms": log.get("latency_ms"),
                 "ttft_ms": log.get("ttft_ms"),
-                "generation_ms": log.get("metadata", {}).get("generation_ms") if log.get("metadata") else None,
-                "tokens_per_second": log.get("metadata", {}).get("tokens_per_second") if log.get("metadata") else None,
+                "generation_ms": (log.get("metadata") or {}).get("generation_ms"),
+                "tokens_per_second": (log.get("metadata") or {}).get("tokens_per_second"),
                 "output_tokens": log.get("output_tokens"),
                 "success": log.get("success"),
             }
             for log in call_logs
         ]
-
     return metrics
