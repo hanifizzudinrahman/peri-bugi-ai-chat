@@ -286,3 +286,55 @@ def _build_rnd_metrics(state, request: RnDChatRequest, metadata: dict) -> dict:
         metrics["keywords_found"] = found
         metrics["keywords_missing"] = missing
     return metrics
+
+
+# =============================================================================
+# Memory endpoints — Phase 2
+# =============================================================================
+
+class SummarizeRequest(BaseModel):
+    session_id: str = Field(..., description="UUID session yang mau di-summarize")
+    messages: list[dict] = Field(default_factory=list)
+    agents_used: list[str] = Field(default_factory=list)
+
+
+@app.post(
+    "/memory/summarize",
+    summary="Generate dan simpan L2 session summary",
+    description="Dipanggil background task dari peri-bugi-api. Tidak blocking.",
+)
+async def memory_summarize(
+    request: SummarizeRequest,
+    x_internal_secret: str | None = Header(default=None),
+):
+    _verify_internal_secret(x_internal_secret)
+
+    from app.agents.memory_job import (
+        generate_session_summary,
+        extract_topics_from_messages,
+        send_summary_to_api,
+    )
+
+    summary_text = await generate_session_summary(
+        session_id=request.session_id,
+        user_id="",
+        messages=request.messages,
+        agents_used=request.agents_used,
+    )
+
+    if not summary_text:
+        return {"status": "skipped", "reason": "no_summary_generated"}
+
+    topics = extract_topics_from_messages(request.messages)
+    sent = await send_summary_to_api(
+        session_id=request.session_id,
+        summary_text=summary_text,
+        key_topics=topics,
+        agents_used=request.agents_used,
+    )
+
+    return {
+        "status": "ok" if sent else "generated_not_saved",
+        "summary_length": len(summary_text),
+        "topics": topics,
+    }

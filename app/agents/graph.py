@@ -1,27 +1,9 @@
 """
 graph.py — LangGraph StateGraph untuk Tanya Peri v2.
 
-Flow:
-    START
-      │
-      ▼
-   [supervisor]          ← klasifikasi + pilih agent(s)
-      │
-      ▼
-   [run_agents]          ← jalankan agent(s) terpilih (parallel/sequential)
-      │
-      ▼
-   [generate]            ← synthesize + generate response dengan streaming
-      │
-      ├── needs_clarification → [emit_clarify] → END
-      ├── needs_quick_reply   → [emit_quick_reply] → END
-      └── normal              → [emit_done] → END
-
-Agents yang tersedia (Phase 1):
-    kb_dental, user_profile, app_faq
-
-Phase 2+: rapot_peri, cerita_peri, mata_peri
-Phase 4:  janji_peri
+Phase 1: kb_dental, user_profile, app_faq
+Phase 2: rapot_peri, cerita_peri, mata_peri  ← aktif sekarang
+Phase 4: janji_peri
 """
 import asyncio
 from typing import AsyncIterator
@@ -34,6 +16,11 @@ from app.agents.sub_agents import (
     user_profile_agent,
     app_faq_agent,
 )
+from app.agents.sub_agents.phase2_agents import (
+    rapot_peri_agent,
+    cerita_peri_agent,
+    mata_peri_agent,
+)
 from app.schemas.chat import (
     ChatRequest,
     RnDChatRequest,
@@ -43,33 +30,24 @@ from app.schemas.chat import (
 )
 
 # Registry agent → function
-# Tambah agent baru di sini saat Phase 2+
 _AGENT_REGISTRY = {
+    # Phase 1
     "kb_dental": kb_dental_agent,
     "user_profile": user_profile_agent,
     "app_faq": app_faq_agent,
-    # Phase 2 — uncomment saat siap:
-    # "rapot_peri": rapot_peri_agent,
-    # "cerita_peri": cerita_peri_agent,
-    # "mata_peri": mata_peri_agent,
-    # Phase 4:
+    # Phase 2
+    "rapot_peri": rapot_peri_agent,
+    "cerita_peri": cerita_peri_agent,
+    "mata_peri": mata_peri_agent,
+    # Phase 4 — uncomment saat siap:
     # "janji_peri": janji_peri_agent,
 }
 
 
 async def run_agent(initial_state: AgentState) -> AsyncIterator[str]:
-    """
-    Entry point utama — jalankan seluruh graph dan yield SSE events.
-
-    Urutan:
-    1. Supervisor → tentukan agents_selected
-    2. Run agents (parallel atau sequential)
-    3. Generate response (streaming)
-    4. Emit done / clarify / quick_reply
-    """
+    """Entry point utama — jalankan seluruh graph dan yield SSE events."""
     state = initial_state
 
-    # Init fields dengan default
     state.setdefault("thinking_steps", [])
     state.setdefault("tool_calls", [])
     state.setdefault("retrieved_docs", [])
@@ -101,27 +79,17 @@ async def run_agent(initial_state: AgentState) -> AsyncIterator[str]:
     state.setdefault("quick_reply_option_id", None)
 
     try:
-        # ── Step 1: Supervisor ────────────────────────────────────────────────
+        # Step 1: Supervisor
         async for event in supervisor_node(state):
             yield event
 
         agents_selected = state.get("agents_selected", [])
         execution_plan = state.get("execution_plan", {})
 
-        # ── Step 2: Run selected agents ───────────────────────────────────────
+        # Step 2: Run selected agents
         if agents_selected:
             step_num = len(state.get("thinking_steps", [])) + 1
-
-            if len(agents_selected) > 1:
-                label = f"Mengumpulkan info dari {len(agents_selected)} sumber..."
-            elif agents_selected[0] == "kb_dental":
-                label = "Mencari referensi kesehatan gigi..."
-            elif agents_selected[0] == "user_profile":
-                label = "Membaca data profil..."
-            elif agents_selected[0] == "app_faq":
-                label = "Mencari info aplikasi..."
-            else:
-                label = "Mengumpulkan informasi..."
+            label = _thinking_label(agents_selected)
 
             yield make_thinking_event(step=step_num, label=label, done=False)
 
@@ -134,18 +102,16 @@ async def run_agent(initial_state: AgentState) -> AsyncIterator[str]:
             yield make_thinking_event(step=step_num, label=label, done=True)
             state["thinking_steps"].append({"step": step_num, "label": label, "done": True})
 
-        # ── Step 3: Generate response ─────────────────────────────────────────
+        # Step 3: Generate
         async for event in generate_node(state):
             yield event
 
-        # ── Step 4: Emit done / clarify / quick_reply ─────────────────────────
+        # Step 4: Emit done
         if state.get("needs_clarification") and not state.get("final_response"):
-            return  # clarify event sudah di-emit di generate_node
-
+            return
         if state.get("quick_reply_data") and not state.get("final_response"):
-            return  # quick_reply event sudah di-emit di generate_node
+            return
 
-        # Kumpulkan metadata untuk done event
         agents_used = list(state.get("agent_results", {}).keys())
         llm_call_logs = state.get("llm_call_logs", [])
         session_id = state.get("session_id", "")
@@ -168,30 +134,37 @@ async def run_agent(initial_state: AgentState) -> AsyncIterator[str]:
         yield make_error_event(f"Maaf, Tanya Peri sedang mengalami gangguan: {str(e)}")
 
 
+def _thinking_label(agents_selected: list[str]) -> str:
+    if len(agents_selected) > 1:
+        return f"Mengumpulkan info dari {len(agents_selected)} sumber..."
+    labels = {
+        "kb_dental": "Mencari referensi kesehatan gigi...",
+        "user_profile": "Membaca data profil...",
+        "app_faq": "Mencari info aplikasi...",
+        "rapot_peri": "Mengecek rapot sikat gigi...",
+        "cerita_peri": "Mengecek progress Cerita Peri...",
+        "mata_peri": "Menganalisis data gigi...",
+        "janji_peri": "Mencari informasi dokter...",
+    }
+    return labels.get(agents_selected[0], "Mengumpulkan informasi...")
+
+
 async def _run_agents_parallel(state: AgentState, agent_keys: list[str]) -> None:
-    """Jalankan semua agent secara paralel dengan asyncio.gather."""
     tasks = []
     valid_keys = []
-
     for key in agent_keys:
         fn = _AGENT_REGISTRY.get(key)
         if fn:
             tasks.append(fn(state))
             valid_keys.append(key)
-
     if not tasks:
         return
-
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for key, result in zip(valid_keys, results):
-        if isinstance(result, Exception):
-            state["agent_results"][key] = {"error": str(result)}
-        else:
-            state["agent_results"][key] = result
+        state["agent_results"][key] = {"error": str(result)} if isinstance(result, Exception) else result
 
 
 async def _run_agents_sequential(state: AgentState, agent_keys: list[str]) -> None:
-    """Jalankan agent satu per satu."""
     for key in agent_keys:
         fn = _AGENT_REGISTRY.get(key)
         if fn:
@@ -207,7 +180,6 @@ async def _run_agents_sequential(state: AgentState, agent_keys: list[str]) -> No
 # =============================================================================
 
 def build_initial_state(request: ChatRequest) -> AgentState:
-    """Build AgentState dari ChatRequest (production)."""
     return AgentState(
         session_id=request.session_id,
         user_context=request.user_context,
@@ -248,7 +220,6 @@ def build_initial_state(request: ChatRequest) -> AgentState:
 
 
 def build_rnd_state(request: RnDChatRequest) -> AgentState:
-    """Build AgentState dari RnDChatRequest (RnD/standalone mode)."""
     messages = list(request.conversation_history)
     messages.append({"role": "user", "content": request.message})
 
@@ -264,7 +235,6 @@ def build_rnd_state(request: RnDChatRequest) -> AgentState:
         image_url=None,
         clarification_selected=None,
         quick_reply_option_id=None,
-        # RnD: semua agents allowed by default
         allowed_agents=request.allowed_agents or list(_AGENT_REGISTRY.keys()),
         agent_configs={},
         response_mode=request.response_mode or "simple",
