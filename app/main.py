@@ -338,3 +338,338 @@ async def memory_summarize(
         "summary_length": len(summary_text),
         "topics": topics,
     }
+
+
+# =============================================================================
+# Knowledge Base Management (Qdrant)
+# =============================================================================
+# Endpoint ini dipanggil dari peri-bugi-api (via internal secret) atau
+# langsung dari super admin panel (via proxy di api).
+#
+# GET  /knowledge/collections        → info semua collection (doc count)
+# GET  /knowledge/documents          → list dokumen per collection (dengan pagination)
+# POST /knowledge/documents          → ingest teks/PDF chunk manual
+# POST /knowledge/documents/upload   → upload & ingest PDF file
+# DELETE /knowledge/documents/{id}   → hapus satu dokumen by point ID
+# DELETE /knowledge/documents        → hapus semua dokumen di collection (clear)
+# =============================================================================
+
+
+def _get_kb_qdrant_client():
+    """Get Qdrant client untuk knowledge base operations."""
+    import warnings
+    from qdrant_client import QdrantClient
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return QdrantClient(
+            url=settings.QDRANT_URL,
+            api_key=settings.QDRANT_API_KEY or None,
+        )
+
+
+def _get_kb_embeddings():
+    """Get embedding model untuk knowledge base operations."""
+    from app.agents.sub_agents import _get_embeddings
+    return _get_embeddings()
+
+
+class CollectionInfoResponse(BaseModel):
+    collection: str
+    display_name: str
+    doc_count: int
+    exists: bool
+
+
+class DocumentItem(BaseModel):
+    id: str
+    content: str
+    source: str
+    metadata: dict
+
+
+class IngestTextRequest(BaseModel):
+    content: str = Field(..., description="Teks yang akan di-index")
+    source: str = Field(..., description="Nama sumber, misal: 'WHO_2024' atau 'manual_input'")
+    collection: str = Field(default="dental", description="'dental' atau 'faq'")
+    doc_type: Optional[str] = Field(default=None, description="Tipe dokumen: guideline | article | faq | manual")
+    metadata: Optional[dict] = Field(default=None, description="Metadata tambahan")
+
+
+class DeleteDocumentsRequest(BaseModel):
+    collection: str = Field(default="dental", description="'dental' atau 'faq'")
+
+
+@app.get(
+    "/knowledge/collections",
+    summary="Info semua Qdrant collections (jumlah dokumen)",
+)
+async def get_collections(x_internal_secret: str | None = Header(default=None)):
+    _verify_internal_secret(x_internal_secret)
+
+    collections_info = []
+    display_map = {
+        settings.QDRANT_COLLECTION: "Knowledge Base Dental",
+        settings.QDRANT_FAQ_COLLECTION: "FAQ Aplikasi",
+    }
+
+    try:
+        client = _get_kb_qdrant_client()
+        existing = {c.name for c in client.get_collections().collections}
+
+        for col_name, display_name in display_map.items():
+            if col_name in existing:
+                info = client.get_collection(col_name)
+                doc_count = info.points_count or 0
+            else:
+                doc_count = 0
+
+            collections_info.append(CollectionInfoResponse(
+                collection=col_name,
+                display_name=display_name,
+                doc_count=doc_count,
+                exists=col_name in existing,
+            ))
+    except Exception as e:
+        log.error("get_collections error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Qdrant error: {str(e)}")
+
+    return {"collections": [c.model_dump() for c in collections_info]}
+
+
+@app.get(
+    "/knowledge/documents",
+    summary="List dokumen di collection (pagination)",
+)
+async def list_documents(
+    collection: str = "dental",
+    limit: int = 20,
+    offset: int = 0,
+    x_internal_secret: str | None = Header(default=None),
+):
+    _verify_internal_secret(x_internal_secret)
+
+    # Resolve collection name
+    col_name = settings.QDRANT_COLLECTION if collection == "dental" else settings.QDRANT_FAQ_COLLECTION
+
+    try:
+        client = _get_kb_qdrant_client()
+        existing = {c.name for c in client.get_collections().collections}
+
+        if col_name not in existing:
+            return {"documents": [], "total": 0, "collection": col_name, "offset": offset, "limit": limit}
+
+        # Qdrant scroll untuk list semua points dengan pagination
+        scroll_result = client.scroll(
+            collection_name=col_name,
+            limit=limit,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        points = scroll_result[0]
+
+        # Count total
+        col_info = client.get_collection(col_name)
+        total = col_info.points_count or 0
+
+        documents = []
+        for pt in points:
+            payload = pt.payload or {}
+            documents.append({
+                "id": str(pt.id),
+                "content": payload.get("page_content", payload.get("content", ""))[:500],
+                "content_full": payload.get("page_content", payload.get("content", "")),
+                "source": payload.get("metadata", {}).get("source", payload.get("source", "unknown")),
+                "doc_type": payload.get("metadata", {}).get("doc_type", "-"),
+                "page": payload.get("metadata", {}).get("page"),
+                "chunk_idx": payload.get("metadata", {}).get("chunk_idx"),
+                "metadata": payload.get("metadata", {}),
+            })
+
+        return {
+            "documents": documents,
+            "total": total,
+            "collection": col_name,
+            "offset": offset,
+            "limit": limit,
+        }
+
+    except Exception as e:
+        log.error("list_documents error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Qdrant error: {str(e)}")
+
+
+@app.post(
+    "/knowledge/documents",
+    summary="Ingest teks manual ke knowledge base",
+)
+async def ingest_text(
+    request: IngestTextRequest,
+    x_internal_secret: str | None = Header(default=None),
+):
+    """
+    Ingest satu potongan teks ke Qdrant.
+    Berguna untuk input manual atau konten yang bukan PDF.
+    Source wajib diisi untuk traceability.
+    """
+    _verify_internal_secret(x_internal_secret)
+
+    import warnings
+    from langchain_qdrant import QdrantVectorStore
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Distance, VectorParams
+    from langchain_core.documents import Document
+
+    col_name = settings.QDRANT_COLLECTION if request.collection == "dental" else settings.QDRANT_FAQ_COLLECTION
+
+    try:
+        embeddings = _get_kb_embeddings()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            client = _get_kb_qdrant_client()
+
+        # Pastikan collection ada
+        existing = {c.name for c in client.get_collections().collections}
+        if col_name not in existing:
+            test_vec = embeddings.embed_query("test")
+            client.create_collection(
+                collection_name=col_name,
+                vectors_config=VectorParams(size=len(test_vec), distance=Distance.COSINE),
+            )
+
+        # Buat Document dengan metadata lengkap
+        metadata = {
+            "source": request.source,
+            "doc_type": request.doc_type or "manual",
+            "ingested_via": "manual_text",
+            **(request.metadata or {}),
+        }
+        doc = Document(page_content=request.content, metadata=metadata)
+
+        vector_store = QdrantVectorStore(
+            client=client,
+            collection_name=col_name,
+            embedding=embeddings,
+        )
+        ids = vector_store.add_documents([doc])
+
+        return {
+            "status": "ok",
+            "message": f"Teks berhasil di-ingest ke collection '{col_name}'.",
+            "doc_id": ids[0] if ids else None,
+            "collection": col_name,
+            "source": request.source,
+        }
+
+    except Exception as e:
+        log.error("ingest_text error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Ingest error: {str(e)}")
+
+
+@app.post(
+    "/knowledge/documents/upload",
+    summary="Upload & ingest PDF file ke knowledge base",
+)
+async def upload_pdf(
+    x_internal_secret: str | None = Header(default=None),
+    collection: str = "dental",
+    chunk_size: int = 400,
+    chunk_overlap: int = 40,
+):
+    """
+    Endpoint ini menerima multipart/form-data dengan field 'file' (PDF).
+    Proses: save temp → load → split → embed → ingest ke Qdrant.
+    Metadata source otomatis diisi dengan nama file.
+    """
+    _verify_internal_secret(x_internal_secret)
+    # Import di sini karena UploadFile dari fastapi
+    import tempfile
+    import os
+    import warnings
+    from fastapi import UploadFile, File, Form
+    raise HTTPException(
+        status_code=501,
+        detail="Endpoint ini belum diimplementasi. Gunakan /knowledge/documents untuk ingest teks, atau jalankan scripts/ingest_pdf.py dari container."
+    )
+
+
+@app.delete(
+    "/knowledge/documents/{point_id}",
+    summary="Hapus satu dokumen dari collection by ID",
+)
+async def delete_document(
+    point_id: str,
+    collection: str = "dental",
+    x_internal_secret: str | None = Header(default=None),
+):
+    """
+    Hapus satu dokumen dari Qdrant by point ID.
+    ID bisa didapat dari GET /knowledge/documents.
+    """
+    _verify_internal_secret(x_internal_secret)
+
+    col_name = settings.QDRANT_COLLECTION if collection == "dental" else settings.QDRANT_FAQ_COLLECTION
+
+    try:
+        client = _get_kb_qdrant_client()
+
+        # Coba parse sebagai integer (Qdrant bisa pakai integer atau UUID)
+        try:
+            parsed_id = int(point_id)
+        except ValueError:
+            parsed_id = point_id
+
+        from qdrant_client.models import PointIdsList
+        client.delete(
+            collection_name=col_name,
+            points_selector=PointIdsList(points=[parsed_id]),
+        )
+
+        return {
+            "status": "ok",
+            "message": f"Dokumen '{point_id}' berhasil dihapus dari '{col_name}'.",
+        }
+
+    except Exception as e:
+        log.error("delete_document error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
+
+
+@app.delete(
+    "/knowledge/documents",
+    summary="Hapus semua dokumen di collection (clear)",
+)
+async def clear_collection(
+    request: DeleteDocumentsRequest,
+    x_internal_secret: str | None = Header(default=None),
+):
+    """
+    Hapus semua dokumen di collection. Collection-nya sendiri tidak dihapus.
+    DESTRUCTIVE — tidak bisa di-undo. Pastikan sebelum eksekusi.
+    """
+    _verify_internal_secret(x_internal_secret)
+
+    col_name = settings.QDRANT_COLLECTION if request.collection == "dental" else settings.QDRANT_FAQ_COLLECTION
+
+    try:
+        client = _get_kb_qdrant_client()
+        existing = {c.name for c in client.get_collections().collections}
+
+        if col_name not in existing:
+            return {"status": "ok", "message": f"Collection '{col_name}' tidak ada, tidak ada yang dihapus."}
+
+        before_count = client.get_collection(col_name).points_count or 0
+
+        from qdrant_client.models import Filter
+        client.delete(collection_name=col_name, points_selector=Filter())
+
+        return {
+            "status": "ok",
+            "message": f"Collection '{col_name}' berhasil dikosongkan.",
+            "deleted_count": before_count,
+        }
+
+    except Exception as e:
+        log.error("clear_collection error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Clear error: {str(e)}")
