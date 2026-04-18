@@ -673,3 +673,282 @@ async def clear_collection(
     except Exception as e:
         log.error("clear_collection error", error=str(e))
         raise HTTPException(status_code=500, detail=f"Clear error: {str(e)}")
+
+
+# =============================================================================
+# Knowledge Base — Upload PDF (real implementation, replace 501 stub)
+# =============================================================================
+
+@app.post(
+    "/knowledge/upload",
+    summary="Upload & ingest PDF file (multipart/form-data) — endpoint aktif",
+)
+async def upload_pdf_real(
+    request: Request,
+    x_internal_secret: str | None = Header(default=None),
+):
+    """
+    Terima PDF via multipart/form-data, split jadi chunks, embed, simpan ke Qdrant.
+
+    Form fields:
+      file         — binary PDF content (required)
+      filename     — nama file asli (required)
+      source       — nama sumber untuk referensi (required)
+      collection   — 'dental' atau 'faq' (default: dental)
+      doc_type     — guideline | article | faq | manual (default: guideline)
+      chunk_size   — integer (default: 400)
+      chunk_overlap— integer (default: 40)
+    """
+    _verify_internal_secret(x_internal_secret)
+
+    import os
+    import tempfile
+    import warnings
+    import time
+    from langchain_community.document_loaders import PyPDFLoader
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain_qdrant import QdrantVectorStore
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Distance, VectorParams
+
+    # Parse multipart body
+    form = await request.form()
+    file_field = form.get("file")
+    filename = form.get("filename", "upload.pdf")
+    source = form.get("source", "")
+    collection_key = form.get("collection", "dental")
+    doc_type = form.get("doc_type", "guideline")
+    chunk_size = int(form.get("chunk_size", 400))
+    chunk_overlap = int(form.get("chunk_overlap", 40))
+
+    if not file_field:
+        raise HTTPException(status_code=400, detail="Field 'file' wajib diisi.")
+    if not source:
+        raise HTTPException(status_code=400, detail="Field 'source' wajib diisi.")
+
+    col_name = settings.QDRANT_COLLECTION if collection_key == "dental" else settings.QDRANT_FAQ_COLLECTION
+
+    # Baca bytes dari UploadFile atau bytes langsung
+    if hasattr(file_field, "read"):
+        file_bytes = await file_field.read()
+    else:
+        file_bytes = file_field
+
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="File kosong.")
+
+    # Simpan ke temp file
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        # Load PDF
+        loader = PyPDFLoader(tmp_path)
+        pages = loader.load()
+        if not pages:
+            raise HTTPException(status_code=422, detail="PDF tidak bisa dibaca atau kosong.")
+
+        # Split chunks
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+        chunks = splitter.split_documents(pages)
+
+        # Tambah metadata
+        for i, chunk in enumerate(chunks):
+            chunk.metadata["source"] = source
+            chunk.metadata["filename"] = str(filename)
+            chunk.metadata["doc_type"] = doc_type
+            chunk.metadata["chunk_idx"] = i
+            chunk.metadata["ingested_via"] = "ui_upload"
+
+        # Embed + ingest
+        embeddings = _get_kb_embeddings()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            client = _get_kb_qdrant_client()
+
+        existing = {c.name for c in client.get_collections().collections}
+        if col_name not in existing:
+            test_vec = embeddings.embed_query("test")
+            client.create_collection(
+                collection_name=col_name,
+                vectors_config=VectorParams(size=len(test_vec), distance=Distance.COSINE),
+            )
+
+        # Ingest in batches
+        batch_size = 50
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:i + batch_size]
+            vector_store = QdrantVectorStore(
+                client=client,
+                collection_name=col_name,
+                embedding=embeddings,
+            )
+            vector_store.add_documents(batch)
+
+        return {
+            "status": "ok",
+            "message": f"PDF '{filename}' berhasil di-ingest ke collection '{col_name}'.",
+            "chunk_count": len(chunks),
+            "page_count": len(pages),
+            "collection": col_name,
+            "source": source,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("upload_pdf_real error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Ingest error: {str(e)}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+@app.get(
+    "/knowledge/embedding-info",
+    summary="Info embedding model yang sedang aktif",
+)
+async def get_embedding_info(x_internal_secret: str | None = Header(default=None)):
+    """Kembalikan embedding provider, model, dan device yang sedang aktif."""
+    _verify_internal_secret(x_internal_secret)
+    return {
+        "embedding_provider": settings.EMBEDDING_PROVIDER,
+        "embedding_model": settings.EMBEDDING_MODEL,
+        "embedding_device": settings.EMBEDDING_DEVICE,
+    }
+
+
+@app.get(
+    "/knowledge/sources",
+    summary="List unique source names di collection",
+)
+async def get_sources(
+    collection: str = "dental",
+    x_internal_secret: str | None = Header(default=None),
+):
+    """
+    Return daftar unique source names di collection.
+    Dipakai FE untuk filter bulk delete by source.
+    """
+    _verify_internal_secret(x_internal_secret)
+
+    col_name = settings.QDRANT_COLLECTION if collection == "dental" else settings.QDRANT_FAQ_COLLECTION
+
+    try:
+        client = _get_kb_qdrant_client()
+        existing = {c.name for c in client.get_collections().collections}
+        if col_name not in existing:
+            return {"sources": [], "collection": col_name}
+
+        # Scroll semua points untuk kumpulkan unique sources
+        # Untuk collection besar, gunakan batch scroll
+        all_sources: dict[str, int] = {}  # source -> count
+        offset = None
+        while True:
+            scroll_result = client.scroll(
+                collection_name=col_name,
+                limit=200,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            points, next_offset = scroll_result
+            for pt in points:
+                payload = pt.payload or {}
+                source = payload.get("metadata", {}).get("source") or payload.get("source", "unknown")
+                all_sources[source] = all_sources.get(source, 0) + 1
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        sources_list = [
+            {"source": s, "chunk_count": c}
+            for s, c in sorted(all_sources.items(), key=lambda x: x[0])
+        ]
+        return {"sources": sources_list, "collection": col_name}
+
+    except Exception as e:
+        log.error("get_sources error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Qdrant error: {str(e)}")
+
+
+class DeleteBySourceRequest(BaseModel):
+    sources: list[str] = Field(..., description="List nama source yang akan dihapus")
+    collection: str = Field(default="dental", description="'dental' atau 'faq'")
+
+
+@app.delete(
+    "/knowledge/documents/by-source",
+    summary="Hapus semua chunk dari satu atau beberapa source",
+)
+async def delete_by_source(
+    request: DeleteBySourceRequest,
+    x_internal_secret: str | None = Header(default=None),
+):
+    """
+    Hapus semua chunk yang metadata.source-nya cocok dengan list yang diberikan.
+    Jauh lebih efisien daripada hapus satu per satu untuk PDF besar.
+    """
+    _verify_internal_secret(x_internal_secret)
+
+    col_name = settings.QDRANT_COLLECTION if request.collection == "dental" else settings.QDRANT_FAQ_COLLECTION
+
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchAny
+        client = _get_kb_qdrant_client()
+
+        existing = {c.name for c in client.get_collections().collections}
+        if col_name not in existing:
+            return {"status": "ok", "message": "Collection tidak ada.", "deleted_sources": []}
+
+        before_count = client.get_collection(col_name).points_count or 0
+
+        # Hapus dengan filter metadata.source
+        # Qdrant payload filter: key "metadata.source" untuk nested, atau "source" untuk flat
+        deleted_count = 0
+        for source in request.sources:
+            # Coba filter nested metadata.source dulu
+            try:
+                client.delete(
+                    collection_name=col_name,
+                    points_selector=Filter(
+                        must=[FieldCondition(key="metadata.source", match=MatchAny(any=[source]))]
+                    ),
+                )
+            except Exception:
+                pass
+            # Juga hapus dengan flat source (untuk dokumen lama)
+            try:
+                client.delete(
+                    collection_name=col_name,
+                    points_selector=Filter(
+                        must=[FieldCondition(key="source", match=MatchAny(any=[source]))]
+                    ),
+                )
+            except Exception:
+                pass
+            deleted_count += 1
+
+        after_count = client.get_collection(col_name).points_count or 0
+        removed = before_count - after_count
+
+        return {
+            "status": "ok",
+            "message": f"{deleted_count} source dihapus, ~{removed} chunk diremove dari '{col_name}'.",
+            "deleted_sources": request.sources,
+            "chunks_before": before_count,
+            "chunks_after": after_count,
+        }
+
+    except Exception as e:
+        log.error("delete_by_source error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
