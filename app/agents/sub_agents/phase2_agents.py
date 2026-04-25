@@ -297,12 +297,27 @@ async def _analyze_chat_image(state: AgentState, image_url: str) -> dict[str, An
 
     # ===== Step 2: Detect via Hybrid Tiered (kalau belum dapat dari clarification) =====
     if view_hint is None:
+        # Per-agent LLM override
         llm_provider = state.get("llm_provider_override")
         llm_model = state.get("llm_model_override")
+        agent_configs = state.get("agent_configs", {})
+        mata_peri_conf = agent_configs.get("mata_peri", {})
+        if not llm_provider and mata_peri_conf.get("llm_provider"):
+            llm_provider = mata_peri_conf["llm_provider"]
+        if not llm_model and mata_peri_conf.get("llm_model"):
+            llm_model = mata_peri_conf["llm_model"]
+
+        # Pull prompt template dari DB (key=view_hint_classification).
+        # Kalau tidak ada (e.g. seeder belum jalan), view_hint_detector akan
+        # fallback ke hardcoded constant.
+        prompts_dict = state.get("prompts", {}) or {}
+        view_hint_prompt = prompts_dict.get("view_hint_classification")
+
         view_hint, decision_source = await detect_view_hint(
             text=user_text,
             llm_provider=llm_provider,
             llm_model=llm_model,
+            prompt_template=view_hint_prompt,
         )
 
     # ===== Step 3a: Ambiguous → emit clarification =====

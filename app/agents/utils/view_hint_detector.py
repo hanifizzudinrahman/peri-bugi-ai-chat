@@ -186,6 +186,7 @@ async def _detect_by_llm(
     text: str,
     llm_provider: Optional[str] = None,
     llm_model: Optional[str] = None,
+    prompt_template: Optional[str] = None,
 ) -> Optional[ViewHint]:
     """
     Layer 2 detection — LLM fallback untuk text yang rule tidak handle.
@@ -197,6 +198,8 @@ async def _detect_by_llm(
         text: User message text
         llm_provider: Override provider (default ke config)
         llm_model: Override model name
+        prompt_template: Prompt dari DB (key='view_hint_classification').
+                        Kalau None, fallback ke hardcoded constant.
 
     Returns:
         ViewHint kalau LLM confident, None kalau LLM tidak yakin / fail
@@ -212,7 +215,10 @@ async def _detect_by_llm(
         logger.warning(f"[view_hint] LLM imports failed, skip LLM layer: {e}")
         return None
 
-    prompt = _LLM_VIEW_CLASSIFICATION_PROMPT.format(text=text.strip()[:500])
+    # Pakai prompt dari DB kalau ada, fallback ke hardcoded.
+    # Ini memungkinkan admin update prompt tanpa redeploy.
+    template = prompt_template or _LLM_VIEW_CLASSIFICATION_PROMPT
+    prompt = template.format(text=text.strip()[:500])
 
     try:
         # Build LLM dengan low temp + tight token limit (cost efficient)
@@ -262,6 +268,7 @@ async def detect_view_hint(
     llm_provider: Optional[str] = None,
     llm_model: Optional[str] = None,
     enable_llm_fallback: bool = True,
+    prompt_template: Optional[str] = None,
 ) -> tuple[Optional[ViewHint], DecisionSource]:
     """
     Hybrid Tiered View Hint Detection.
@@ -275,6 +282,8 @@ async def detect_view_hint(
         llm_provider: Override LLM provider for Layer 2 (default config)
         llm_model: Override LLM model for Layer 2 (default config)
         enable_llm_fallback: Set False untuk skip Layer 2 (e.g. test mode)
+        prompt_template: Prompt dari DB key='view_hint_classification'
+                        untuk Layer 2. Kalau None, fallback ke hardcoded.
 
     Returns:
         (ViewHint | None, decision_source)
@@ -298,7 +307,9 @@ async def detect_view_hint(
 
     # Layer 2: LLM fallback (slow path)
     if enable_llm_fallback:
-        llm_hint = await _detect_by_llm(text, llm_provider, llm_model)
+        llm_hint = await _detect_by_llm(
+            text, llm_provider, llm_model, prompt_template=prompt_template
+        )
         if llm_hint:
             return llm_hint, "llm"
 

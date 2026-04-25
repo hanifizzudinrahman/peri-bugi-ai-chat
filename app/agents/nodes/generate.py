@@ -114,6 +114,7 @@ def _build_system_prompt(state: AgentState) -> str:
         system += f"\n\nInfo aplikasi yang relevan:\n{faq_text}"
 
     # Image analysis (Mata Peri agent - Phase 2 / Tanya Peri image - Phase 4 Batch B)
+    # Phase 6: prompts pindah ke DB — dipilih berdasarkan response_mode.
     image_analysis = state.get("image_analysis")
     if image_analysis:
         # AnalyzeResponse dari ai-cv punya struktur:
@@ -125,16 +126,50 @@ def _build_system_prompt(state: AgentState) -> str:
             sum_status = session_summary.get("summary_status") or "tidak diketahui"
             sum_text = session_summary.get("summary_text") or ""
             rec_text = session_summary.get("recommendation_text") or ""
-            system += (
-                f"\n\nHasil analisis foto gigi anak:\n"
-                f"- Status: {sum_status}\n"
-                f"- Ringkasan: {sum_text}\n"
-                f"- Saran: {rec_text}\n\n"
-                f"Gunakan info di atas untuk merespon pertanyaan user dengan empati. "
-                f"Jangan ulangi semua detail — fokus jawab pertanyaan user dan beri "
-                f"konteks dari hasil analisis seperlunya. Hasil sudah ditampilkan di "
-                f"card terpisah, jadi cukup berkomentar singkat soal hasilnya."
-            )
+            requires_review = session_summary.get("requires_dentist_review", False)
+
+            # Status emoji untuk visual reinforcement
+            status_emoji = {
+                "ok": "✅",
+                "perlu_perhatian": "⚠️",
+                "perlu_dokter": "🚨",
+                "gagal": "❌",
+            }.get(sum_status, "📋")
+
+            # Pull prompt template dari DB berdasarkan response_mode aktif.
+            # Key: tanya_peri_image_response_{simple|medium|detailed}
+            response_mode = state.get("response_mode", "simple")
+            image_prompt_key = f"tanya_peri_image_response_{response_mode}"
+            image_prompt_template = prompts.get(image_prompt_key)
+
+            if image_prompt_template:
+                # Render template dengan placeholder
+                try:
+                    rendered = image_prompt_template.format(
+                        summary_status=sum_status,
+                        summary_text=sum_text,
+                        recommendation_text=rec_text,
+                        child_name=child_name,
+                        requires_dentist_review=str(requires_review).lower(),
+                        status_emoji=status_emoji,
+                    )
+                    system += "\n\n" + rendered
+                except KeyError as e:
+                    # Prompt ada placeholder yang tidak kita support — log + fallback
+                    logger.warning(
+                        f"[generate] Prompt {image_prompt_key} pakai placeholder "
+                        f"yang tidak dikenal: {e}. Fallback ke hardcoded format."
+                    )
+                    system += _build_image_analysis_fallback_prompt(
+                        sum_status, sum_text, rec_text, child_name,
+                        requires_review, status_emoji,
+                    )
+            else:
+                # DB tidak punya prompt (seeder belum jalan / disabled) → hardcoded fallback
+                system += _build_image_analysis_fallback_prompt(
+                    sum_status, sum_text, rec_text, child_name,
+                    requires_review, status_emoji,
+                )
         else:
             # Backward compat — old _analyze_image format (Phase 2)
             system += (
@@ -373,3 +408,39 @@ def _get_child_name(state: AgentState) -> str:
     ctx = state.get("user_context", {})
     child = ctx.get("child") or {}
     return child.get("nickname") or child.get("full_name") or "si kecil"
+
+
+def _build_image_analysis_fallback_prompt(
+    sum_status: str,
+    sum_text: str,
+    rec_text: str,
+    child_name: str,
+    requires_review: bool,
+    status_emoji: str,
+) -> str:
+    """
+    Hardcoded fallback prompt untuk image analysis kalau DB belum punya
+    prompt key `tanya_peri_image_response_{simple|medium|detailed}`.
+
+    Pattern: konteks + instruction berbasis poin (bukan paragraph).
+    Pakai bahasa explicit "JANGAN minta upload" karena small LLM mudah miss.
+
+    Catatan: setelah seeder jalan, function ini tidak akan ke-trigger.
+    Sengaja simpan untuk safety net + dev tanpa DB seed.
+    """
+    return (
+        f"\n\n=== KONTEKS PENTING ===\n"
+        f"USER SUDAH MENGIRIM FOTO GIGI ANAK dan SUDAH dianalisis oleh sistem AI. "
+        f"JANGAN minta user upload foto lagi.\n\n"
+        f"📸 Hasil Analisis Foto Gigi {child_name}:\n"
+        f"{status_emoji} Status: {sum_status}\n"
+        f"📝 Ringkasan: {sum_text}\n"
+        f"💡 Saran: {rec_text}\n\n"
+        f"INSTRUKSI MERESPON:\n"
+        f"1. JANGAN minta user upload foto — foto sudah ada dan sudah dianalisis.\n"
+        f"2. Acknowledge hasil analisis singkat (1-2 kalimat empati).\n"
+        f"3. Jawab pertanyaan user kalau ada.\n"
+        f"4. Hasil sudah ditampilkan di card terpisah — cukup komentar singkat.\n"
+        f"5. {'Anjurkan konsultasi dokter gigi.' if requires_review else 'Tetap pantau dan jaga kebiasaan sikat gigi.'}\n"
+        f"=== AKHIR KONTEKS ===\n"
+    )
