@@ -377,6 +377,31 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
             "recommendation_text": ss.get("recommendation_text"),
             "requires_dentist_review": ss.get("requires_dentist_review", False),
         }
+        # Phase 6 — Forward overlay artifact URLs (mask gigi hijau + karies merah).
+        # Konsisten dengan Mata Peri 5-view: same pattern dari ai-cv pipeline.
+        # FE detail screen pakai ini untuk render foto dengan annotation.
+        # NOTE: URL ini signed dengan TTL 1 jam. Untuk akses ulang setelah expired,
+        # FE harus fetch detail dari /mata-peri/sessions/{id} yang regenerate URL fresh.
+        image_results = image_analysis_state.get("results", []) or []
+        if image_results and isinstance(image_results, list):
+            artifacts_list = []
+            for ir in image_results:
+                if not isinstance(ir, dict):
+                    continue
+                artifacts = ir.get("artifacts") or {}
+                if not isinstance(artifacts, dict):
+                    continue
+                view_type = ir.get("view_type")
+                crop_url = artifacts.get("crop_image_url")
+                overlay_url = artifacts.get("overlay_image_url")
+                if crop_url or overlay_url:
+                    artifacts_list.append({
+                        "view_type": view_type,
+                        "crop_image_url": crop_url,
+                        "overlay_image_url": overlay_url,
+                    })
+            if artifacts_list:
+                metadata["image_artifacts"] = artifacts_list
     state["llm_metadata"] = metadata
 
     log = LLMCallLogPayload(
