@@ -7,8 +7,19 @@ services:
     ports:
       - "8003:8003"
     env_file: .env
+    environment:
+      # Make `app.xxx` imports work for pytest + ad-hoc scripts
+      PYTHONPATH: /app
+      # GPU access
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Redis dari peri-bugi-api (exposed ke host port 6379)
+      # Kosongkan jika tidak pakai Redis di dev
+      # REDIS_URL: redis://host.docker.internal:6379/0
     volumes:
       - ./app:/app/app
+      - ./tests:/app/tests
+      - ./pytest.ini:/app/pytest.ini
       - huggingface_cache:/root/.cache/huggingface
     command: uvicorn app.main:app --host 0.0.0.0 --port 8003 --reload
     extra_hosts:
@@ -21,12 +32,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      # Redis dari peri-bugi-api (exposed ke host port 6379)
-      # Kosongkan jika tidak pakai Redis di dev
-      # - REDIS_URL=redis://host.docker.internal:6379/0
     restart: unless-stopped
 
   qdrant:

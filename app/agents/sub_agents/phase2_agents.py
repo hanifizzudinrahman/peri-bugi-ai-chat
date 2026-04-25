@@ -34,6 +34,54 @@ async def _call_internal_api(path: str) -> dict:
         return {"error": str(e), "has_data": False}
 
 
+async def _call_internal_api_post(
+    path: str,
+    json_body: dict,
+    extra_headers: dict | None = None,
+    timeout: int | None = None,
+) -> dict:
+    """
+    Helper: POST ke peri-bugi-api internal endpoint.
+
+    Berbeda dengan _call_internal_api yang GET-only:
+    - Support JSON body
+    - Support extra headers (e.g. X-Request-ID untuk trace propagation)
+    - Configurable timeout (default _TIMEOUT, untuk image analysis perlu lebih lama)
+    """
+    if not settings.PERI_API_URL:
+        return {"status": "failed", "error": "PERI_API_URL tidak diset"}
+
+    url = f"{settings.PERI_API_URL.rstrip('/')}{path}"
+    headers = dict(_INTERNAL_HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+
+    actual_timeout = timeout or _TIMEOUT
+
+    try:
+        async with httpx.AsyncClient(timeout=actual_timeout) as client:
+            resp = await client.post(url, json=json_body, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.TimeoutException:
+        logger.warning(f"[internal_api_post] Timeout: {path}")
+        return {"status": "failed", "error": "timeout", "error_code": "api_timeout"}
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"[internal_api_post] HTTP {e.response.status_code}: {path}")
+        return {
+            "status": "failed",
+            "error": f"HTTP {e.response.status_code}",
+            "error_code": "api_http_error",
+        }
+    except Exception as e:
+        logger.exception(f"[internal_api_post] Error: {path}: {e}")
+        return {
+            "status": "failed",
+            "error": str(e)[:200],
+            "error_code": "api_unknown_error",
+        }
+
+
 # =============================================================================
 # Rapot Peri Agent
 # =============================================================================
@@ -123,22 +171,31 @@ async def cerita_peri_agent(state: AgentState) -> dict[str, Any]:
 
 async def mata_peri_agent(state: AgentState) -> dict[str, Any]:
     """
-    Ambil riwayat scan Mata Peri dan narasi hasil.
+    Mata Peri agent — handle 2 mode:
+      Mode A (image-based): user kirim foto di chat → analyze via Tanya Peri pipeline
+      Mode B (history-based): user tanya soal scan history → ambil dari api
 
-    Dua mode:
-    1. Image baru dikirim → forward ke ai-cv untuk analisis
-    2. Tanya riwayat scan → ambil dari api
+    Mode A flow (Phase 4 Batch B):
+      1. Cek state["clarification_selected"] — kalau user just answered ClarificationCard,
+         pakai value itu sebagai view_hint
+      2. Detect view_hint via Hybrid Tiered (rule + LLM)
+      3a. Detected → call internal /agent/tanya-peri-analyze-image
+      3b. Ambiguous → emit clarification_data, return early (generate node skip image)
 
-    Return: {has_data, latest_scan, scans, image_analysis}
+    Returns:
+      Mode A success: {has_data, mode='new_scan_tanya_peri', image_analysis,
+                       scan_session_id, view_hint, decision_source}
+      Mode A clarification: {needs_clarification: True, clarification_data: {...}}
+      Mode A failed: {has_data: False, mode='new_scan_failed', fallback_text}
+      Mode B: {has_data, latest_scan, scans, source}
     """
     image_url = state.get("image_url")
 
-    # Mode 1: ada gambar baru → analisis via ai-cv
-    if image_url and settings.AI_CV_URL:
-        result = await _analyze_image(state, image_url)
-        return result
+    # Mode A: image-based analysis
+    if image_url:
+        return await _analyze_chat_image(state, image_url)
 
-    # Mode 2: tanya riwayat → ambil dari api
+    # Mode B: history-based query (existing flow — preserved)
     ctx = state.get("user_context", {})
     user = ctx.get("user") or {}
     user_id = user.get("id")
@@ -172,35 +229,190 @@ async def mata_peri_agent(state: AgentState) -> dict[str, Any]:
     return data
 
 
-async def _analyze_image(state: AgentState, image_url: str) -> dict[str, Any]:
-    """Forward image ke ai-cv untuk analisis YOLO."""
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"{settings.AI_CV_URL}/analyze",
-                json={"image_url": image_url},
-                headers={"X-Internal-Secret": settings.INTERNAL_SECRET},
-            )
-            resp.raise_for_status()
-            result = resp.json()
+# =============================================================================
+# Mode A: Analyze chat image (Phase 4 Batch B)
+# =============================================================================
 
-        state["image_analysis"] = result
+# View options untuk ClarificationCard saat hint ambigu
+_VIEW_CLARIFICATION_OPTIONS = [
+    {"id": "front", "label": "Tampak Depan", "icon": "🦷"},
+    {"id": "upper", "label": "Rahang Atas", "icon": "⬆️"},
+    {"id": "lower", "label": "Rahang Bawah", "icon": "⬇️"},
+    {"id": "left", "label": "Sisi Kiri", "icon": "◀"},
+    {"id": "right", "label": "Sisi Kanan", "icon": "▶"},
+    {"id": "skip", "label": "Lewati (depan saja)", "icon": "🤷"},
+]
+
+_CLARIFICATION_QUESTION = (
+    "Foto ini tampak gigi bagian mana ya, Bu? Biar Peri analisa lebih tepat 😊"
+)
+
+
+def _get_last_user_message(state: AgentState) -> str:
+    """Ambil text pesan user terakhir dari state."""
+    messages = state.get("messages") or []
+    for msg in reversed(messages):
+        # Format: {role: 'user', content: '...'}
+        if isinstance(msg, dict):
+            if msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    return content
+                # content bisa list of parts (text + image) — extract text
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            return part.get("text", "")
+                return ""
+    return ""
+
+
+async def _analyze_chat_image(state: AgentState, image_url: str) -> dict[str, Any]:
+    """
+    Multi-step image analysis flow.
+
+    Step 1: Cek apakah ini retry setelah user pilih clarification
+    Step 2: Detect view_hint via Hybrid Tiered
+    Step 3a: Ambiguous → emit clarification, return early
+    Step 3b: Detected → call internal API → save result ke state
+    """
+    from app.agents.utils.view_hint_detector import detect_view_hint
+
+    user_text = _get_last_user_message(state)
+
+    # ===== Step 1: Check clarification reply =====
+    clarification_selected = state.get("clarification_selected") or []
+    view_hint: str | None = None
+    decision_source: str = "ambiguous"
+
+    if clarification_selected:
+        # User just answered ClarificationCard
+        selected = clarification_selected[0] if isinstance(clarification_selected, list) else clarification_selected
+        if selected == "skip":
+            view_hint = "front"  # default fallback
+            decision_source = "user_skip"
+        elif selected in {"front", "upper", "lower", "left", "right"}:
+            view_hint = selected
+            decision_source = "user_clarification"
+
+    # ===== Step 2: Detect via Hybrid Tiered (kalau belum dapat dari clarification) =====
+    if view_hint is None:
+        llm_provider = state.get("llm_provider_override")
+        llm_model = state.get("llm_model_override")
+        view_hint, decision_source = await detect_view_hint(
+            text=user_text,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+        )
+
+    # ===== Step 3a: Ambiguous → emit clarification =====
+    if view_hint is None:
+        logger.info(
+            f"[mata_peri_agent] View hint ambiguous, emit clarification: "
+            f"text={user_text[:60]}"
+        )
+        state["needs_clarification"] = True
+        state["clarification_data"] = {
+            "type": "single_select",
+            "question": _CLARIFICATION_QUESTION,
+            "options": _VIEW_CLARIFICATION_OPTIONS,
+        }
         state["tool_calls"].append({
-            "tool": "image_analysis",
+            "tool": "view_hint_detection",
             "agent": "mata_peri",
-            "input": {"image_url": image_url[:80]},
-            "result": {"status": "success", "summary_status": result.get("summary_status")},
+            "input": {"text": user_text[:100]},
+            "result": {"decision_source": "ambiguous", "needs_clarification": True},
         })
         return {
-            "has_data": True,
-            "image_analysis": result,
-            "mode": "new_scan",
+            "has_data": False,
+            "mode": "clarification_pending",
+            "needs_clarification": True,
         }
-    except Exception as e:
-        state["tool_calls"].append({
-            "tool": "image_analysis",
-            "agent": "mata_peri",
-            "input": {"image_url": image_url[:80]},
-            "result": {"error": str(e)},
-        })
-        return {"has_data": False, "error": str(e), "mode": "new_scan"}
+
+    # ===== Step 3b: Call internal API untuk full analyze =====
+    user_ctx = state.get("user_context", {}) or {}
+    user_obj = user_ctx.get("user") or {}
+    user_id = user_obj.get("id")
+    chat_message_id = state.get("chat_message_id")
+    trace_id = state.get("trace_id") or state.get("request_id")
+
+    if not user_id:
+        logger.error("[mata_peri_agent] user_id tidak tersedia di state")
+        return {
+            "has_data": False,
+            "mode": "new_scan_failed",
+            "error": "user_id_missing",
+            "fallback_text": (
+                "Maaf, Peri tidak bisa proses foto kamu sekarang. Coba beberapa saat lagi ya."
+            ),
+        }
+
+    payload = {
+        "user_id": user_id,
+        "image_url": image_url,
+        "view_hint": view_hint,
+        "chat_message_id": chat_message_id,
+        "trace_id": trace_id,
+    }
+
+    headers = {}
+    if trace_id:
+        headers["X-Request-ID"] = trace_id
+
+    # Image analysis butuh waktu — pakai timeout lebih panjang
+    response = await _call_internal_api_post(
+        "/api/v1/internal/agent/tanya-peri-analyze-image",
+        json_body=payload,
+        extra_headers=headers,
+        timeout=120,  # ai-cv pipeline could take up to 2 min cold start
+    )
+
+    response_status = response.get("status")
+    error_code = response.get("error_code")
+    scan_session_id = response.get("scan_session_id")
+    ai_response = response.get("ai_response")
+
+    state["tool_calls"].append({
+        "tool": "tanya_peri_analyze_image",
+        "agent": "mata_peri",
+        "input": {
+            "view_hint": view_hint,
+            "decision_source": decision_source,
+            "image_url_preview": image_url[:80],
+        },
+        "result": {
+            "status": response_status,
+            "scan_session_id": scan_session_id,
+            "error_code": error_code,
+        },
+    })
+
+    if response_status != "success" or not ai_response:
+        # Graceful failure — pesan empati ke user via fallback_text
+        fallback_msg = response.get("error_message") or (
+            "Maaf, Peri lagi belum bisa cek foto kamu detail. "
+            "Tapi dari pertanyaanmu Peri tetap bisa bantu."
+        )
+        logger.warning(
+            f"[mata_peri_agent] Analyze failed: code={error_code} msg={fallback_msg[:100]}"
+        )
+        return {
+            "has_data": False,
+            "mode": "new_scan_failed",
+            "error": error_code or "analysis_failed",
+            "fallback_text": fallback_msg,
+            "scan_session_id": scan_session_id,  # might exist meski failed (audit)
+        }
+
+    # ===== Success — save result ke state untuk generate node =====
+    state["image_analysis"] = ai_response
+    state["scan_session_id"] = scan_session_id
+
+    return {
+        "has_data": True,
+        "mode": "new_scan_tanya_peri",
+        "image_analysis": ai_response,
+        "scan_session_id": scan_session_id,
+        "view_hint": view_hint,
+        "decision_source": decision_source,
+    }

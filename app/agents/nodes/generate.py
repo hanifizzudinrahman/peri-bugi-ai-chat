@@ -10,7 +10,7 @@ Update v2:
 """
 import json
 import time
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -113,13 +113,34 @@ def _build_system_prompt(state: AgentState) -> str:
         faq_text = "\n\n".join(faq_docs[:3])
         system += f"\n\nInfo aplikasi yang relevan:\n{faq_text}"
 
-    # Image analysis (Mata Peri agent - Phase 2)
+    # Image analysis (Mata Peri agent - Phase 2 / Tanya Peri image - Phase 4 Batch B)
     image_analysis = state.get("image_analysis")
     if image_analysis:
-        system += (
-            f"\n\nHasil analisis gambar gigi: "
-            f"{image_analysis.get('summary', 'tidak tersedia')}."
-        )
+        # AnalyzeResponse dari ai-cv punya struktur:
+        # { session_summary: { summary_status, summary_text, recommendation_text, ... }, results: [...] }
+        # Backward compat: kalau dari _analyze_image lama (deprecated), fallback ke field 'summary'.
+        session_summary = image_analysis.get("session_summary") if isinstance(image_analysis, dict) else None
+
+        if session_summary:
+            sum_status = session_summary.get("summary_status") or "tidak diketahui"
+            sum_text = session_summary.get("summary_text") or ""
+            rec_text = session_summary.get("recommendation_text") or ""
+            system += (
+                f"\n\nHasil analisis foto gigi anak:\n"
+                f"- Status: {sum_status}\n"
+                f"- Ringkasan: {sum_text}\n"
+                f"- Saran: {rec_text}\n\n"
+                f"Gunakan info di atas untuk merespon pertanyaan user dengan empati. "
+                f"Jangan ulangi semua detail — fokus jawab pertanyaan user dan beri "
+                f"konteks dari hasil analisis seperlunya. Hasil sudah ditampilkan di "
+                f"card terpisah, jadi cukup berkomentar singkat soal hasilnya."
+            )
+        else:
+            # Backward compat — old _analyze_image format (Phase 2)
+            system += (
+                f"\n\nHasil analisis gambar gigi: "
+                f"{image_analysis.get('summary', 'tidak tersedia')}."
+            )
 
     # ── Response mode instructions ────────────────────────────────────────────
     response_mode = state.get("response_mode", "simple")
@@ -292,7 +313,9 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
     tps = round(output_tokens / (generation_ms / 1000), 1) if generation_ms and generation_ms > 0 else None
 
     state["final_response"] = full_response
-    state["llm_metadata"] = {
+    # Build llm_metadata for client. Tambahan field has_image_analysis +
+    # scan_session_id untuk FE render compact card di chat bubble.
+    metadata: dict[str, Any] = {
         "model": get_model_name(provider=_provider, model=_model),
         "provider": get_provider_name(provider=_provider),
         "agents_used": list(state.get("agent_results", {}).keys()),
@@ -303,6 +326,23 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
         "tokens_per_second": tps,
         "output_tokens_approx": output_tokens,
     }
+    # Tag has_image_analysis kalau ada session_summary structure
+    # (Tanya Peri image analysis dari Phase 4 Batch B).
+    image_analysis_state = state.get("image_analysis")
+    if isinstance(image_analysis_state, dict) and image_analysis_state.get("session_summary"):
+        metadata["has_image_analysis"] = True
+        scan_session_id = state.get("scan_session_id")
+        if scan_session_id:
+            metadata["scan_session_id"] = scan_session_id
+        # Include compact subset of session_summary buat FE render card tanpa fetch ulang
+        ss = image_analysis_state.get("session_summary", {})
+        metadata["image_analysis_summary"] = {
+            "summary_status": ss.get("summary_status"),
+            "summary_text": ss.get("summary_text"),
+            "recommendation_text": ss.get("recommendation_text"),
+            "requires_dentist_review": ss.get("requires_dentist_review", False),
+        }
+    state["llm_metadata"] = metadata
 
     log = LLMCallLogPayload(
         prompt_key=f"generate_{state.get('response_mode', 'simple')}",

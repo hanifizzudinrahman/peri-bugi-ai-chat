@@ -40,8 +40,29 @@ class ChatRequest(BaseModel):
     timezone: str = Field(default="Asia/Jakarta")
     source: str = Field(default="web")
     image_url: Optional[str] = None
+    image_url_public: Optional[str] = Field(
+        default=None,
+        description=(
+            "Public URL untuk display di FE chat bubble. image_url adalah internal URL "
+            "untuk container access; image_url_public direturn untuk render."
+        ),
+    )
     clarification_selected: Optional[list[str]] = None
     quick_reply_option_id: Optional[str] = None
+    chat_message_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "UUID chat_messages.id dari user message yang baru saja disave. "
+            "Dipakai untuk audit trail di MataPeriScanSession.source_chat_message_id."
+        ),
+    )
+    trace_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "X-Request-ID untuk observability propagation lintas service. "
+            "Generated di api, forwarded ke ai-chat, ai-cv via header."
+        ),
+    )
 
 
 # =============================================================================
