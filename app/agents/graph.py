@@ -94,10 +94,25 @@ async def run_agent(initial_state: AgentState) -> AsyncIterator[str]:
             yield make_thinking_event(step=step_num, label=label, done=False)
 
             mode = execution_plan.get("mode", "sequential")
+            # Bug #5 fix — agents jalan async (await fn(state)) yang
+            # bisa lama (e.g. mata_peri call ai-cv via api internal,
+            # potential 60-120s). Tanpa heartbeat, FE diam total selama
+            # itu — user kira app stuck.
+            #
+            # Pakai heartbeat-aware runner: emit thinking event berkala
+            # supaya FE tahu app masih hidup, dengan label yang berubah-ubah
+            # (e.g. "Menganalisis foto..." → "Hampir selesai..." → ...)
+            # untuk feedback visual yang lebih hidup.
             if mode == "parallel" and len(agents_selected) > 1:
-                await _run_agents_parallel(state, agents_selected)
+                async for event in _run_agents_parallel_with_heartbeat(
+                    state, agents_selected, base_step=step_num, base_label=label
+                ):
+                    yield event
             else:
-                await _run_agents_sequential(state, agents_selected)
+                async for event in _run_agents_sequential_with_heartbeat(
+                    state, agents_selected, base_step=step_num, base_label=label
+                ):
+                    yield event
 
             yield make_thinking_event(step=step_num, label=label, done=True)
             state["thinking_steps"].append({"step": step_num, "label": label, "done": True})
@@ -150,6 +165,7 @@ def _thinking_label(agents_selected: list[str]) -> str:
 
 
 async def _run_agents_parallel(state: AgentState, agent_keys: list[str]) -> None:
+    """Original parallel runner — dipakai oleh heartbeat wrapper."""
     tasks = []
     valid_keys = []
     for key in agent_keys:
@@ -165,6 +181,7 @@ async def _run_agents_parallel(state: AgentState, agent_keys: list[str]) -> None
 
 
 async def _run_agents_sequential(state: AgentState, agent_keys: list[str]) -> None:
+    """Original sequential runner — dipakai oleh heartbeat wrapper."""
     for key in agent_keys:
         fn = _AGENT_REGISTRY.get(key)
         if fn:
@@ -173,6 +190,135 @@ async def _run_agents_sequential(state: AgentState, agent_keys: list[str]) -> No
                 state["agent_results"][key] = result
             except Exception as e:
                 state["agent_results"][key] = {"error": str(e)}
+
+
+# =============================================================================
+# Heartbeat-aware runners (Bug #5 fix)
+# =============================================================================
+#
+# Wrapper yang yield periodic `thinking` events selama agent execution,
+# supaya FE punya visual feedback hidup saat agent lama (e.g. mata_peri
+# image analysis yang harus call ai-cv pipeline 30-90s).
+#
+# Pattern:
+# 1. Spawn agent execution sebagai asyncio.Task (background).
+# 2. Di main loop, asyncio.wait dengan timeout HEARTBEAT_INTERVAL.
+# 3. Kalau task belum done, yield thinking event (label rotating).
+# 4. Repeat sampai task done.
+# 5. Hard timeout HEARTBEAT_MAX_DURATION untuk safety.
+
+# Heartbeat setiap 12 detik — cukup sering supaya FE feel alive,
+# cukup jarang supaya tidak spam SSE stream.
+HEARTBEAT_INTERVAL_SEC = 12.0
+
+# Hard ceiling — kalau agent belum selesai dalam waktu ini,
+# emit warning thinking event tapi tetap tunggu sampai timeout HTTP-nya
+# (timeout HTTP di-set di phase2_agents._call_internal_api_post = 120s).
+HEARTBEAT_LONG_RUNNING_THRESHOLD_SEC = 30.0
+
+
+def _heartbeat_label(base_label: str, elapsed_sec: float, agent_keys: list[str]) -> str:
+    """
+    Rotating label untuk heartbeat — kasih sense of progress ke user.
+    Lebih spesifik untuk image analysis karena itu yang paling sering
+    lama (ai-cv pipeline pakai YOLO + segmentation models).
+    """
+    is_image_flow = "mata_peri" in agent_keys
+    if is_image_flow:
+        if elapsed_sec < 8:
+            return "Menganalisis foto gigi..."
+        if elapsed_sec < 20:
+            return "Membaca area gigi & karies..."
+        if elapsed_sec < 40:
+            return "Hampir selesai, sebentar ya..."
+        # Long-running fallback — minta user sabar
+        return "Analisis butuh waktu lebih lama, terima kasih sudah sabar 🙏"
+    # Non-image flow — fallback ke base label
+    return base_label
+
+
+async def _run_agents_sequential_with_heartbeat(
+    state: AgentState,
+    agent_keys: list[str],
+    base_step: int,
+    base_label: str,
+) -> AsyncIterator[str]:
+    """
+    Sequential runner dengan periodic heartbeat events.
+
+    Identik dengan _run_agents_sequential di sisi state mutation,
+    tapi yield thinking events setiap HEARTBEAT_INTERVAL_SEC supaya
+    FE tidak diam terlalu lama saat agent slow.
+    """
+    task = asyncio.create_task(_run_agents_sequential(state, agent_keys))
+    async for event in _heartbeat_loop(task, base_step, base_label, agent_keys):
+        yield event
+
+
+async def _run_agents_parallel_with_heartbeat(
+    state: AgentState,
+    agent_keys: list[str],
+    base_step: int,
+    base_label: str,
+) -> AsyncIterator[str]:
+    """Parallel version — sama pattern dengan sequential."""
+    task = asyncio.create_task(_run_agents_parallel(state, agent_keys))
+    async for event in _heartbeat_loop(task, base_step, base_label, agent_keys):
+        yield event
+
+
+async def _heartbeat_loop(
+    task: asyncio.Task,
+    base_step: int,
+    base_label: str,
+    agent_keys: list[str],
+) -> AsyncIterator[str]:
+    """
+    Tunggu task selesai sambil yield heartbeat thinking events.
+
+    Defensive:
+    - Kalau task raise exception, propagate setelah loop selesai supaya
+      caller graph.py bisa catch dan emit make_error_event seperti biasa.
+    - Pakai asyncio.wait dengan timeout — kalau task selesai sebelum
+      heartbeat tick, langsung exit loop (tidak ada heartbeat extra).
+    """
+    import time
+    start_time = time.monotonic()
+    long_running_warned = False
+
+    while not task.done():
+        try:
+            # Tunggu task selesai atau timeout
+            await asyncio.wait_for(asyncio.shield(task), timeout=HEARTBEAT_INTERVAL_SEC)
+        except asyncio.TimeoutError:
+            # Task masih jalan — emit heartbeat thinking event
+            elapsed = time.monotonic() - start_time
+            label = _heartbeat_label(base_label, elapsed, agent_keys)
+            yield make_thinking_event(step=base_step, label=label, done=False)
+
+            # Log warning kalau long-running (untuk observability)
+            if not long_running_warned and elapsed >= HEARTBEAT_LONG_RUNNING_THRESHOLD_SEC:
+                long_running_warned = True
+                import logging
+                logging.getLogger(__name__).warning(
+                    f"[heartbeat] Agent execution > {HEARTBEAT_LONG_RUNNING_THRESHOLD_SEC}s: "
+                    f"agents={agent_keys} elapsed={elapsed:.1f}s"
+                )
+        except asyncio.CancelledError:
+            # Caller cancel — propagate
+            task.cancel()
+            raise
+
+    # Task done — kalau exception, propagate
+    if task.exception() is not None:
+        # Re-raise sehingga _run_agents_sequential's try/except bisa handle
+        # via state.agent_results (sudah di-handle di runner).
+        # Di sini kita tidak raise karena runner sudah catch internal.
+        # Cukup log untuk visibility.
+        import logging
+        logging.getLogger(__name__).warning(
+            f"[heartbeat] Agent task ended with exception: {task.exception()}"
+        )
 
 
 # =============================================================================

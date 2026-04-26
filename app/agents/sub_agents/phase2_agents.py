@@ -374,12 +374,22 @@ async def _analyze_chat_image(state: AgentState, image_url: str) -> dict[str, An
     if trace_id:
         headers["X-Request-ID"] = trace_id
 
-    # Image analysis butuh waktu — pakai timeout lebih panjang
+    # Image analysis butuh waktu — tapi timeout ini harus LEBIH KECIL
+    # daripada AI_CHAT_TIMEOUT_SECONDS (default 120s di api side) supaya
+    # kita fail dulu dengan error message yang user-friendly, bukan dapet
+    # generic "Tanya Peri tidak merespons" dari proxy timeout di api.
+    #
+    # Chain timeout:
+    #   web SSE read    : tidak ada hard limit
+    #   api → ai-chat   : AI_CHAT_TIMEOUT_SECONDS = 120s
+    #   ai-chat → api   : 90s (di sini) ← LEBIH KECIL, kasih buffer 30s
+    #   api → ai-cv     : AI_BACKEND_TIMEOUT_SECONDS = 60s
+    # Bug #5 fix — turunin dari 120 jadi 90.
     response = await _call_internal_api_post(
         "/api/v1/internal/agent/tanya-peri-analyze-image",
         json_body=payload,
         extra_headers=headers,
-        timeout=120,  # ai-cv pipeline could take up to 2 min cold start
+        timeout=90,
     )
 
     response_status = response.get("status")
@@ -403,10 +413,34 @@ async def _analyze_chat_image(state: AgentState, image_url: str) -> dict[str, An
     })
 
     if response_status != "success" or not ai_response:
-        # Graceful failure — pesan empati ke user via fallback_text
-        fallback_msg = response.get("error_message") or (
-            "Maaf, Peri lagi belum bisa cek foto kamu detail. "
-            "Tapi dari pertanyaanmu Peri tetap bisa bantu."
+        # Graceful failure — pesan empati ke user via fallback_text.
+        # Bug #5 fix — pesan disesuaikan dengan error_code supaya user
+        # tahu apa yang salah (timeout vs ai down vs no_active_child).
+        error_message_overrides = {
+            "api_timeout": (
+                "Maaf, analisis foto butuh waktu lebih lama dari biasanya. "
+                "Coba kirim foto lagi sebentar lagi ya, atau tanya tanpa foto dulu."
+            ),
+            "ai_timeout": (
+                "Maaf, AI lagi sibuk menganalisis. Coba kirim foto lagi sebentar "
+                "ya — biasanya 1-2 menit udah lancar lagi."
+            ),
+            "ai_http_error": (
+                "Maaf, ada gangguan di sistem analisis foto. "
+                "Coba lagi nanti ya, atau langsung tanya tanpa foto dulu."
+            ),
+            "no_active_child": (
+                "Untuk analisis foto, profil anak harus dibuat dulu ya. "
+                "Silakan buka menu Profil > Tambah Anak."
+            ),
+        }
+        fallback_msg = (
+            response.get("error_message")
+            or error_message_overrides.get(error_code or "")
+            or (
+                "Maaf, Peri lagi belum bisa cek foto kamu detail. "
+                "Tapi dari pertanyaanmu Peri tetap bisa bantu."
+            )
         )
         logger.warning(
             f"[mata_peri_agent] Analyze failed: code={error_code} msg={fallback_msg[:100]}"
