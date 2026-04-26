@@ -19,6 +19,7 @@ class AgentState(TypedDict):
     quick_reply_option_id: Optional[str]
     chat_message_id: Optional[str]      # UUID chat_messages.id (audit Tanya Peri image analysis)
     trace_id: Optional[str]             # X-Request-ID untuk observability propagation
+    source: Optional[str]               # Device origin: 'web' | 'mobile' (untuk MataPeriScanSession.source)
 
     # ── Agent routing ─────────────────────────────────────────────────────────
     allowed_agents: list[str]           # agents yang boleh dipakai user ini

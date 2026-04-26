@@ -368,6 +368,9 @@ async def _analyze_chat_image(state: AgentState, image_url: str) -> dict[str, An
         "view_hint": view_hint,
         "chat_message_id": chat_message_id,
         "trace_id": trace_id,
+        # Bug A fix — forward source dari request supaya MataPeriScanSession.source
+        # akurat (web/mobile), bukan hardcoded 'mobile'.
+        "source": state.get("source"),
     }
 
     headers = {}
