@@ -330,20 +330,74 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
     # Per-call trace config (no-op kalau Langfuse disabled)
     trace_config = build_trace_config(state=state, agent_name="generate")
 
-    try:
-        async for chunk in llm.astream(lc_messages, config=trace_config):
-            token = chunk.content
-            if not token:
-                continue
-            if t_first_token is None:
-                t_first_token = time.monotonic()
-            full_response += token
-            output_tokens += 1
-            yield make_token_event(token)
+    # Phase 4: extract last user message untuk trace input
+    user_msg_text = ""
+    last_user_msg = next(
+        (m for m in reversed(state.get("messages", []))
+         if isinstance(m, dict) and m.get("role") == "user"),
+        None,
+    )
+    if last_user_msg:
+        content = last_user_msg.get("content", "")
+        if isinstance(content, str):
+            user_msg_text = content
+        elif isinstance(content, list):
+            # Multimodal — extract text part
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    user_msg_text = part.get("text", "")
+                    break
 
-    except Exception as e:
-        success = False
-        error_msg = str(e)
+    # Phase 4: generation span — capture full prompt + output untuk diagnostic
+    from app.config.observability import trace_generation
+
+    async with trace_generation(
+        name="generate",
+        model=get_model_name(provider=_provider, model=_model),
+        system_prompt=system_prompt,
+        messages=lc_messages,
+        user_message=user_msg_text,
+        metadata={
+            "agents_used": list(state.get("agent_results", {}).keys()),
+            "response_mode": state.get("response_mode", "simple"),
+            "has_image_analysis": bool(state.get("image_analysis")),
+            "child_name": _get_child_name(state),
+            "provider": get_provider_name(provider=_provider),
+        },
+    ) as gen_span:
+        try:
+            async for chunk in llm.astream(lc_messages, config=trace_config):
+                token = chunk.content
+                if not token:
+                    continue
+                if t_first_token is None:
+                    t_first_token = time.monotonic()
+                full_response += token
+                output_tokens += 1
+                yield make_token_event(token)
+
+        except Exception as e:
+            success = False
+            error_msg = str(e)
+            if gen_span:
+                gen_span.update(
+                    output=f"[ERROR] {str(e)[:500]}",
+                    level="ERROR",
+                    status_message=str(e)[:200],
+                )
+
+        # Phase 4: capture output ke generation span (sebelum exit context)
+        # Dilakukan di sini supaya keep timing accurate (di dalam context)
+        if gen_span and success:
+            try:
+                gen_span.update(
+                    output=full_response[:5000] if full_response else "(empty)",
+                    usage_details={
+                        "output": output_tokens,  # approx token count
+                    },
+                )
+            except Exception:
+                pass  # defensive — jangan break flow kalau Langfuse error
 
     t_end = time.monotonic()
     total_latency_ms = int((t_end - t_start) * 1000)

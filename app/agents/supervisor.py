@@ -219,52 +219,88 @@ async def supervisor_node(state: AgentState) -> AsyncIterator[str]:
     last_message = user_messages[-1].get("content", "") if user_messages else ""
     allowed_agents = state.get("allowed_agents", [])
 
-    yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=False)
+    # Phase 4: wrap node body with trace span
+    from app.config.observability import trace_node
 
-    # Force intent dari RnD mode
-    force_intent = state.get("force_intent")
-    if force_intent:
-        state["agents_selected"] = [force_intent] if force_intent in allowed_agents else []
-        state["execution_plan"] = {"mode": "sequential", "reasoning": "force_intent"}
+    async with trace_node(
+        name="supervisor",
+        state=state,
+        input_data={
+            "user_message": last_message[:500] if isinstance(last_message, str) else "",
+            "has_image": bool(state.get("image_url")),
+            "force_intent": state.get("force_intent"),
+            "allowed_agents": allowed_agents,
+        },
+    ) as span:
+        yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=False)
+
+        # Force intent dari RnD mode
+        force_intent = state.get("force_intent")
+        if force_intent:
+            state["agents_selected"] = [force_intent] if force_intent in allowed_agents else []
+            state["execution_plan"] = {"mode": "sequential", "reasoning": "force_intent"}
+            if span:
+                span.update(output={
+                    "agents_selected": state["agents_selected"],
+                    "execution_plan": state["execution_plan"],
+                    "decision_path": "force_intent",
+                })
+            yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=True)
+            state["thinking_steps"].append({"step": 1, "label": "Memahami pertanyaanmu...", "done": True})
+            return
+
+        # Juga cek image_url — otomatis tambah mata_peri
+        if state.get("image_url") and "mata_peri" in allowed_agents:
+            state["agents_selected"] = ["mata_peri"]
+            state["execution_plan"] = {"mode": "sequential", "reasoning": "image_detected"}
+            if span:
+                span.update(output={
+                    "agents_selected": state["agents_selected"],
+                    "execution_plan": state["execution_plan"],
+                    "decision_path": "image_auto",
+                })
+            yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=True)
+            state["thinking_steps"].append({"step": 1, "label": "Memahami pertanyaanmu...", "done": True})
+            return
+
+        # Rule-based
+        agents = _classify_rule_based(last_message, allowed_agents)
+        decision_path = "rule_based"
+
+        if agents is None:
+            # LLM fallback
+            decision_path = "llm_fallback"
+            supervisor_prompt = state.get("prompts", {}).get("supervisor_route", "")
+            if supervisor_prompt:
+                agents, log = await _classify_by_llm(
+                    message=last_message,
+                    allowed_agents=allowed_agents,
+                    prompt_template=supervisor_prompt,
+                    provider=state.get("llm_provider_override"),
+                    model=state.get("llm_model_override"),
+                    state=state,  # untuk Langfuse trace metadata
+                )
+                state["llm_call_logs"].append(log.model_dump())
+            else:
+                # No prompt → default ke kb_dental jika allowed
+                agents = ["kb_dental"] if "kb_dental" in allowed_agents else []
+                decision_path = "no_prompt_default"
+
+        # Tentukan mode eksekusi
+        # Sequential jika satu agent butuh hasil agent lain (saat ini belum ada case)
+        # Parallel untuk semua kasus lainnya
+        mode = "parallel" if len(agents) > 1 else "sequential"
+
+        state["agents_selected"] = agents
+        state["execution_plan"] = {"mode": mode, "reasoning": "auto"}
+
+        # Phase 4: capture decision output
+        if span:
+            span.update(output={
+                "agents_selected": agents,
+                "execution_plan": state["execution_plan"],
+                "decision_path": decision_path,
+            })
+
         yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=True)
         state["thinking_steps"].append({"step": 1, "label": "Memahami pertanyaanmu...", "done": True})
-        return
-
-    # Juga cek image_url — otomatis tambah mata_peri
-    if state.get("image_url") and "mata_peri" in allowed_agents:
-        state["agents_selected"] = ["mata_peri"]
-        state["execution_plan"] = {"mode": "sequential", "reasoning": "image_detected"}
-        yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=True)
-        state["thinking_steps"].append({"step": 1, "label": "Memahami pertanyaanmu...", "done": True})
-        return
-
-    # Rule-based
-    agents = _classify_rule_based(last_message, allowed_agents)
-
-    if agents is None:
-        # LLM fallback
-        supervisor_prompt = state.get("prompts", {}).get("supervisor_route", "")
-        if supervisor_prompt:
-            agents, log = await _classify_by_llm(
-                message=last_message,
-                allowed_agents=allowed_agents,
-                prompt_template=supervisor_prompt,
-                provider=state.get("llm_provider_override"),
-                model=state.get("llm_model_override"),
-                state=state,  # untuk Langfuse trace metadata
-            )
-            state["llm_call_logs"].append(log.model_dump())
-        else:
-            # No prompt → default ke kb_dental jika allowed
-            agents = ["kb_dental"] if "kb_dental" in allowed_agents else []
-
-    # Tentukan mode eksekusi
-    # Sequential jika satu agent butuh hasil agent lain (saat ini belum ada case)
-    # Parallel untuk semua kasus lainnya
-    mode = "parallel" if len(agents) > 1 else "sequential"
-
-    state["agents_selected"] = agents
-    state["execution_plan"] = {"mode": mode, "reasoning": "auto"}
-
-    yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=True)
-    state["thinking_steps"].append({"step": 1, "label": "Memahami pertanyaanmu...", "done": True})

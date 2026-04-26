@@ -161,38 +161,65 @@ async def rapot_peri_agent(state: AgentState) -> dict[str, Any]:
     user = ctx.get("user") or {}
     user_id = user.get("id")
 
-    if not user_id:
-        # Fallback ke user_context yang sudah di-inject
-        brushing = ctx.get("brushing")
-        child = ctx.get("child") or {}
+    # Phase 4: wrap agent body with trace_node
+    from app.config.observability import trace_node
+
+    async with trace_node(
+        name="rapot_peri_agent",
+        state=state,
+        input_data={
+            "has_user_id": bool(user_id),
+            "has_brushing_in_context": ctx.get("brushing") is not None,
+        },
+    ) as span:
+        if not user_id:
+            # Fallback ke user_context yang sudah di-inject
+            brushing = ctx.get("brushing")
+            child = ctx.get("child") or {}
+            state["tool_calls"].append({
+                "tool": "get_brushing_stats",
+                "agent": "rapot_peri",
+                "input": {"source": "user_context_fallback"},
+                "result": {"has_data": brushing is not None},
+            })
+            result = {
+                "child_name": child.get("nickname") or child.get("full_name", "si kecil"),
+                "streak": brushing,
+                "has_data": brushing is not None,
+                "source": "user_context",
+            }
+            if span:
+                span.update(output={
+                    "has_data": result["has_data"],
+                    "source": "user_context_fallback",
+                    "current_streak": brushing.get("current_streak") if brushing else None,
+                })
+            return result
+
+        data = await _call_internal_api(f"/api/v1/internal/agent/brushing-stats/{user_id}")
         state["tool_calls"].append({
             "tool": "get_brushing_stats",
             "agent": "rapot_peri",
-            "input": {"source": "user_context_fallback"},
-            "result": {"has_data": brushing is not None},
+            "input": {"user_id": user_id},
+            "result": {"has_data": data.get("has_data", False), "error": data.get("error")},
         })
-        return {
-            "child_name": child.get("nickname") or child.get("full_name", "si kecil"),
-            "streak": brushing,
-            "has_data": brushing is not None,
-            "source": "user_context",
-        }
 
-    data = await _call_internal_api(f"/api/v1/internal/agent/brushing-stats/{user_id}")
-    state["tool_calls"].append({
-        "tool": "get_brushing_stats",
-        "agent": "rapot_peri",
-        "input": {"user_id": user_id},
-        "result": {"has_data": data.get("has_data", False), "error": data.get("error")},
-    })
+        # Merge dengan user_context streak (lebih fresh, sudah di-inject saat request)
+        if not data.get("has_data") and ctx.get("brushing"):
+            data["streak"] = ctx["brushing"]
+            data["has_data"] = True
+            data["source"] = "user_context"
 
-    # Merge dengan user_context streak (lebih fresh, sudah di-inject saat request)
-    if not data.get("has_data") and ctx.get("brushing"):
-        data["streak"] = ctx["brushing"]
-        data["has_data"] = True
-        data["source"] = "user_context"
+        if span:
+            streak_data = data.get("streak") if isinstance(data.get("streak"), dict) else None
+            span.update(output={
+                "has_data": data.get("has_data", False),
+                "source": data.get("source", "api"),
+                "current_streak": streak_data.get("current_streak") if streak_data else None,
+                "best_streak": streak_data.get("best_streak") if streak_data else None,
+            })
 
-    return data
+        return data
 
 
 # =============================================================================
@@ -208,27 +235,44 @@ async def cerita_peri_agent(state: AgentState) -> dict[str, Any]:
     user = ctx.get("user") or {}
     user_id = user.get("id")
 
-    if not user_id:
+    # Phase 4: wrap agent body with trace_node
+    from app.config.observability import trace_node
+
+    async with trace_node(
+        name="cerita_peri_agent",
+        state=state,
+        input_data={"has_user_id": bool(user_id)},
+    ) as span:
+        if not user_id:
+            state["tool_calls"].append({
+                "tool": "get_cerita_progress",
+                "agent": "cerita_peri",
+                "input": {},
+                "result": {"error": "user_id tidak tersedia"},
+            })
+            if span:
+                span.update(output={"has_data": False, "error": "user_id_missing"})
+            return {"has_data": False, "error": "user_id tidak tersedia"}
+
+        data = await _call_internal_api(f"/api/v1/internal/agent/cerita-progress/{user_id}")
         state["tool_calls"].append({
             "tool": "get_cerita_progress",
             "agent": "cerita_peri",
-            "input": {},
-            "result": {"error": "user_id tidak tersedia"},
+            "input": {"user_id": user_id},
+            "result": {
+                "has_data": data.get("has_data", False),
+                "completed_count": data.get("completed_count", 0),
+                "total_stars": data.get("total_stars", 0),
+            },
         })
-        return {"has_data": False, "error": "user_id tidak tersedia"}
-
-    data = await _call_internal_api(f"/api/v1/internal/agent/cerita-progress/{user_id}")
-    state["tool_calls"].append({
-        "tool": "get_cerita_progress",
-        "agent": "cerita_peri",
-        "input": {"user_id": user_id},
-        "result": {
-            "has_data": data.get("has_data", False),
-            "completed_count": data.get("completed_count", 0),
-            "total_stars": data.get("total_stars", 0),
-        },
-    })
-    return data
+        if span:
+            span.update(output={
+                "has_data": data.get("has_data", False),
+                "completed_count": data.get("completed_count", 0),
+                "total_stars": data.get("total_stars", 0),
+                "current_module_id": data.get("current_module_id"),
+            })
+        return data
 
 
 # =============================================================================
@@ -257,42 +301,88 @@ async def mata_peri_agent(state: AgentState) -> dict[str, Any]:
     """
     image_url = state.get("image_url")
 
-    # Mode A: image-based analysis
-    if image_url:
-        return await _analyze_chat_image(state, image_url)
+    # Phase 4: wrap agent body with trace_node
+    # NOTE: _analyze_chat_image dan internal API calls sudah punya child spans sendiri
+    # (trace_http_call dari Phase 3) — mereka akan nest di bawah span ini.
+    from app.config.observability import trace_node
 
-    # Mode B: history-based query (existing flow — preserved)
-    ctx = state.get("user_context", {})
-    user = ctx.get("user") or {}
-    user_id = user.get("id")
+    mode_input = "image" if image_url else "history"
+    has_clarification = bool(state.get("clarification_selected"))
 
-    # Cek user_context dulu (lebih cepat, sudah di-inject)
-    mata_peri_ctx = ctx.get("mata_peri_last_result")
-    if mata_peri_ctx:
+    async with trace_node(
+        name="mata_peri_agent",
+        state=state,
+        input_data={
+            "mode": mode_input,
+            "has_image": bool(image_url),
+            "has_clarification_selected": has_clarification,
+        },
+    ) as span:
+        # Mode A: image-based analysis
+        if image_url:
+            result = await _analyze_chat_image(state, image_url)
+            if span:
+                span.update(output={
+                    "mode": result.get("mode"),
+                    "has_data": result.get("has_data", False),
+                    "view_hint": result.get("view_hint"),
+                    "decision_source": result.get("decision_source"),
+                    "scan_session_id": result.get("scan_session_id"),
+                    "needs_clarification": result.get("needs_clarification", False),
+                })
+            return result
+
+        # Mode B: history-based query (existing flow — preserved)
+        ctx = state.get("user_context", {})
+        user = ctx.get("user") or {}
+        user_id = user.get("id")
+
+        # Cek user_context dulu (lebih cepat, sudah di-inject)
+        mata_peri_ctx = ctx.get("mata_peri_last_result")
+        if mata_peri_ctx:
+            state["tool_calls"].append({
+                "tool": "get_mata_peri_history",
+                "agent": "mata_peri",
+                "input": {"source": "user_context"},
+                "result": {"has_data": True},
+            })
+            result = {
+                "has_data": True,
+                "latest_scan": mata_peri_ctx,
+                "scans": [mata_peri_ctx],
+                "source": "user_context",
+            }
+            if span:
+                span.update(output={
+                    "mode": "history",
+                    "has_data": True,
+                    "source": "user_context",
+                })
+            return result
+
+        if not user_id:
+            if span:
+                span.update(
+                    output={"has_data": False, "error": "user_id_missing"},
+                    level="ERROR",
+                )
+            return {"has_data": False, "error": "user_id tidak tersedia"}
+
+        data = await _call_internal_api(f"/api/v1/internal/agent/mata-peri-history/{user_id}")
         state["tool_calls"].append({
             "tool": "get_mata_peri_history",
             "agent": "mata_peri",
-            "input": {"source": "user_context"},
-            "result": {"has_data": True},
+            "input": {"user_id": user_id},
+            "result": {"has_data": data.get("has_data", False), "scan_count": data.get("scan_count", 0)},
         })
-        return {
-            "has_data": True,
-            "latest_scan": mata_peri_ctx,
-            "scans": [mata_peri_ctx],
-            "source": "user_context",
-        }
-
-    if not user_id:
-        return {"has_data": False, "error": "user_id tidak tersedia"}
-
-    data = await _call_internal_api(f"/api/v1/internal/agent/mata-peri-history/{user_id}")
-    state["tool_calls"].append({
-        "tool": "get_mata_peri_history",
-        "agent": "mata_peri",
-        "input": {"user_id": user_id},
-        "result": {"has_data": data.get("has_data", False), "scan_count": data.get("scan_count", 0)},
-    })
-    return data
+        if span:
+            span.update(output={
+                "mode": "history",
+                "has_data": data.get("has_data", False),
+                "scan_count": data.get("scan_count", 0),
+                "source": "api",
+            })
+        return data
 
 
 # =============================================================================

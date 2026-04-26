@@ -379,3 +379,193 @@ async def trace_http_call(
         # Just log dan yield None.
         logger.warning(f"trace_http_call instrumentation failed for {name}: {e}")
         yield None
+
+
+# =============================================================================
+# Phase 4: Node-level + Generation Instrumentation
+# =============================================================================
+#
+# Helpers untuk wrap LangGraph node logic + LLM generation sebagai child
+# observation di Langfuse parent span. Goal: full diagnostic visibility —
+# Hanif bisa lihat per-node input/output, prompt content yang masuk LLM,
+# dan response content yang keluar.
+#
+# Pattern: 2 async context managers
+#   - trace_node      → as_type="span" untuk node logic (router, supervisor, agents)
+#   - trace_generation → as_type="generation" untuk LLM calls dengan rich UI
+#
+# Storage limits: 5000 chars per field (truncate auto), Langfuse render OK.
+
+
+def _truncate(value, max_len: int = 5000) -> str:
+    """
+    Truncate string ke max_len chars dengan suffix indicator.
+    Tidak break di middle word kalau bisa.
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + f"... [truncated {len(s) - max_len} chars]"
+
+
+def _safe_messages_for_trace(lc_messages, max_per_msg: int = 1500) -> list[dict]:
+    """
+    Convert list LangChain messages ke format aman untuk Langfuse trace.
+    Handle Image content blocks (skip base64 data, just metadata).
+    """
+    out = []
+    for m in lc_messages or []:
+        try:
+            role = type(m).__name__.replace("Message", "").lower()
+            content = getattr(m, "content", "")
+
+            # Handle multimodal content (list of content parts)
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        ptype = part.get("type", "unknown")
+                        if ptype == "text":
+                            parts.append({"type": "text", "text": _truncate(part.get("text", ""), max_per_msg)})
+                        elif ptype in ("image_url", "image"):
+                            # Skip base64 — too big untuk trace storage
+                            parts.append({"type": ptype, "url_redacted": True})
+                        else:
+                            parts.append({"type": ptype})
+                    else:
+                        parts.append({"type": "raw", "value": _truncate(str(part), 200)})
+                out.append({"role": role, "content_parts": parts})
+            else:
+                out.append({"role": role, "content": _truncate(content, max_per_msg)})
+        except Exception:
+            # Defensive — skip message yang gak bisa di-parse
+            continue
+    return out
+
+
+@asynccontextmanager
+async def trace_node(
+    name: str,
+    state: Optional[dict] = None,
+    input_data: Optional[dict] = None,
+    metadata: Optional[dict] = None,
+):
+    """
+    Context manager untuk wrap LangGraph node logic sebagai child span
+    di parent trace (kalau Langfuse enabled).
+
+    Usage:
+        async with trace_node(
+            name="supervisor",
+            state=state,
+            input_data={"user_message": msg, "has_image": True}
+        ) as span:
+            # ... node logic ...
+            if span:
+                span.update(output={"agents_selected": [...], "decision": "..."})
+
+    Behavior:
+    - Langfuse enabled  → yield Langfuse span object
+    - Langfuse disabled → yield None (caller's span.update is no-op)
+    - Instrumentation error → yield None (graceful, jangan break node logic)
+    """
+    langfuse = get_langfuse_client()
+
+    if langfuse is None:
+        yield None
+        return
+
+    try:
+        # Truncate input_data values defensively
+        safe_input = {}
+        if input_data:
+            for k, v in input_data.items():
+                if isinstance(v, str):
+                    safe_input[k] = _truncate(v, 2000)
+                elif isinstance(v, (list, dict, bool, int, float, type(None))):
+                    safe_input[k] = v
+                else:
+                    safe_input[k] = _truncate(str(v), 500)
+
+        with langfuse.start_as_current_observation(
+            as_type="span",
+            name=name,
+            input=safe_input or None,
+            metadata=metadata or {},
+        ) as span:
+            yield span
+    except Exception as e:
+        logger.warning(f"trace_node instrumentation failed for {name}: {e}")
+        yield None
+
+
+@asynccontextmanager
+async def trace_generation(
+    name: str,
+    model: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    messages: Optional[list] = None,
+    user_message: Optional[str] = None,
+    metadata: Optional[dict] = None,
+):
+    """
+    Context manager untuk wrap LLM generation sebagai 'generation' type
+    observation. Langfuse render khusus untuk generation: input/output
+    formatted nicely, model name di highlight, token count visible.
+
+    Usage:
+        async with trace_generation(
+            name="generate",
+            model="gemini-3.1-flash-lite",
+            system_prompt=full_system_prompt,
+            messages=lc_messages,
+            user_message=last_user_msg,
+            metadata={"agents_used": [...], "response_mode": "simple"},
+        ) as gen_span:
+            # ... LLM streaming ...
+            if gen_span:
+                gen_span.update(
+                    output=full_response,
+                    usage_details={"output_tokens": ...},
+                )
+
+    Behavior:
+    - Langfuse enabled  → yield Langfuse generation span
+    - Langfuse disabled → yield None
+    - Instrumentation error → yield None (graceful)
+
+    Privacy: system_prompt + messages truncated ke 5000 chars.
+    Multimodal images SKIP base64 data (too big).
+    """
+    langfuse = get_langfuse_client()
+
+    if langfuse is None:
+        yield None
+        return
+
+    try:
+        # Build input dict — comprehensive for diagnostic
+        input_data: dict = {}
+        if system_prompt is not None:
+            input_data["system_prompt"] = _truncate(system_prompt, 5000)
+        if messages is not None:
+            input_data["messages"] = _safe_messages_for_trace(messages)
+        if user_message is not None:
+            input_data["user_message"] = _truncate(user_message, 1000)
+
+        kwargs: dict = {
+            "as_type": "generation",
+            "name": name,
+            "input": input_data or None,
+            "metadata": metadata or {},
+        }
+        if model:
+            kwargs["model"] = model
+
+        with langfuse.start_as_current_observation(**kwargs) as gen_span:
+            yield gen_span
+    except Exception as e:
+        logger.warning(f"trace_generation instrumentation failed for {name}: {e}")
+        yield None

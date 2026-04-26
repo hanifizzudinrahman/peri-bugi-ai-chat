@@ -35,44 +35,69 @@ async def kb_dental_agent(state: AgentState) -> dict[str, Any]:
     query = user_messages[-1].get("content", "") if user_messages else ""
     top_k = state.get("top_k_docs", 3)
 
-    if top_k == 0:
-        state["tool_calls"].append({
-            "tool": "qdrant_retriever",
-            "agent": "kb_dental",
-            "input": {"query": query[:100]},
-            "result": {"doc_count": 0, "note": "top_k=0, RAG skipped"},
-        })
-        return {"docs": [], "source_count": 0}
+    # Phase 4: wrap agent body with trace_node
+    from app.config.observability import trace_node
 
-    docs = []
-    try:
-        retriever = _get_qdrant_retriever(
-            collection=settings.QDRANT_COLLECTION,
-            top_k=top_k,
-            provider_override=state.get("embedding_provider_override"),
-            model_override=state.get("embedding_model_override"),
-        )
-        # Per-call trace metadata: agent="kb_dental_retriever", session_id, dll
-        trace_config = build_trace_config(state=state, agent_name="kb_dental_retriever")
-        results = await retriever.ainvoke(query, config=trace_config)
-        docs = [doc.page_content for doc in results]
-        state["tool_calls"].append({
-            "tool": "qdrant_retriever",
-            "agent": "kb_dental",
-            "input": {"query": query[:100], "top_k": top_k},
-            "result": {"doc_count": len(docs)},
-        })
-    except Exception as e:
-        state["tool_calls"].append({
-            "tool": "qdrant_retriever",
-            "agent": "kb_dental",
-            "input": {"query": query[:100]},
-            "result": {"error": str(e), "fallback": "no_rag"},
-        })
+    async with trace_node(
+        name="kb_dental_agent",
+        state=state,
+        input_data={
+            "query": query[:300] if isinstance(query, str) else "",
+            "top_k": top_k,
+            "collection": settings.QDRANT_COLLECTION,
+        },
+    ) as span:
+        if top_k == 0:
+            state["tool_calls"].append({
+                "tool": "qdrant_retriever",
+                "agent": "kb_dental",
+                "input": {"query": query[:100]},
+                "result": {"doc_count": 0, "note": "top_k=0, RAG skipped"},
+            })
+            if span:
+                span.update(output={"doc_count": 0, "skipped": True})
+            return {"docs": [], "source_count": 0}
 
-    # Simpan juga ke state["retrieved_docs"] untuk backward compat
-    state["retrieved_docs"] = docs
-    return {"docs": docs, "source_count": len(docs)}
+        docs = []
+        try:
+            retriever = _get_qdrant_retriever(
+                collection=settings.QDRANT_COLLECTION,
+                top_k=top_k,
+                provider_override=state.get("embedding_provider_override"),
+                model_override=state.get("embedding_model_override"),
+            )
+            # Per-call trace metadata: agent="kb_dental_retriever", session_id, dll
+            trace_config = build_trace_config(state=state, agent_name="kb_dental_retriever")
+            results = await retriever.ainvoke(query, config=trace_config)
+            docs = [doc.page_content for doc in results]
+            state["tool_calls"].append({
+                "tool": "qdrant_retriever",
+                "agent": "kb_dental",
+                "input": {"query": query[:100], "top_k": top_k},
+                "result": {"doc_count": len(docs)},
+            })
+            if span:
+                span.update(output={
+                    "doc_count": len(docs),
+                    "docs_preview": [d[:200] for d in docs[:3]],  # first 3 docs, 200 chars each
+                })
+        except Exception as e:
+            state["tool_calls"].append({
+                "tool": "qdrant_retriever",
+                "agent": "kb_dental",
+                "input": {"query": query[:100]},
+                "result": {"error": str(e), "fallback": "no_rag"},
+            })
+            if span:
+                span.update(
+                    output={"doc_count": 0, "error": str(e)[:200], "fallback": "no_rag"},
+                    level="ERROR",
+                    status_message=str(e)[:200],
+                )
+
+        # Simpan juga ke state["retrieved_docs"] untuk backward compat
+        state["retrieved_docs"] = docs
+        return {"docs": docs, "source_count": len(docs)}
 
 
 # =============================================================================
@@ -91,32 +116,58 @@ async def user_profile_agent(state: AgentState) -> dict[str, Any]:
     brushing = ctx.get("brushing")
     mata_peri = ctx.get("mata_peri_last_result")
 
-    state["tool_calls"].append({
-        "tool": "user_context_read",
-        "agent": "user_profile",
-        "input": {"fields": ["user", "child", "brushing", "mata_peri"]},
-        "result": {
-            "has_child": child is not None,
+    # Phase 4: wrap agent body with trace_node
+    from app.config.observability import trace_node
+
+    async with trace_node(
+        name="user_profile_agent",
+        state=state,
+        input_data={
+            "fields_requested": ["user", "child", "brushing", "mata_peri"],
+            "has_user": bool(user),
+            "has_child": bool(child),
             "has_brushing": brushing is not None,
             "has_scan": mata_peri is not None,
         },
-    })
+    ) as span:
+        state["tool_calls"].append({
+            "tool": "user_context_read",
+            "agent": "user_profile",
+            "input": {"fields": ["user", "child", "brushing", "mata_peri"]},
+            "result": {
+                "has_child": child is not None,
+                "has_brushing": brushing is not None,
+                "has_scan": mata_peri is not None,
+            },
+        })
 
-    return {
-        "profile": {
-            "name": user.get("nickname") or user.get("full_name", "User"),
-            "gender": user.get("gender"),
-        },
-        "child": {
-            "name": child.get("nickname") or child.get("full_name"),
-            "age_years": child.get("age_years"),
-            "gender": child.get("gender"),
-        } if child else None,
-        "brushing": brushing,
-        "mata_peri_last": mata_peri,
-        "has_brushing_data": brushing is not None,
-        "has_scan_data": mata_peri is not None,
-    }
+        result = {
+            "profile": {
+                "name": user.get("nickname") or user.get("full_name", "User"),
+                "gender": user.get("gender"),
+            },
+            "child": {
+                "name": child.get("nickname") or child.get("full_name"),
+                "age_years": child.get("age_years"),
+                "gender": child.get("gender"),
+            } if child else None,
+            "brushing": brushing,
+            "mata_peri_last": mata_peri,
+            "has_brushing_data": brushing is not None,
+            "has_scan_data": mata_peri is not None,
+        }
+
+        if span:
+            # Output: ringkasan saja, jangan kirim sensitive data verbatim
+            span.update(output={
+                "child_name": result["child"]["name"] if result["child"] else None,
+                "child_age": result["child"]["age_years"] if result["child"] else None,
+                "has_brushing_data": result["has_brushing_data"],
+                "has_scan_data": result["has_scan_data"],
+                "current_streak": brushing.get("current_streak") if brushing else None,
+            })
+
+        return result
 
 
 # =============================================================================
@@ -134,36 +185,56 @@ async def app_faq_agent(state: AgentState) -> dict[str, Any]:
     ]
     query = user_messages[-1].get("content", "") if user_messages else ""
 
-    docs = []
-    try:
-        faq_collection = getattr(settings, "QDRANT_FAQ_COLLECTION", "peri_bugi_faq")
-        retriever = _get_qdrant_retriever(
-            collection=faq_collection,
-            top_k=3,
-            provider_override=state.get("embedding_provider_override"),
-            model_override=state.get("embedding_model_override"),
-        )
-        # Per-call trace metadata: agent="app_faq_retriever", session_id, dll
-        trace_config = build_trace_config(state=state, agent_name="app_faq_retriever")
-        results = await retriever.ainvoke(query, config=trace_config)
-        docs = [doc.page_content for doc in results]
-        state["tool_calls"].append({
-            "tool": "qdrant_retriever_faq",
-            "agent": "app_faq",
-            "input": {"query": query[:100]},
-            "result": {"doc_count": len(docs)},
-        })
-    except Exception as e:
-        # Fallback ke hardcoded FAQ dasar
-        docs = _get_hardcoded_faq(query)
-        state["tool_calls"].append({
-            "tool": "qdrant_retriever_faq",
-            "agent": "app_faq",
-            "input": {"query": query[:100]},
-            "result": {"error": str(e), "fallback": "hardcoded_faq", "doc_count": len(docs)},
-        })
+    # Phase 4: wrap agent body with trace_node
+    from app.config.observability import trace_node
 
-    return {"docs": docs, "source_count": len(docs)}
+    async with trace_node(
+        name="app_faq_agent",
+        state=state,
+        input_data={
+            "query": query[:300] if isinstance(query, str) else "",
+            "top_k": 3,
+        },
+    ) as span:
+        docs = []
+        used_fallback = False
+        try:
+            faq_collection = getattr(settings, "QDRANT_FAQ_COLLECTION", "peri_bugi_faq")
+            retriever = _get_qdrant_retriever(
+                collection=faq_collection,
+                top_k=3,
+                provider_override=state.get("embedding_provider_override"),
+                model_override=state.get("embedding_model_override"),
+            )
+            # Per-call trace metadata: agent="app_faq_retriever", session_id, dll
+            trace_config = build_trace_config(state=state, agent_name="app_faq_retriever")
+            results = await retriever.ainvoke(query, config=trace_config)
+            docs = [doc.page_content for doc in results]
+            state["tool_calls"].append({
+                "tool": "qdrant_retriever_faq",
+                "agent": "app_faq",
+                "input": {"query": query[:100]},
+                "result": {"doc_count": len(docs)},
+            })
+        except Exception as e:
+            # Fallback ke hardcoded FAQ dasar
+            docs = _get_hardcoded_faq(query)
+            used_fallback = True
+            state["tool_calls"].append({
+                "tool": "qdrant_retriever_faq",
+                "agent": "app_faq",
+                "input": {"query": query[:100]},
+                "result": {"error": str(e), "fallback": "hardcoded_faq", "doc_count": len(docs)},
+            })
+
+        if span:
+            span.update(output={
+                "doc_count": len(docs),
+                "used_fallback": used_fallback,
+                "docs_preview": [d[:200] for d in docs[:3]],
+            })
+
+        return {"docs": docs, "source_count": len(docs)}
 
 
 def _get_hardcoded_faq(query: str) -> list[str]:
