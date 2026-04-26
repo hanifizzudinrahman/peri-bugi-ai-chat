@@ -33,6 +33,9 @@ services:
               count: 1
               capabilities: [gpu]
     restart: unless-stopped
+    networks:
+      - default
+      - peri-bugi-shared
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -42,7 +45,16 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
+    networks:
+      - default
+      - peri-bugi-shared
 
 volumes:
   qdrant_data:
   huggingface_cache:
+
+networks:
+  default:
+  peri-bugi-shared:
+    name: peri-bugi-shared
+    external: true
