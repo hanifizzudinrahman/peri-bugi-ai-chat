@@ -101,12 +101,14 @@ async def send_summary_to_api(
     }
 
     # Phase 3: trace HTTP call as child observation
+    # Phase 4.5: pass full body for diagnostic visibility
     from app.config.observability import trace_http_call
 
     async with trace_http_call(
         name="http-internal-post-memory-summary",
         method="POST",
         url=url,
+        body=body,  # Phase 4.5: full body (auto-redacted)
         body_keys=list(body.keys()),
     ) as span:
         try:

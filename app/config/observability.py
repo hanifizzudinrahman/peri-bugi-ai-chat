@@ -320,28 +320,40 @@ async def trace_http_call(
     method: str,
     url: str,
     body_keys: Optional[list[str]] = None,
+    body: Optional[dict] = None,
     metadata: Optional[dict] = None,
 ):
     """
     Context manager untuk trace HTTP call eksternal sebagai child observation
     di parent span Langfuse (kalau enabled).
 
-    Privacy-aware: hanya log method, redacted URL, dan body keys (bukan values).
+    Privacy-aware: hanya log method, redacted URL, body keys, dan body values
+    (kalau provided, sudah di-sanitize via _safe_dict_for_trace).
     Caller bertanggung jawab call `span.update(output=...)` dengan field aman.
 
-    Usage:
+    Args:
+        name: Span name (e.g. "http-internal-post-tanya-peri-analyze-image")
+        method: HTTP method ("GET", "POST", etc.)
+        url: Full URL (akan di-redact untuk hide query params sensitive)
+        body_keys: Optional list of body field names — backward compat, lightweight.
+        body: Optional dict body — Phase 4.5 — Full body values (recommended for
+            diagnostic). Auto-redacted via _safe_dict_for_trace (skip secrets,
+            base64, truncate strings).
+        metadata: Optional dict for span metadata.
+
+    Usage (Phase 4.5 pattern):
         async with trace_http_call(
             name="mata-peri-analyze-image",
             method="POST",
             url=url,
-            body_keys=list(json_body.keys()),
+            body=json_body,  # Phase 4.5 — capture full body for diagnostic
         ) as span:
             response = await client.post(url, json=json_body)
             result = response.json()
             if span:
                 span.update(output={
-                    "status": result.get("status"),
-                    "scan_session_id": result.get("scan_session_id"),
+                    "status_code": response.status_code,
+                    "response_body": _safe_dict_for_trace(result),  # Phase 4.5
                 })
 
     Behavior:
@@ -366,6 +378,9 @@ async def trace_http_call(
         }
         if body_keys:
             span_input["body_keys"] = sorted(list(body_keys))
+        # Phase 4.5: capture full body values (sanitized)
+        if body is not None:
+            span_input["body"] = _safe_dict_for_trace(body)
 
         with langfuse.start_as_current_observation(
             as_type="span",
@@ -408,6 +423,129 @@ def _truncate(value, max_len: int = 5000) -> str:
     if len(s) <= max_len:
         return s
     return s[:max_len] + f"... [truncated {len(s) - max_len} chars]"
+
+
+# =============================================================================
+# Phase 4.5: Body + Response capture untuk full diagnostic visibility
+# =============================================================================
+
+# Secret keys yang HARUS di-redact dari trace (case-insensitive match)
+_SECRET_KEYS = frozenset([
+    "authorization",
+    "x-internal-secret",
+    "x-api-key",
+    "password",
+    "token",
+    "api_key",
+    "secret",
+    "access_token",
+    "refresh_token",
+    "private_key",
+])
+
+
+def _is_base64_data(s: str) -> bool:
+    """Detect base64 data URI patterns (image_url biasanya)."""
+    if not isinstance(s, str) or len(s) < 30:
+        return False
+    return s.startswith("data:") and ";base64," in s
+
+
+def _safe_dict_for_trace(
+    d,
+    max_depth: int = 3,
+    max_str_len: int = 1000,
+    max_list_items: int = 20,
+) -> dict | list | str | int | float | bool | None:
+    """
+    Convert dict/list/value ke trace-safe format untuk Langfuse capture.
+
+    Privacy/safety guarantees:
+    - Truncate strings >1000 chars (avoid storage bloat)
+    - REDACT keys yang match _SECRET_KEYS (X-Internal-Secret, password, dll)
+    - Skip base64 image data (data:...;base64,...) — too big, low diagnostic value
+    - Recurse depth max 3 (avoid infinite loops, stack overflow)
+    - Truncate list >20 items
+
+    Args:
+        d: Value to sanitize. Bisa dict, list, str, int, float, bool, None.
+        max_depth: Max recursion depth.
+        max_str_len: Max string length before truncate.
+        max_list_items: Max items per list.
+
+    Returns:
+        Trace-safe value with sensitive data redacted.
+    """
+    return _safe_value_recursive(
+        d, "", 0, max_depth, max_str_len, max_list_items,
+    )
+
+
+def _safe_value_recursive(
+    val,
+    key_context: str,
+    depth: int,
+    max_depth: int,
+    max_str_len: int,
+    max_list_items: int,
+):
+    """Internal recursive helper for _safe_dict_for_trace."""
+    # Depth guard
+    if depth > max_depth:
+        if isinstance(val, dict):
+            return f"[max_depth: dict with {len(val)} keys]"
+        if isinstance(val, list):
+            return f"[max_depth: list with {len(val)} items]"
+        return _truncate(str(val), 200)
+
+    # Redact secret keys
+    if key_context and key_context.lower() in _SECRET_KEYS:
+        return "[REDACTED]"
+
+    # None / primitives
+    if val is None or isinstance(val, (bool, int, float)):
+        return val
+
+    # String — handle base64 + truncate
+    if isinstance(val, str):
+        if _is_base64_data(val):
+            return f"[base64 data, {len(val)} chars]"
+        return _truncate(val, max_str_len)
+
+    # Dict — recurse
+    if isinstance(val, dict):
+        out = {}
+        for k, v in val.items():
+            try:
+                out[k] = _safe_value_recursive(
+                    v, k, depth + 1, max_depth, max_str_len, max_list_items,
+                )
+            except Exception:
+                out[k] = "[error sanitizing]"
+        return out
+
+    # List / tuple — recurse + cap length
+    if isinstance(val, (list, tuple)):
+        items = list(val)
+        truncated = len(items) > max_list_items
+        items = items[:max_list_items]
+        out = []
+        for item in items:
+            try:
+                out.append(_safe_value_recursive(
+                    item, "", depth + 1, max_depth, max_str_len, max_list_items,
+                ))
+            except Exception:
+                out.append("[error sanitizing]")
+        if truncated:
+            out.append(f"... [truncated {len(val) - max_list_items} more items]")
+        return out
+
+    # Fallback — convert to string and truncate
+    try:
+        return _truncate(str(val), max_str_len)
+    except Exception:
+        return "[unserializable]"
 
 
 def _safe_messages_for_trace(lc_messages, max_per_msg: int = 1500) -> list[dict]:

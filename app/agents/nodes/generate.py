@@ -349,7 +349,14 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
                     break
 
     # Phase 4: generation span — capture full prompt + output untuk diagnostic
-    from app.config.observability import trace_generation
+    # Phase 4.5: tambah agent_results context yang membentuk system_prompt
+    from app.config.observability import trace_generation, _safe_dict_for_trace
+
+    # Phase 4.5: extract agent_results context — yang ini di-inject ke system_prompt
+    agent_results = state.get("agent_results", {})
+    image_analysis = state.get("image_analysis")
+    memory_context = state.get("memory_context", {})
+    retrieved_docs = state.get("retrieved_docs", []) or []
 
     async with trace_generation(
         name="generate",
@@ -358,11 +365,18 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
         messages=lc_messages,
         user_message=user_msg_text,
         metadata={
-            "agents_used": list(state.get("agent_results", {}).keys()),
+            "agents_used": list(agent_results.keys()),
             "response_mode": state.get("response_mode", "simple"),
-            "has_image_analysis": bool(state.get("image_analysis")),
+            "has_image_analysis": bool(image_analysis),
             "child_name": _get_child_name(state),
             "provider": get_provider_name(provider=_provider),
+            # Phase 4.5: cross-reference info supaya Hanif bisa correlate
+            # context yang masuk → system_prompt yang di-render
+            "agent_results_keys": list(agent_results.keys()),
+            "image_analysis_present": bool(image_analysis),
+            "kb_docs_count": len(retrieved_docs),
+            "memory_summaries_count": len(memory_context.get("session_summaries", [])),
+            "memory_facts_count": len(memory_context.get("user_facts", [])),
         },
     ) as gen_span:
         try:
@@ -387,13 +401,20 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
                 )
 
         # Phase 4: capture output ke generation span (sebelum exit context)
-        # Dilakukan di sini supaya keep timing accurate (di dalam context)
+        # Phase 4.5: tambah agent_results di metadata untuk full diagnostic
         if gen_span and success:
             try:
                 gen_span.update(
                     output=full_response[:5000] if full_response else "(empty)",
                     usage_details={
                         "output": output_tokens,  # approx token count
+                    },
+                    # Phase 4.5: capture agent_results in update metadata —
+                    # diakses via "Additional Input" panel di Langfuse UI
+                    metadata={
+                        "agent_results_summary": _safe_dict_for_trace(agent_results),
+                        "image_analysis_summary": _safe_dict_for_trace(image_analysis) if image_analysis else None,
+                        "memory_context_summary": _safe_dict_for_trace(memory_context) if memory_context else None,
                     },
                 )
             except Exception:

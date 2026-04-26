@@ -25,7 +25,7 @@ async def _call_internal_api(path: str) -> dict:
     url = f"{settings.PERI_API_URL.rstrip('/')}{path}"
 
     # Phase 3: trace HTTP call as child observation
-    from app.config.observability import trace_http_call
+    from app.config.observability import trace_http_call, _safe_dict_for_trace
     span_name = f"http-internal-get-{path.split('/')[-1].split('?')[0] or 'root'}"
 
     async with trace_http_call(
@@ -39,9 +39,11 @@ async def _call_internal_api(path: str) -> dict:
                 resp.raise_for_status()
                 result = resp.json()
             if span:
+                # Phase 4.5: capture full response body for diagnostic
                 span.update(output={
                     "status_code": resp.status_code,
                     "has_data": result.get("has_data"),
+                    "response_body": _safe_dict_for_trace(result),  # Phase 4.5
                 })
             return result
         except httpx.TimeoutException:
@@ -87,14 +89,16 @@ async def _call_internal_api_post(
     actual_timeout = timeout or _TIMEOUT
 
     # Phase 3: trace HTTP call as child observation
-    from app.config.observability import trace_http_call
+    # Phase 4.5: pass full body + capture full response for diagnostic visibility
+    from app.config.observability import trace_http_call, _safe_dict_for_trace
     span_name = f"http-internal-post-{path.split('/')[-1].split('?')[0] or 'root'}"
 
     async with trace_http_call(
         name=span_name,
         method="POST",
         url=url,
-        body_keys=list(json_body.keys()) if json_body else None,
+        body=json_body,  # Phase 4.5: full body values (auto-redacted)
+        body_keys=list(json_body.keys()) if json_body else None,  # backward compat
         metadata={"timeout_sec": actual_timeout},
     ) as span:
         try:
@@ -103,12 +107,14 @@ async def _call_internal_api_post(
                 resp.raise_for_status()
                 result = resp.json()
             if span:
-                # Output: subset of safe response fields
+                # Phase 4.5: capture FULL response body for full diagnostic visibility.
+                # _safe_dict_for_trace handle redact secret + truncate + skip base64.
                 span.update(output={
                     "status_code": resp.status_code,
                     "status": result.get("status"),
                     "scan_session_id": result.get("scan_session_id"),
                     "error_code": result.get("error_code"),
+                    "response_body": _safe_dict_for_trace(result),  # Phase 4.5
                 })
             return result
         except httpx.TimeoutException:
@@ -212,11 +218,14 @@ async def rapot_peri_agent(state: AgentState) -> dict[str, Any]:
 
         if span:
             streak_data = data.get("streak") if isinstance(data.get("streak"), dict) else None
+            # Phase 4.5: capture full data so generate context visible
+            from app.config.observability import _safe_dict_for_trace
             span.update(output={
                 "has_data": data.get("has_data", False),
                 "source": data.get("source", "api"),
                 "current_streak": streak_data.get("current_streak") if streak_data else None,
                 "best_streak": streak_data.get("best_streak") if streak_data else None,
+                "data": _safe_dict_for_trace(data),  # Phase 4.5: full result
             })
 
         return data
@@ -266,11 +275,14 @@ async def cerita_peri_agent(state: AgentState) -> dict[str, Any]:
             },
         })
         if span:
+            # Phase 4.5: capture full data so generate context visible
+            from app.config.observability import _safe_dict_for_trace
             span.update(output={
                 "has_data": data.get("has_data", False),
                 "completed_count": data.get("completed_count", 0),
                 "total_stars": data.get("total_stars", 0),
                 "current_module_id": data.get("current_module_id"),
+                "data": _safe_dict_for_trace(data),  # Phase 4.5: full result (modules, etc)
             })
         return data
 
@@ -322,6 +334,12 @@ async def mata_peri_agent(state: AgentState) -> dict[str, Any]:
         if image_url:
             result = await _analyze_chat_image(state, image_url)
             if span:
+                # Phase 4.5: capture image_analysis JSON yang masuk ke generate prompt.
+                # Ini THE MOST IMPORTANT data flow — apa yang ai-cv return = apa yang
+                # akan jadi context di system prompt LLM. Tanpa ini Hanif tidak bisa
+                # debug kenapa LLM merespon dengan tone tertentu.
+                from app.config.observability import _safe_dict_for_trace
+                image_analysis = state.get("image_analysis")
                 span.update(output={
                     "mode": result.get("mode"),
                     "has_data": result.get("has_data", False),
@@ -329,6 +347,10 @@ async def mata_peri_agent(state: AgentState) -> dict[str, Any]:
                     "decision_source": result.get("decision_source"),
                     "scan_session_id": result.get("scan_session_id"),
                     "needs_clarification": result.get("needs_clarification", False),
+                    # Phase 4.5: full image_analysis content (session_summary + results)
+                    "image_analysis": _safe_dict_for_trace(image_analysis) if image_analysis else None,
+                    # Phase 4.5: full result dict (mode, fallback_text kalau gagal, dll)
+                    "result_data": _safe_dict_for_trace(result),
                 })
             return result
 
@@ -353,10 +375,13 @@ async def mata_peri_agent(state: AgentState) -> dict[str, Any]:
                 "source": "user_context",
             }
             if span:
+                # Phase 4.5: capture full latest_scan content
+                from app.config.observability import _safe_dict_for_trace
                 span.update(output={
                     "mode": "history",
                     "has_data": True,
                     "source": "user_context",
+                    "latest_scan": _safe_dict_for_trace(mata_peri_ctx),  # Phase 4.5
                 })
             return result
 
@@ -376,11 +401,14 @@ async def mata_peri_agent(state: AgentState) -> dict[str, Any]:
             "result": {"has_data": data.get("has_data", False), "scan_count": data.get("scan_count", 0)},
         })
         if span:
+            # Phase 4.5: capture full history data (latest_scan, scans list)
+            from app.config.observability import _safe_dict_for_trace
             span.update(output={
                 "mode": "history",
                 "has_data": data.get("has_data", False),
                 "scan_count": data.get("scan_count", 0),
                 "source": "api",
+                "data": _safe_dict_for_trace(data),  # Phase 4.5: full result
             })
         return data
 

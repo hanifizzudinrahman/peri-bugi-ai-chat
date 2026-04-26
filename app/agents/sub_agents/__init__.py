@@ -77,9 +77,15 @@ async def kb_dental_agent(state: AgentState) -> dict[str, Any]:
                 "result": {"doc_count": len(docs)},
             })
             if span:
+                # Phase 4.5: capture full docs (auto-truncated 1000 chars each per
+                # _safe_dict_for_trace) so Hanif bisa lihat actual content yang
+                # akan masuk ke generate prompt sebagai "Referensi dari knowledge base".
+                from app.config.observability import _safe_dict_for_trace
                 span.update(output={
                     "doc_count": len(docs),
-                    "docs_preview": [d[:200] for d in docs[:3]],  # first 3 docs, 200 chars each
+                    "docs_preview": [d[:200] for d in docs[:3]],  # backward compat
+                    "docs": _safe_dict_for_trace(docs),  # Phase 4.5: full content
+                    "total_chars": sum(len(d) for d in docs),
                 })
         except Exception as e:
             state["tool_calls"].append({
@@ -158,13 +164,15 @@ async def user_profile_agent(state: AgentState) -> dict[str, Any]:
         }
 
         if span:
-            # Output: ringkasan saja, jangan kirim sensitive data verbatim
+            # Phase 4.5: capture full result so generate context fully visible
+            from app.config.observability import _safe_dict_for_trace
             span.update(output={
                 "child_name": result["child"]["name"] if result["child"] else None,
                 "child_age": result["child"]["age_years"] if result["child"] else None,
                 "has_brushing_data": result["has_brushing_data"],
                 "has_scan_data": result["has_scan_data"],
                 "current_streak": brushing.get("current_streak") if brushing else None,
+                "data": _safe_dict_for_trace(result),  # Phase 4.5: full agent result
             })
 
         return result
@@ -228,10 +236,14 @@ async def app_faq_agent(state: AgentState) -> dict[str, Any]:
             })
 
         if span:
+            # Phase 4.5: capture full docs for full diagnostic
+            from app.config.observability import _safe_dict_for_trace
             span.update(output={
                 "doc_count": len(docs),
                 "used_fallback": used_fallback,
-                "docs_preview": [d[:200] for d in docs[:3]],
+                "docs_preview": [d[:200] for d in docs[:3]],  # backward compat
+                "docs": _safe_dict_for_trace(docs),  # Phase 4.5: full content
+                "total_chars": sum(len(d) for d in docs),
             })
 
         return {"docs": docs, "source_count": len(docs)}

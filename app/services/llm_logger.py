@@ -49,12 +49,21 @@ async def send_llm_call_logs(
     # NOTE: send_llm_call_logs dipanggil sebagai background task (asyncio.create_task)
     # SETELAH "done" event di-yield. Saat ini, parent span sudah closed —
     # span akan jadi standalone trace. Itu OK untuk fire-and-forget logging.
+    # Phase 4.5: pass body summary so log content visible per fire-and-forget trace
     from app.config.observability import trace_http_call
+
+    # Build sanitized body — kirim summary, bukan full logs (bisa panjang)
+    body_summary = {
+        "log_count": len(logs),
+        "first_log_node": logs[0].get("node") if logs else None,
+        "first_log_model": logs[0].get("model") if logs else None,
+    }
 
     async with trace_http_call(
         name="http-internal-post-llm-call-logs",
         method="POST",
         url=url,
+        body=body_summary,  # Phase 4.5: body summary (not full logs to avoid bloat)
         body_keys=["logs"],
         metadata={"log_count": len(logs)},
     ) as span:
