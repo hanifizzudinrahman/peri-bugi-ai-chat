@@ -45,7 +45,168 @@ _AGENT_REGISTRY = {
 
 
 async def run_agent(initial_state: AgentState) -> AsyncIterator[str]:
-    """Entry point utama — jalankan seluruh graph dan yield SSE events."""
+    """
+    Entry point utama — jalankan seluruh graph dan yield SSE events.
+
+    Wraps execution dengan Langfuse parent span (kalau enabled) supaya semua
+    child LLM call ter-nest di bawah 1 trace utuh. Kalau Langfuse disabled,
+    langsung jalankan internal logic tanpa overhead.
+
+    Behavior:
+    - LANGFUSE_ENABLED=false → jalankan _run_agent_internal langsung
+    - LANGFUSE_ENABLED=true  → wrap dengan span "tanya-peri-message" yang
+      otomatis jadi root trace; LLM callback handler nge-detect parent
+      context via OTEL → semua child observation nest di bawah trace ini.
+    """
+    from app.config.observability import (
+        get_langfuse_client,
+        extract_user_message,
+    )
+
+    langfuse = get_langfuse_client()
+
+    # Path 1: Langfuse disabled → run normally
+    if langfuse is None:
+        async for event in _run_agent_internal(initial_state):
+            yield event
+        return
+
+    # Path 2: Langfuse enabled → wrap dengan parent span
+    user_message = extract_user_message(initial_state)
+    session_id = initial_state.get("session_id")
+    user_context = initial_state.get("user_context") or {}
+    user_id = user_context.get("user_id") or user_context.get("id")
+    response_mode = initial_state.get("response_mode", "simple")
+    has_image = bool(initial_state.get("image_url"))
+    source = initial_state.get("source")
+
+    # Trace input — ringkasan request
+    trace_input: dict = {}
+    if user_message:
+        trace_input["message"] = user_message
+    if has_image:
+        trace_input["has_image"] = True
+    if source:
+        trace_input["source"] = source
+
+    # Tags untuk filter di dashboard
+    tags = ["tanya-peri", f"mode:{response_mode}"]
+    if has_image:
+        tags.append("with-image")
+    if source:
+        tags.append(f"source:{source}")
+
+    # Try import propagate_attributes, fallback graceful kalau API berubah
+    try:
+        from langfuse import propagate_attributes
+    except ImportError:
+        propagate_attributes = None  # type: ignore
+
+    # Buffer untuk capture final response — diset saat done event muncul
+    captured_output: dict = {"text": "", "needs_clarification": False, "error": None}
+
+    async def _run_with_span():
+        """Inner generator yang yield events sambil capture output untuk trace."""
+        with langfuse.start_as_current_observation(
+            as_type="span",
+            name="tanya-peri-message",
+            input=trace_input or None,
+        ) as span:
+            try:
+                attrs_kwargs = {}
+                if user_id:
+                    attrs_kwargs["user_id"] = str(user_id)
+                if session_id:
+                    attrs_kwargs["session_id"] = str(session_id)
+                if tags:
+                    attrs_kwargs["tags"] = tags
+
+                if propagate_attributes and attrs_kwargs:
+                    # Propagate ke seluruh child observation (LLM calls, retrievers)
+                    with propagate_attributes(**attrs_kwargs):
+                        async for event in _run_agent_internal(initial_state):
+                            _capture_response(event, captured_output)
+                            yield event
+                else:
+                    # Fallback: gak ada propagate_attributes (langfuse v lama?)
+                    async for event in _run_agent_internal(initial_state):
+                        _capture_response(event, captured_output)
+                        yield event
+
+                # Update trace output di akhir
+                trace_output = _build_trace_output(captured_output, initial_state)
+                span.update(output=trace_output)
+
+            except Exception as e:
+                # Capture error di trace
+                span.update(
+                    output={"error": str(e), "type": type(e).__name__},
+                    level="ERROR",
+                    status_message=str(e),
+                )
+                raise
+
+    async for event in _run_with_span():
+        yield event
+
+
+def _capture_response(event_str: str, captured: dict) -> None:
+    """Parse SSE event untuk capture final response (untuk trace output)."""
+    import json
+    try:
+        if not event_str.startswith("data: "):
+            return
+        parsed = json.loads(event_str[6:])
+        ev_type = parsed.get("event")
+
+        if ev_type == "token":
+            token = parsed.get("data", {}).get("token", "")
+            if token:
+                captured["text"] += token
+        elif ev_type == "done":
+            data = parsed.get("data", {})
+            content = data.get("content")
+            if content:
+                captured["text"] = content  # final, override token accumulation
+        elif ev_type == "error":
+            captured["error"] = parsed.get("data", {}).get("message")
+        elif ev_type == "clarification":
+            captured["needs_clarification"] = True
+    except Exception:
+        # Defensive — jangan break execution kalau parsing gagal
+        pass
+
+
+def _build_trace_output(captured: dict, state: AgentState) -> dict:
+    """Build dict output untuk trace berdasarkan hasil capture + state."""
+    output: dict = {}
+
+    if captured.get("error"):
+        output["error"] = captured["error"]
+    if captured.get("text"):
+        # Limit text supaya gak overflow Langfuse storage (mostly cosmetic)
+        text = captured["text"]
+        output["response"] = text[:5000] if len(text) > 5000 else text
+    if captured.get("needs_clarification"):
+        output["needs_clarification"] = True
+
+    # Metadata tambahan dari state
+    agents_used = list(state.get("agent_results", {}).keys())
+    if agents_used:
+        output["agents_used"] = agents_used
+
+    if state.get("image_analysis"):
+        output["image_analyzed"] = True
+
+    return output if output else {"response": "(no output captured)"}
+
+
+async def _run_agent_internal(initial_state: AgentState) -> AsyncIterator[str]:
+    """
+    Internal logic — original run_agent body, unchanged.
+    Dipisah dari run_agent supaya wrapper Langfuse bisa di-apply transparently
+    tanpa modify graph orchestration logic.
+    """
     state = initial_state
 
     state.setdefault("thinking_steps", [])

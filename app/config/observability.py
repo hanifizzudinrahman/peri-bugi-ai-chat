@@ -134,6 +134,49 @@ def is_observability_enabled() -> bool:
     return get_langfuse_handler() is not None
 
 
+def get_langfuse_client():
+    """
+    Return Langfuse global client (Langfuse instance) kalau enabled,
+    atau None kalau disabled / not initialized.
+
+    Dipakai untuk create parent span via langfuse.start_as_current_observation(),
+    yang akan jadi root trace untuk seluruh request — supaya semua LLM call
+    children nge-nest di bawah 1 trace yang sama.
+
+    NOTE: get_langfuse_handler() harus dipanggil dulu (di app startup atau
+    di pertama call) supaya global Langfuse() client ke-init.
+    """
+    # Trigger handler init kalau belum (idempotent)
+    handler = get_langfuse_handler()
+    if handler is None:
+        return None
+
+    try:
+        from langfuse import get_client
+        return get_client()
+    except Exception as e:
+        logger.warning(f"Failed to get Langfuse client: {e}")
+        return None
+
+
+def extract_user_message(state: Optional[dict]) -> Optional[str]:
+    """
+    Extract pesan user terakhir dari AgentState untuk trace input.
+    Return None kalau gak ada pesan user.
+    """
+    if not state:
+        return None
+    messages = state.get("messages") or []
+    user_msgs = [
+        m for m in messages
+        if isinstance(m, dict) and m.get("role") == "user" and m.get("content")
+    ]
+    if not user_msgs:
+        return None
+    content = user_msgs[-1].get("content", "")
+    return str(content) if content else None
+
+
 def build_trace_metadata(
     state: Optional[dict] = None,
     agent_name: Optional[str] = None,
