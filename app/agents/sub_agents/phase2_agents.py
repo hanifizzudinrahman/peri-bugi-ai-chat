@@ -23,15 +23,43 @@ async def _call_internal_api(path: str) -> dict:
     if not settings.PERI_API_URL:
         return {"error": "PERI_API_URL tidak diset", "has_data": False}
     url = f"{settings.PERI_API_URL.rstrip('/')}{path}"
-    try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            resp = await client.get(url, headers=_INTERNAL_HEADERS)
-            resp.raise_for_status()
-            return resp.json()
-    except httpx.TimeoutException:
-        return {"error": "timeout", "has_data": False}
-    except Exception as e:
-        return {"error": str(e), "has_data": False}
+
+    # Phase 3: trace HTTP call as child observation
+    from app.config.observability import trace_http_call
+    span_name = f"http-internal-get-{path.split('/')[-1].split('?')[0] or 'root'}"
+
+    async with trace_http_call(
+        name=span_name,
+        method="GET",
+        url=url,
+    ) as span:
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                resp = await client.get(url, headers=_INTERNAL_HEADERS)
+                resp.raise_for_status()
+                result = resp.json()
+            if span:
+                span.update(output={
+                    "status_code": resp.status_code,
+                    "has_data": result.get("has_data"),
+                })
+            return result
+        except httpx.TimeoutException:
+            if span:
+                span.update(
+                    output={"error": "timeout"},
+                    level="ERROR",
+                    status_message="HTTP timeout",
+                )
+            return {"error": "timeout", "has_data": False}
+        except Exception as e:
+            if span:
+                span.update(
+                    output={"error": str(e)[:200]},
+                    level="ERROR",
+                    status_message=str(e)[:200],
+                )
+            return {"error": str(e), "has_data": False}
 
 
 async def _call_internal_api_post(
@@ -58,28 +86,66 @@ async def _call_internal_api_post(
 
     actual_timeout = timeout or _TIMEOUT
 
-    try:
-        async with httpx.AsyncClient(timeout=actual_timeout) as client:
-            resp = await client.post(url, json=json_body, headers=headers)
-            resp.raise_for_status()
-            return resp.json()
-    except httpx.TimeoutException:
-        logger.warning(f"[internal_api_post] Timeout: {path}")
-        return {"status": "failed", "error": "timeout", "error_code": "api_timeout"}
-    except httpx.HTTPStatusError as e:
-        logger.warning(f"[internal_api_post] HTTP {e.response.status_code}: {path}")
-        return {
-            "status": "failed",
-            "error": f"HTTP {e.response.status_code}",
-            "error_code": "api_http_error",
-        }
-    except Exception as e:
-        logger.exception(f"[internal_api_post] Error: {path}: {e}")
-        return {
-            "status": "failed",
-            "error": str(e)[:200],
-            "error_code": "api_unknown_error",
-        }
+    # Phase 3: trace HTTP call as child observation
+    from app.config.observability import trace_http_call
+    span_name = f"http-internal-post-{path.split('/')[-1].split('?')[0] or 'root'}"
+
+    async with trace_http_call(
+        name=span_name,
+        method="POST",
+        url=url,
+        body_keys=list(json_body.keys()) if json_body else None,
+        metadata={"timeout_sec": actual_timeout},
+    ) as span:
+        try:
+            async with httpx.AsyncClient(timeout=actual_timeout) as client:
+                resp = await client.post(url, json=json_body, headers=headers)
+                resp.raise_for_status()
+                result = resp.json()
+            if span:
+                # Output: subset of safe response fields
+                span.update(output={
+                    "status_code": resp.status_code,
+                    "status": result.get("status"),
+                    "scan_session_id": result.get("scan_session_id"),
+                    "error_code": result.get("error_code"),
+                })
+            return result
+        except httpx.TimeoutException:
+            logger.warning(f"[internal_api_post] Timeout: {path}")
+            if span:
+                span.update(
+                    output={"error": "timeout"},
+                    level="ERROR",
+                    status_message=f"timeout after {actual_timeout}s",
+                )
+            return {"status": "failed", "error": "timeout", "error_code": "api_timeout"}
+        except httpx.HTTPStatusError as e:
+            logger.warning(f"[internal_api_post] HTTP {e.response.status_code}: {path}")
+            if span:
+                span.update(
+                    output={"status_code": e.response.status_code, "error_code": "api_http_error"},
+                    level="ERROR",
+                    status_message=f"HTTP {e.response.status_code}",
+                )
+            return {
+                "status": "failed",
+                "error": f"HTTP {e.response.status_code}",
+                "error_code": "api_http_error",
+            }
+        except Exception as e:
+            logger.exception(f"[internal_api_post] Error: {path}: {e}")
+            if span:
+                span.update(
+                    output={"error": str(e)[:200], "error_code": "api_unknown_error"},
+                    level="ERROR",
+                    status_message=str(e)[:200],
+                )
+            return {
+                "status": "failed",
+                "error": str(e)[:200],
+                "error_code": "api_unknown_error",
+            }
 
 
 # =============================================================================

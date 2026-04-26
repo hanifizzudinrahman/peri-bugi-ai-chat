@@ -43,26 +43,56 @@ async def send_llm_call_logs(
             if not log.get("session_id"):
                 log["session_id"] = session_id
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{settings.PERI_API_URL}/api/v1/internal/llm-call-logs",
-                json={"logs": logs},
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Internal-Secret": settings.INTERNAL_SECRET,
-                },
-            )
-            if resp.status_code not in (200, 201):
-                logger.warning(
-                    "llm_logger: api returned %s — logs tidak tersimpan",
-                    resp.status_code,
+    url = f"{settings.PERI_API_URL}/api/v1/internal/llm-call-logs"
+
+    # Phase 3: trace HTTP call as child observation.
+    # NOTE: send_llm_call_logs dipanggil sebagai background task (asyncio.create_task)
+    # SETELAH "done" event di-yield. Saat ini, parent span sudah closed —
+    # span akan jadi standalone trace. Itu OK untuk fire-and-forget logging.
+    from app.config.observability import trace_http_call
+
+    async with trace_http_call(
+        name="http-internal-post-llm-call-logs",
+        method="POST",
+        url=url,
+        body_keys=["logs"],
+        metadata={"log_count": len(logs)},
+    ) as span:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    url,
+                    json={"logs": logs},
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Internal-Secret": settings.INTERNAL_SECRET,
+                    },
                 )
-    except httpx.RequestError as e:
-        # Silence — jangan block stream karena logging gagal
-        logger.warning("llm_logger: gagal kirim ke api — %s", str(e))
-    except Exception as e:
-        logger.warning("llm_logger: unexpected error — %s", str(e))
+                ok = resp.status_code in (200, 201)
+                if span:
+                    span.update(output={"status_code": resp.status_code, "ok": ok})
+                if not ok:
+                    logger.warning(
+                        "llm_logger: api returned %s — logs tidak tersimpan",
+                        resp.status_code,
+                    )
+        except httpx.RequestError as e:
+            # Silence — jangan block stream karena logging gagal
+            logger.warning("llm_logger: gagal kirim ke api — %s", str(e))
+            if span:
+                span.update(
+                    output={"error": str(e)[:200]},
+                    level="ERROR",
+                    status_message=str(e)[:200],
+                )
+        except Exception as e:
+            logger.warning("llm_logger: unexpected error — %s", str(e))
+            if span:
+                span.update(
+                    output={"error": str(e)[:200]},
+                    level="ERROR",
+                    status_message=str(e)[:200],
+                )
 
 
 def fire_and_forget_logs(logs: list[dict], session_id: Optional[str] = None) -> None:

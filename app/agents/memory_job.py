@@ -92,22 +92,43 @@ async def send_summary_to_api(
         return False
 
     import httpx
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"{settings.PERI_API_URL.rstrip('/')}/api/v1/internal/memory/summary",
-                json={
-                    "session_id": session_id,
-                    "summary_text": summary_text,
-                    "key_topics": key_topics,
-                    "agents_used": agents_used,
-                },
-                headers={"X-Internal-Secret": settings.INTERNAL_SECRET},
-            )
-            return resp.status_code == 200
-    except Exception as e:
-        logger.warning(f"Failed to send summary to api: {e}")
-        return False
+    url = f"{settings.PERI_API_URL.rstrip('/')}/api/v1/internal/memory/summary"
+    body = {
+        "session_id": session_id,
+        "summary_text": summary_text,
+        "key_topics": key_topics,
+        "agents_used": agents_used,
+    }
+
+    # Phase 3: trace HTTP call as child observation
+    from app.config.observability import trace_http_call
+
+    async with trace_http_call(
+        name="http-internal-post-memory-summary",
+        method="POST",
+        url=url,
+        body_keys=list(body.keys()),
+    ) as span:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    url,
+                    json=body,
+                    headers={"X-Internal-Secret": settings.INTERNAL_SECRET},
+                )
+                ok = resp.status_code == 200
+                if span:
+                    span.update(output={"status_code": resp.status_code, "ok": ok})
+                return ok
+        except Exception as e:
+            logger.warning(f"Failed to send summary to api: {e}")
+            if span:
+                span.update(
+                    output={"error": str(e)[:200]},
+                    level="ERROR",
+                    status_message=str(e)[:200],
+                )
+            return False
 
 
 # Topic keywords untuk extract dari conversation (sama dengan memory_service.py di api)

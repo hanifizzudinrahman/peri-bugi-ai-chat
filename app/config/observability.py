@@ -282,3 +282,100 @@ def build_trace_config(
         config["tags"] = tags
 
     return config
+
+
+# =============================================================================
+# Phase 3: HTTP Call Instrumentation
+# =============================================================================
+#
+# Helper untuk wrap HTTP call eksternal (httpx) sebagai child observation
+# di parent span Langfuse. Menutup gap arsitektur dimana mata_peri/rapot_peri/
+# cerita_peri/memory_job call internal API via HTTP yang tidak ke-trace
+# otomatis oleh callback handler (yang cuma cover LangChain).
+#
+# Pattern: async context manager yang gracefully degrade kalau Langfuse off.
+
+from contextlib import asynccontextmanager
+
+
+def _redact_url(url: str, max_len: int = 200) -> str:
+    """
+    Redact URL untuk privacy — strip query params yang mungkin contain PII,
+    truncate kalau terlalu panjang.
+
+    Tetap preserve path biar visible di Langfuse trace.
+    """
+    if not url:
+        return ""
+    # Strip query string (might contain user_id, token, etc)
+    base = url.split("?", 1)[0]
+    if len(base) > max_len:
+        return base[:max_len] + "..."
+    return base
+
+
+@asynccontextmanager
+async def trace_http_call(
+    name: str,
+    method: str,
+    url: str,
+    body_keys: Optional[list[str]] = None,
+    metadata: Optional[dict] = None,
+):
+    """
+    Context manager untuk trace HTTP call eksternal sebagai child observation
+    di parent span Langfuse (kalau enabled).
+
+    Privacy-aware: hanya log method, redacted URL, dan body keys (bukan values).
+    Caller bertanggung jawab call `span.update(output=...)` dengan field aman.
+
+    Usage:
+        async with trace_http_call(
+            name="mata-peri-analyze-image",
+            method="POST",
+            url=url,
+            body_keys=list(json_body.keys()),
+        ) as span:
+            response = await client.post(url, json=json_body)
+            result = response.json()
+            if span:
+                span.update(output={
+                    "status": result.get("status"),
+                    "scan_session_id": result.get("scan_session_id"),
+                })
+
+    Behavior:
+    - Langfuse enabled  → yield Langfuse span object (observation type=span)
+    - Langfuse disabled → yield None (caller harus check sebelum span.update)
+    - Instrumentation error → yield None (graceful, jangan break HTTP call)
+
+    Span otomatis nest di bawah parent (e.g. "tanya-peri-message") via OTEL
+    context propagation.
+    """
+    langfuse = get_langfuse_client()
+
+    if langfuse is None:
+        # Langfuse disabled — yield None so caller's span.update is no-op
+        yield None
+        return
+
+    try:
+        span_input: dict = {
+            "method": method.upper(),
+            "url": _redact_url(url),
+        }
+        if body_keys:
+            span_input["body_keys"] = sorted(list(body_keys))
+
+        with langfuse.start_as_current_observation(
+            as_type="span",
+            name=name,
+            input=span_input,
+            metadata=metadata or {},
+        ) as span:
+            yield span
+    except Exception as e:
+        # Defensive: kalau Langfuse SDK error, jangan break HTTP call.
+        # Just log dan yield None.
+        logger.warning(f"trace_http_call instrumentation failed for {name}: {e}")
+        yield None
