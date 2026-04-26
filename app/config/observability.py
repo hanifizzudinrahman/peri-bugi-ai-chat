@@ -8,6 +8,13 @@ Pattern:
 - Pattern 2 (explicit toggle): LANGFUSE_ENABLED env flag. Default False
   supaya safe by default. Set =true di .env untuk aktifkan.
 
+SDK v3 init pattern (OTEL-based):
+  1. Init Langfuse global client SEKALI dengan credentials
+     (Langfuse(public_key=..., secret_key=..., host=...))
+  2. CallbackHandler() di-construct TANPA args — dia ambil credential
+     dari global client yang udah ke-init.
+  3. v3 berbeda dari v2 yang `CallbackHandler(public_key=..., secret_key=...)`.
+
 Usage:
     from app.config.observability import get_langfuse_handler
 
@@ -71,17 +78,25 @@ def get_langfuse_handler() -> Optional["BaseCallbackHandler"]:
             _init_attempted = True
         return None
 
-    # ── Step 3: Try import + instantiate ──────────────────────────────────────
+    # ── Step 3: Init global Langfuse client + create CallbackHandler ──────────
+    # SDK v3 pattern: init Langfuse client global dulu (singleton via get_client),
+    # baru CallbackHandler() bisa di-construct tanpa args. Reference:
+    # https://langfuse.com/integrations/frameworks/langchain
     try:
-        # Import lazy supaya kalau langfuse package not installed,
-        # cuma fail saat user beneran enable, bukan saat startup
+        from langfuse import Langfuse
         from langfuse.langchain import CallbackHandler
 
-        handler = CallbackHandler(
+        # Initialize global Langfuse client (singleton)
+        # Aman dipanggil multiple times — internal SDK guard idempotent.
+        Langfuse(
             public_key=settings.LANGFUSE_PUBLIC_KEY,
             secret_key=settings.LANGFUSE_SECRET_KEY,
             host=settings.LANGFUSE_HOST,
         )
+
+        # Construct CallbackHandler — ambil credential dari global client.
+        # v3 NO LONGER accepts public_key/secret_key/host as constructor args.
+        handler = CallbackHandler()
 
         if not _init_attempted or not _init_succeeded:
             logger.info(
@@ -141,20 +156,30 @@ def build_trace_metadata(
         ```
 
     Aman dipanggil walau state None / partial — cuma return dict apa yang ada.
+
+    Note: Untuk v3, gunakan key `langfuse_session_id`, `langfuse_user_id`,
+    `langfuse_tags` supaya Langfuse SDK extract jadi top-level trace properties
+    (bukan cuma metadata). Reference:
+    https://langfuse.com/docs/observability/sdk/upgrade-path/python-v2-to-v3
     """
     metadata: dict = {}
 
     if state:
-        # AgentState fields yang berguna untuk filter di Langfuse dashboard
-        for key in ("session_id", "trace_id", "chat_message_id", "response_mode"):
-            value = state.get(key)
-            if value:
-                metadata[key] = value
+        # AgentState fields → langfuse-specific keys (v3 convention)
+        session_id = state.get("session_id")
+        if session_id:
+            metadata["langfuse_session_id"] = session_id
 
         user_context = state.get("user_context") or {}
         user_id = user_context.get("user_id") or user_context.get("id")
         if user_id:
-            metadata["user_id"] = str(user_id)
+            metadata["langfuse_user_id"] = str(user_id)
+
+        # Custom metadata (bukan top-level v3 properties)
+        for key in ("trace_id", "chat_message_id", "response_mode"):
+            value = state.get(key)
+            if value:
+                metadata[key] = value
 
     if agent_name:
         metadata["agent"] = agent_name
@@ -177,8 +202,8 @@ def build_trace_config(
 
     Returns dict dengan:
     - callbacks: list — handler yang aktif (atau empty kalau disabled)
-    - metadata:  dict — context dari state + agent_name
-    - tags:      list[str] — quick-filter tags
+    - metadata:  dict — context dari state + agent_name (with langfuse_* keys)
+    - tags:      list[str] — quick-filter tags (also via langfuse_tags metadata)
 
     Pattern usage di call site:
         from app.config.observability import build_trace_config
@@ -191,10 +216,7 @@ def build_trace_config(
     """
     handler = get_langfuse_handler()
 
-    config: dict = {
-        "callbacks": [handler] if handler else [],
-        "metadata": build_trace_metadata(state, agent_name, extra_metadata),
-    }
+    metadata = build_trace_metadata(state, agent_name, extra_metadata)
 
     tags: list[str] = []
     if agent_name:
@@ -203,6 +225,15 @@ def build_trace_config(
         tags.append(f"mode:{state['response_mode']}")
     if extra_tags:
         tags.extend(extra_tags)
+
+    # v3: also expose tags via metadata key supaya muncul di Langfuse trace UI
+    if tags:
+        metadata["langfuse_tags"] = tags
+
+    config: dict = {
+        "callbacks": [handler] if handler else [],
+        "metadata": metadata,
+    }
 
     if tags:
         config["tags"] = tags
