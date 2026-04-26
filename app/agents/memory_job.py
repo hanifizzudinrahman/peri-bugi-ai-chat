@@ -60,8 +60,15 @@ async def generate_session_summary(
     start = time.monotonic()
     try:
         from langchain_core.messages import HumanMessage
+        from app.config.observability import build_trace_config
+
         llm = get_llm(temperature=0.3, max_tokens=200, streaming=False)
-        result = await llm.ainvoke([HumanMessage(content=prompt)])
+        # Build pseudo-state untuk trace metadata (memory_job tidak punya AgentState)
+        trace_config = build_trace_config(
+            state={"session_id": session_id, "user_context": {"user_id": user_id}},
+            agent_name="memory_summary",
+        )
+        result = await llm.ainvoke([HumanMessage(content=prompt)], config=trace_config)
         summary = result.content.strip()
         latency_ms = int((time.monotonic() - start) * 1000)
         logger.info(f"Session summary generated: session={session_id} latency={latency_ms}ms")

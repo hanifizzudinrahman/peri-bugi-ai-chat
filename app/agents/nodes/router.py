@@ -107,14 +107,21 @@ async def _classify_by_llm(
     prompt_template: str,
     provider: str | None = None,
     model: str | None = None,
+    state: dict | None = None,
 ) -> tuple[str, LLMCallLogPayload]:
     """
     Fallback: klasifikasi via LLM jika rule-based tidak match.
     Pakai model kecil/cepat, temperature=0 untuk output deterministik.
     Return (intent, log_payload).
+
+    Args:
+        state: AgentState — dipakai untuk Langfuse trace metadata.
+               Optional: kalau None, trace tetap masuk tapi tanpa
+               session_id / user_id metadata.
     """
     from langchain_core.messages import HumanMessage
     from app.config.llm import get_llm, get_model_name, get_provider_name
+    from app.config.observability import build_trace_config
 
     llm = get_llm(
         temperature=0,
@@ -132,8 +139,11 @@ async def _classify_by_llm(
     error_msg: str | None = None
     intent = "dental_qa"
 
+    # Per-call trace config (no-op kalau Langfuse disabled)
+    trace_config = build_trace_config(state=state, agent_name="router")
+
     try:
-        result = await llm.ainvoke([HumanMessage(content=prompt)])
+        result = await llm.ainvoke([HumanMessage(content=prompt)], config=trace_config)
         ttft = (time.monotonic() - start_time) * 1000
         intent_raw = result.content.strip().lower()
 
@@ -204,6 +214,7 @@ async def router_node(state: AgentState) -> AsyncIterator[str]:
                 router_prompt,
                 provider=state.get("llm_provider_override"),
                 model=state.get("llm_model_override"),
+                state=state,  # untuk Langfuse trace metadata
             )
             # Simpan log untuk dikirim ke api
             state["llm_call_logs"].append(log.model_dump())

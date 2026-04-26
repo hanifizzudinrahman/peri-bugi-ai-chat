@@ -47,3 +47,8 @@ python-multipart==0.0.20
 # Testing
 pytest==8.2.2
 pytest-asyncio==0.23.7
+
+# Observability — Langfuse (optional, lihat docs/LANGFUSE_INTEGRATION.md)
+# Pin major v3 (OTEL-based, langchain integration via langfuse.langchain.CallbackHandler).
+# v3.x SDK requires self-hosted Langfuse platform >= 3.125.0 (Hanif punya 3.170.0 ✅)
+langfuse>=3.0.0,<4.0.0

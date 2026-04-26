@@ -50,6 +50,17 @@ class Settings(BaseSettings):
     # RnD mode
     RND_MODE: bool = True
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Langfuse Observability (optional)
+    # Pattern 1+2: graceful degradation + explicit toggle.
+    # Default OFF supaya safe — Hanif harus eksplisit set true di .env.
+    # Lihat docs/LANGFUSE_INTEGRATION.md untuk detail.
+    # ─────────────────────────────────────────────────────────────────────────
+    LANGFUSE_ENABLED: bool = False
+    LANGFUSE_PUBLIC_KEY: str = ""
+    LANGFUSE_SECRET_KEY: str = ""
+    LANGFUSE_HOST: str = "http://langfuse-web:3000"  # internal Docker network
+
     @property
     def is_production(self) -> bool:
         return self.APP_ENV == "production"

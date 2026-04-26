@@ -15,6 +15,7 @@ import warnings
 from typing import Any
 
 from app.agents.state import AgentState
+from app.config.observability import build_trace_config
 from app.config.settings import settings
 
 
@@ -51,7 +52,9 @@ async def kb_dental_agent(state: AgentState) -> dict[str, Any]:
             provider_override=state.get("embedding_provider_override"),
             model_override=state.get("embedding_model_override"),
         )
-        results = await retriever.ainvoke(query)
+        # Per-call trace metadata: agent="kb_dental_retriever", session_id, dll
+        trace_config = build_trace_config(state=state, agent_name="kb_dental_retriever")
+        results = await retriever.ainvoke(query, config=trace_config)
         docs = [doc.page_content for doc in results]
         state["tool_calls"].append({
             "tool": "qdrant_retriever",
@@ -140,7 +143,9 @@ async def app_faq_agent(state: AgentState) -> dict[str, Any]:
             provider_override=state.get("embedding_provider_override"),
             model_override=state.get("embedding_model_override"),
         )
-        results = await retriever.ainvoke(query)
+        # Per-call trace metadata: agent="app_faq_retriever", session_id, dll
+        trace_config = build_trace_config(state=state, agent_name="app_faq_retriever")
+        results = await retriever.ainvoke(query, config=trace_config)
         docs = [doc.page_content for doc in results]
         state["tool_calls"].append({
             "tool": "qdrant_retriever_faq",

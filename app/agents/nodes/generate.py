@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.agents.state import AgentState
 from app.config.llm import get_llm, get_model_name, get_provider_name
+from app.config.observability import build_trace_config
 from app.schemas.chat import (
     LLMCallLogPayload,
     make_clarify_event,
@@ -326,8 +327,11 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
     yield make_thinking_event(step=thinking_step, label=thinking_label, done=True)
     state["thinking_steps"].append({"step": thinking_step, "label": thinking_label, "done": True})
 
+    # Per-call trace config (no-op kalau Langfuse disabled)
+    trace_config = build_trace_config(state=state, agent_name="generate")
+
     try:
-        async for chunk in llm.astream(lc_messages):
+        async for chunk in llm.astream(lc_messages, config=trace_config):
             token = chunk.content
             if not token:
                 continue

@@ -8,10 +8,26 @@ Swap provider cukup dengan ubah LLM_PROVIDER di .env:
 
 Semua provider return BaseChatModel yang interface-nya sama,
 sehingga code agent tidak perlu tahu provider yang dipakai.
+
+Observability:
+- Setiap LLM yang di-return dari get_llm() otomatis di-wrap dengan
+  Langfuse callback handler kalau LANGFUSE_ENABLED=true di .env.
+- Wrap pakai .with_config() — interface BaseChatModel tetap sama,
+  call site tidak perlu tahu observability aktif atau tidak.
+- Kalau Langfuse disabled / unreachable / config invalid, get_llm()
+  return LLM tanpa wrap. Zero overhead.
+- Untuk per-call metadata (session_id, agent name dll), call site bisa
+  pass `config=build_trace_config(state, agent_name)` ke .ainvoke()/.astream()
+  di samping wrap default. Lihat app/config/observability.py.
 """
+import logging
+
 from langchain_core.language_models import BaseChatModel
 
+from app.config.observability import get_langfuse_handler
 from app.config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 def get_llm(
@@ -27,20 +43,39 @@ def get_llm(
 
     provider dan model bisa di-override untuk kebutuhan RnD
     (test berbagai model tanpa ganti .env).
+
+    Auto-wrap dengan Langfuse observability kalau LANGFUSE_ENABLED=true.
     """
     temp = temperature if temperature is not None else settings.LLM_TEMPERATURE
     tokens = max_tokens if max_tokens is not None else settings.LLM_MAX_TOKENS
     _provider = provider or settings.LLM_PROVIDER
 
     if _provider == "ollama":
-        return _get_ollama(temp, tokens, streaming, model_override=model)
-    if _provider == "gemini":
-        return _get_gemini(temp, tokens, streaming, model_override=model)
-    if _provider == "openai":
-        return _get_openai(temp, tokens, streaming, model_override=model)
+        llm = _get_ollama(temp, tokens, streaming, model_override=model)
+    elif _provider == "gemini":
+        llm = _get_gemini(temp, tokens, streaming, model_override=model)
+    elif _provider == "openai":
+        llm = _get_openai(temp, tokens, streaming, model_override=model)
+    else:
+        raise ValueError(f"LLM_PROVIDER tidak dikenal: '{_provider}'. "
+                         f"Pilih: ollama | gemini | openai")
 
-    raise ValueError(f"LLM_PROVIDER tidak dikenal: '{_provider}'. "
-                     f"Pilih: ollama | gemini | openai")
+    return _attach_observability(llm)
+
+
+def _attach_observability(llm: BaseChatModel) -> BaseChatModel:
+    """
+    Wrap LLM dengan Langfuse callback handler kalau enabled.
+    Kalau disabled / unreachable, return llm apa adanya.
+
+    `with_config()` adalah LangChain official method untuk attach
+    callbacks tanpa mengubah interface BaseChatModel. Aman dipakai
+    di semua call pattern: .ainvoke(), .astream(), .invoke(), dll.
+    """
+    handler = get_langfuse_handler()
+    if handler is None:
+        return llm
+    return llm.with_config({"callbacks": [handler]})
 
 
 def _get_ollama(temperature: float, max_tokens: int, streaming: bool,

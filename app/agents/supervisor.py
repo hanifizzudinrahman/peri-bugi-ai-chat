@@ -150,10 +150,16 @@ async def _classify_by_llm(
     prompt_template: str,
     provider: str | None,
     model: str | None,
+    state: dict | None = None,
 ) -> tuple[list[str], LLMCallLogPayload]:
-    """LLM fallback: return list agent yang perlu dipanggil."""
+    """LLM fallback: return list agent yang perlu dipanggil.
+
+    Args:
+        state: AgentState — untuk Langfuse trace metadata. Optional.
+    """
     from langchain_core.messages import HumanMessage
     from app.config.llm import get_llm, get_model_name, get_provider_name
+    from app.config.observability import build_trace_config
 
     llm = get_llm(temperature=0, max_tokens=50, streaming=False,
                   provider=provider, model=model)
@@ -168,8 +174,11 @@ async def _classify_by_llm(
     error_msg = None
     agents_selected: list[str] = []
 
+    # Per-call trace config (no-op kalau Langfuse disabled)
+    trace_config = build_trace_config(state=state, agent_name="supervisor")
+
     try:
-        result = await llm.ainvoke([HumanMessage(content=prompt)])
+        result = await llm.ainvoke([HumanMessage(content=prompt)], config=trace_config)
         raw = result.content.strip().lower()
         # Parse: "kb_dental,user_profile" atau "kb_dental" atau "none"
         if raw and raw != "none":
@@ -242,6 +251,7 @@ async def supervisor_node(state: AgentState) -> AsyncIterator[str]:
                 prompt_template=supervisor_prompt,
                 provider=state.get("llm_provider_override"),
                 model=state.get("llm_model_override"),
+                state=state,  # untuk Langfuse trace metadata
             )
             state["llm_call_logs"].append(log.model_dump())
         else:

@@ -187,6 +187,7 @@ async def _detect_by_llm(
     llm_provider: Optional[str] = None,
     llm_model: Optional[str] = None,
     prompt_template: Optional[str] = None,
+    state: Optional[dict] = None,
 ) -> Optional[ViewHint]:
     """
     Layer 2 detection — LLM fallback untuk text yang rule tidak handle.
@@ -200,6 +201,7 @@ async def _detect_by_llm(
         llm_model: Override model name
         prompt_template: Prompt dari DB (key='view_hint_classification').
                         Kalau None, fallback ke hardcoded constant.
+        state: AgentState — untuk Langfuse trace metadata. Optional.
 
     Returns:
         ViewHint kalau LLM confident, None kalau LLM tidak yakin / fail
@@ -211,6 +213,7 @@ async def _detect_by_llm(
         # Lazy import — avoid load saat module init
         from langchain_core.messages import HumanMessage
         from app.config.llm import get_llm
+        from app.config.observability import build_trace_config
     except ImportError as e:
         logger.warning(f"[view_hint] LLM imports failed, skip LLM layer: {e}")
         return None
@@ -229,7 +232,9 @@ async def _detect_by_llm(
             provider=llm_provider,
             model=llm_model,
         )
-        result = await llm.ainvoke([HumanMessage(content=prompt)])
+        # Per-call trace config (no-op kalau Langfuse disabled)
+        trace_config = build_trace_config(state=state, agent_name="view_hint_detector")
+        result = await llm.ainvoke([HumanMessage(content=prompt)], config=trace_config)
 
         # Parse output — extract first word, lowercase
         raw_content = (result.content or "").strip().lower()
@@ -269,6 +274,7 @@ async def detect_view_hint(
     llm_model: Optional[str] = None,
     enable_llm_fallback: bool = True,
     prompt_template: Optional[str] = None,
+    state: Optional[dict] = None,
 ) -> tuple[Optional[ViewHint], DecisionSource]:
     """
     Hybrid Tiered View Hint Detection.
@@ -284,6 +290,7 @@ async def detect_view_hint(
         enable_llm_fallback: Set False untuk skip Layer 2 (e.g. test mode)
         prompt_template: Prompt dari DB key='view_hint_classification'
                         untuk Layer 2. Kalau None, fallback ke hardcoded.
+        state: AgentState — untuk Langfuse trace metadata. Optional.
 
     Returns:
         (ViewHint | None, decision_source)
@@ -308,7 +315,9 @@ async def detect_view_hint(
     # Layer 2: LLM fallback (slow path)
     if enable_llm_fallback:
         llm_hint = await _detect_by_llm(
-            text, llm_provider, llm_model, prompt_template=prompt_template
+            text, llm_provider, llm_model,
+            prompt_template=prompt_template,
+            state=state,
         )
         if llm_hint:
             return llm_hint, "llm"
