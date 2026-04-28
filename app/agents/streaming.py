@@ -1,11 +1,11 @@
 """
 Stream adapter — Hybrid LangGraph + native async generator pattern.
 
-PHASE 1 STREAMING APPROACH (Hybrid — final):
+PHASE 2 STREAMING APPROACH (post-Step 2a — Single-Pass Tools):
 
-  Step 1: invoke compiled graph (supervisor → agent_dispatcher → END)
+  Step 1: invoke compiled graph (pre_router → agent → tools → tool_bridge → END)
           - Capture state updates, emit thinking/tool events
-          - Graph terminates di END setelah agent_dispatcher selesai
+          - Graph terminates di END setelah tool_bridge selesai
   Step 2: Get final state snapshot dari checkpointer
   Step 3: Call generate_node(state) langsung sebagai async generator
           - Per-token streaming via `yield make_token_event(token)`
@@ -17,11 +17,12 @@ Kenapa hybrid:
   untuk Gemini via langchain_google_genai. Buffering issue di langgraph 0.2.60.
 - Original pattern (yield from async generator) PROVEN work — kita preserve untuk
   generate node yang punya streaming concern.
-- Supervisor + dispatcher tidak perlu streaming (cuma return state update),
-  jadi cocok di graph.
+- Graph nodes (pre_router/agent/tools/tool_bridge) tidak perlu streaming, jadi
+  cocok di graph dengan stream_mode="updates" untuk emit thinking + tool events.
 
-Phase 2 nanti akan revisit setelah migrate ke ReAct loop dengan ToolNode +
-LangGraph custom stream writer pattern.
+Phase 6 (cleanup) nanti akan refactor generate.py jadi clean — saat itu kita
+bisa eliminate _build_legacy_dict_state shim dan mungkin migrate streaming
+pattern juga (tergantung apa Gemini astream sudah reliable saat itu).
 """
 from __future__ import annotations
 
@@ -138,7 +139,7 @@ async def _stream_internal(
 ) -> AsyncIterator[str]:
     """
     Hybrid streaming:
-    - Step 1: invoke graph (supervisor + agent_dispatcher) via astream(stream_mode="updates")
+    - Step 1: invoke graph (pre_router + agent + tools + tool_bridge) via astream(stream_mode="updates")
     - Step 2: get final state, call generate_node(state) as async generator
     - Step 3: emit clarify/quick_reply/suggestions/done after generate selesai
     """
@@ -196,7 +197,7 @@ async def _stream_internal(
     emitted_tool_calls: set = set()
 
     # ========================================================================
-    # STEP 1: Run graph (supervisor + agent_dispatcher) — emit thinking/tool events
+    # STEP 1: Run graph (pre_router + agent + tools + tool_bridge) — emit thinking/tool events
     # ========================================================================
     try:
         async for event_tuple in graph.astream(
@@ -260,7 +261,7 @@ async def _stream_internal(
                         )
 
         # ========================================================================
-        # STEP 2: Get final state snapshot dari graph (post-dispatcher)
+        # STEP 2: Get final state snapshot dari graph (post-tool_bridge)
         # ========================================================================
         try:
             state_obj = await graph.aget_state(config)
@@ -290,10 +291,14 @@ async def _stream_internal(
     # state["key"] = value (setitem) untuk mutate final_response, llm_metadata,
     # prompt_debug. Pydantic AgentState immutable by design — pakai dict shim.
     #
-    # Pattern: convert Pydantic AgentState → legacy dict (sama seperti
-    # agent_dispatcher pakai _build_legacy_dict_state). Setelah generate_node
+    # Pattern: convert Pydantic AgentState → legacy dict (via
+    # _build_legacy_dict_state — kept in agent_dispatcher.py for now even
+    # though dispatcher itself isn't in graph anymore). After generate_node
     # selesai, extract final_response, llm_metadata, prompt_debug dari dict
     # untuk submit_llm_logs + langfuse capture.
+    #
+    # Phase 6 (refactor generate.py) akan eliminate dict shim — generate jadi
+    # pure Pydantic-aware async generator.
     from app.agents.nodes.agent_dispatcher import _build_legacy_dict_state
 
     legacy_dict_state = _build_legacy_dict_state(final_state)

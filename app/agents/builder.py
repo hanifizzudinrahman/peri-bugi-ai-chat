@@ -1,20 +1,26 @@
 """
-StateGraph builder untuk Tanya Peri (Phase 1 — Hybrid).
+StateGraph builder untuk Tanya Peri (Phase 2 Step 2a — Single-Pass Tools).
 
-PHASE 1 GRAPH STRUCTURE (post-fix):
+PHASE 2 GRAPH STRUCTURE:
 
-    START → supervisor → agent_dispatcher → END
+    START → pre_router → agent → tools → tool_bridge → END
 
-generate_node TIDAK masuk graph — di-invoke langsung sebagai async generator
-oleh streaming.py setelah graph selesai. Alasan: LangGraph stream API tidak
-reliable emit per-token chunk untuk Gemini provider via langchain_google_genai.
-Dengan keep generate sebagai async generator, kita preserve:
-- Per-token streaming (FE terima word-by-word) ✅
-- Pydantic AgentState ✅ (state shared via dict-compat shim)
-- Checkpointer untuk supervisor + dispatcher state ✅
+Flow:
+1. pre_router: detect image / clarification → maybe set state.forced_tool_calls
+2. agent_node: LLM with bind_tools, single invocation
+   - If forced_tool_calls set → emit AIMessage with those tool_calls (no LLM)
+   - Else → LLM picks tools (or none for smalltalk)
+3. tools_node: execute tool_calls in parallel (custom node, not prebuilt ToolNode)
+4. tool_bridge: convert ToolMessages → legacy state fields (agent_results,
+   retrieved_docs, image_analysis, needs_clarification, ...)
+5. END
 
-Phase 2 nanti akan refactor ulang setelah ReAct loop in place — pakai LangGraph
-ToolNode + dedicated streaming dengan custom stream writer pattern.
+generate_node (per-token streaming) di-invoke OUTSIDE graph oleh streaming.py
+sebagai async generator. Hybrid pattern dipertahankan dari Phase 1.
+
+If agent_node decides NO tools (smalltalk), tools_node + tool_bridge are still
+visited but become no-ops. State passes through unchanged. generate_node will
+respond from system prompt + history only.
 """
 from __future__ import annotations
 
@@ -24,8 +30,10 @@ from typing import Optional
 from langgraph.graph import StateGraph, START, END
 
 from app.agents.state import AgentState
-from app.agents.supervisor import supervisor_node
-from app.agents.nodes.agent_dispatcher import agent_dispatcher_node
+from app.agents.nodes.pre_router import pre_router_node
+from app.agents.nodes.agent import agent_node
+from app.agents.nodes.tools_node import tools_node
+from app.agents.nodes.tool_bridge import tool_bridge_node
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +46,7 @@ async def get_compiled_graph():
     """
     Return compiled StateGraph singleton.
 
-    PHASE 1 graph: START → supervisor → agent_dispatcher → END
-    (generate node di-invoke terpisah oleh streaming.py untuk preserve
-    per-token streaming.)
+    PHASE 2 graph: START → pre_router → agent → tools → tool_bridge → END
     """
     global _compiled_graph
     if _compiled_graph is not None:
@@ -52,17 +58,23 @@ async def get_compiled_graph():
     builder = StateGraph(AgentState)
 
     # Nodes
-    builder.add_node("supervisor", supervisor_node)
-    builder.add_node("agent_dispatcher", agent_dispatcher_node)
+    builder.add_node("pre_router", pre_router_node)
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", tools_node)
+    builder.add_node("tool_bridge", tool_bridge_node)
 
-    # Edges (linear flow — generate handled separately)
-    builder.add_edge(START, "supervisor")
-    builder.add_edge("supervisor", "agent_dispatcher")
-    builder.add_edge("agent_dispatcher", END)
+    # Edges (linear single-pass — no loop back to agent)
+    builder.add_edge(START, "pre_router")
+    builder.add_edge("pre_router", "agent")
+    builder.add_edge("agent", "tools")
+    builder.add_edge("tools", "tool_bridge")
+    builder.add_edge("tool_bridge", END)
 
     if cp is not None:
         _compiled_graph = builder.compile(checkpointer=cp)
-        logger.info("[builder] StateGraph compiled WITH PostgresSaver checkpointer")
+        logger.info(
+            "[builder] StateGraph compiled (Phase 2 ReAct) WITH PostgresSaver checkpointer"
+        )
     else:
         _compiled_graph = builder.compile()
         logger.warning(

@@ -225,6 +225,14 @@ class AgentState(BaseModel):
     agents_selected: list[str] = Field(default_factory=list)
     execution_plan: dict = Field(default_factory=dict)
 
+    # ── Phase 2 ReAct routing (NEW) ───────────────────────────────────────────
+    # forced_tool_calls: set by pre_router_node when state.image is detected
+    # (or other deterministic routing scenario). agent_node reads this and
+    # SKIPS the LLM decision — directly emits these tool_calls in the AIMessage.
+    # Empty list = no forced routing, LLM decides freely.
+    # Format: [{"name": "tool_name", "args": dict}]
+    forced_tool_calls: list[dict] = Field(default_factory=list)
+
     # ── Per-agent results (Phase 1: dict keyed by agent_key) ──────────────────
     agent_results: dict[str, Any] = Field(default_factory=dict)
     retrieved_docs: list[str] = Field(default_factory=list)
@@ -298,6 +306,8 @@ class AgentState(BaseModel):
             return self.agents_selected
         elif key == "execution_plan":
             return self.execution_plan
+        elif key == "forced_tool_calls":
+            return self.forced_tool_calls
         elif key == "agent_results":
             return self.agent_results
         elif key == "retrieved_docs":

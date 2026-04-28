@@ -61,11 +61,45 @@ def _build_legacy_dict_state(state: AgentState) -> dict:
     Agents akan mutate dict ini in-place; kita extract perubahan setelahnya.
     """
     # Convert messages ke legacy dict format
+    #
+    # PHASE 2A FIX: Skip empty AIMessages dari agent_node.
+    # Di Phase 2, agent_node return AIMessage(content="", tool_calls=[...])
+    # untuk tool selection (atau AIMessage("") kalau smalltalk no tools).
+    # LangGraph add_messages reducer APPEND ini ke state.messages.
+    # Kalau kita keep empty AIMessage di history → generate.py LLM lihat
+    # "assistant already responded with nothing" → respond empty (0 token).
+    # Filter rules:
+    #   - HumanMessage: ALWAYS keep (even empty content — image-only upload)
+    #   - AIMessage with non-empty content: keep (real assistant turn)
+    #   - AIMessage with empty content: SKIP (Phase 2 agent_node artifact)
+    #   - AIMessage with tool_calls only (no content): SKIP (internal routing)
+    #   - ToolMessage: keep with role "tool" (generate._build_messages
+    #     handles by skipping non-user/assistant roles)
     msgs_legacy = []
     for m in state.messages:
-        if hasattr(m, "type"):
-            role = "user" if m.type == "human" else ("assistant" if m.type == "ai" else m.type)
-            msgs_legacy.append({"role": role, "content": m.content})
+        if not hasattr(m, "type"):
+            continue
+        msg_type = m.type
+        content = m.content if m.content is not None else ""
+
+        if msg_type == "ai":
+            # Skip empty AIMessages (Phase 2 agent_node artifacts)
+            has_content = bool(content and str(content).strip())
+            has_tool_calls = bool(getattr(m, "tool_calls", None))
+            if not has_content:
+                # No content → skip (regardless of tool_calls).
+                # tool_calls audit captured separately via state.tool_calls (ToolCallRecord).
+                continue
+            msgs_legacy.append({"role": "assistant", "content": content})
+        elif msg_type == "human":
+            msgs_legacy.append({"role": "user", "content": content})
+        elif msg_type == "tool":
+            # Tool result — generate.py doesn't use these directly (uses agent_results).
+            # Keep with role "tool" so future generate refactor can read if needed.
+            msgs_legacy.append({"role": "tool", "content": content})
+        else:
+            # System/other — pass through with original type as role
+            msgs_legacy.append({"role": msg_type, "content": content})
 
     return {
         # Static context

@@ -212,17 +212,33 @@ def _build_system_prompt(state: AgentState) -> str:
 
 
 def _build_messages(state: AgentState, system_prompt: str) -> list:
-    """Build list LangChain messages dari state."""
+    """Build list LangChain messages dari state.
+
+    PHASE 2A DEFENSIVE FIX: Skip empty assistant messages.
+    Background: Sebelum Phase 2a fix1, agent_node mengappend empty AIMessage
+    ke state.messages, yang ke-save ke DB via chat_messages.content="".
+    Saat user kirim turn berikutnya, history dari DB include empty assistant
+    rows. LLM dapat empty AIMessage → respond empty.
+    Defensive filter ini protect future turns kalau ada empty assistant
+    rows di DB (artifact dari turn yang gagal sebelum fix).
+    """
     lc_messages = [SystemMessage(content=system_prompt)]
     for msg in state.get("messages", []):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role", "user")
         content = msg.get("content", "")
-        if role == "user":
-            lc_messages.append(HumanMessage(content=content))
-        elif role == "assistant":
+        if role == "assistant":
+            # Skip empty assistant messages (artifact dari Phase 2a bug atau
+            # turn yang gagal sebelum fix shipped).
+            if not content or not str(content).strip():
+                continue
             lc_messages.append(AIMessage(content=content))
+        elif role == "user":
+            # Always keep user messages (even empty — image-only upload valid)
+            lc_messages.append(HumanMessage(content=content))
+        # Other roles (system, tool) skipped — system prompt built separately,
+        # tool results consumed via agent_results.
     return lc_messages
 
 
