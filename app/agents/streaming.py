@@ -156,7 +156,33 @@ async def _stream_internal(
         captured["error"] = str(e)
         return
 
-    thread_id = initial_state.session.session_id or f"thread-{uuid.uuid4()}"
+    # CRITICAL FIX: per-turn thread_id (bukan per-session).
+    #
+    # Original design (pre-Phase 1): TIDAK pakai LangGraph checkpointer.
+    # Tiap chat message build state FRESH dari build_initial_state(request).
+    # State lama TIDAK di-resume cross-turn.
+    #
+    # Phase 1 add LangGraph + PostgresSaver checkpointer. Kalau pakai
+    # thread_id = session_id, tiap turn berikutnya akan RESUME state lama
+    # (image_url, agent_results, image_analysis, agents_selected, dll).
+    # Hasilnya: user kirim text-only di session yang pernah upload foto →
+    # image_url checkpoint lama bocor → mata_peri_agent tetap aktif → minta
+    # clarification ulang. BUG.
+    #
+    # Solusi: thread_id unique per turn (per chat message). Checkpoint masih
+    # tersimpan untuk debug/audit + mid-turn recovery, tapi tidak ada
+    # cross-turn state leak. Sesuai design original (fresh state per turn).
+    #
+    # Memory cross-turn (riwayat percakapan, fakta user) tetap di-handle
+    # pakai existing memory_context dari peri-bugi-api (TIDAK via checkpointer).
+    # Phase 5 nanti akan revisit kalau perlu cross-turn checkpoint resume.
+    base_thread = initial_state.session.session_id or f"thread-{uuid.uuid4()}"
+    turn_id = (
+        initial_state.session.chat_message_id
+        or initial_state.session.trace_id
+        or str(uuid.uuid4())
+    )
+    thread_id = f"{base_thread}::{turn_id}"
     config = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": 25,
