@@ -19,6 +19,7 @@ services:
     volumes:
       - ./app:/app/app
       - ./tests:/app/tests
+      - ./scripts:/app/scripts
       - ./pytest.ini:/app/pytest.ini
       - huggingface_cache:/root/.cache/huggingface
     command: uvicorn app.main:app --host 0.0.0.0 --port 8003 --reload

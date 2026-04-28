@@ -34,6 +34,21 @@ class Settings(BaseSettings):
     QDRANT_COLLECTION: str = "peri_bugi_dental"
     QDRANT_FAQ_COLLECTION: str = "peri_bugi_faq"      # NEW: untuk app_faq agent
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Embedding model (untuk RAG retrieval — kb_dental, app_faq agents)
+    # Diakses oleh app/agents/sub_agents/__init__.py (_get_embeddings) +
+    # app/agents/tools/retrieve.py + admin info endpoint di main.py.
+    # Sebelumnya field ini tidak declared di Settings — pakai .env value via
+    # extra="ignore" tidak cukup karena pydantic-settings butuh field declaration
+    # supaya bisa diakses via settings.EMBEDDING_PROVIDER.
+    #   Provider: "local" (HuggingFace, default) | "gemini" | "openai"
+    #   Model:    nama model (untuk local: HF model name)
+    #   Device:   "cpu" | "cuda" | "auto" (auto = detect via torch)
+    # ─────────────────────────────────────────────────────────────────────────
+    EMBEDDING_PROVIDER: str = "local"
+    EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    EMBEDDING_DEVICE: str = "auto"
+
     # Redis (shared dengan peri-bugi-api — connect via host.docker.internal)
     # Kosong = rate limiting RnD endpoint dinonaktifkan
     REDIS_URL: str = ""
