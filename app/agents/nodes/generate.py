@@ -7,8 +7,14 @@ Update v2:
 - Build context dari agent_results (multi-agent)
 - Inject memory context (L2+L3) ke system prompt
 - Support quick_reply event
+
+Update v3 (Step 2b):
+- Smalltalk path: jika state.is_smalltalk=True (set by pre_router), pakai
+  lean prompt minimal (Q2B: keep nama anak doang). SKIP injection of
+  brushing, mata_peri_last_result, memory_context, agent_results.
 """
 import json
+import logging
 import time
 from typing import Any, AsyncIterator
 
@@ -25,6 +31,59 @@ from app.schemas.chat import (
     make_token_event,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _build_smalltalk_system_prompt(state: AgentState, prompts: dict) -> str:
+    """
+    Lean smalltalk system prompt (Step 2b — Q2B decision).
+
+    Triggered when state.is_smalltalk=True (set by pre_router_node via strict
+    regex+length+keyword check).
+
+    SKIP injection: brushing, mata_peri_last_result, memory_context, agent_results.
+    KEEP: persona + nama orang tua + nama anak.
+
+    Q3A graceful fallback: kalau 'generate_smalltalk' tidak ada di state.prompts
+    (DB seeder belum jalan / key inactive), pakai inline default + warning log.
+    """
+    SMALLTALK_FALLBACK = (
+        "Kamu adalah Tanya Peri 🧚, asisten kesehatan gigi anak yang ramah dan hangat.\n\n"
+        "User baru kasih sapaan singkat. Bales dengan hangat dan natural — JANGAN dump info detail.\n\n"
+        "ATURAN:\n"
+        "- Sapa user dengan nama orang tua-nya\n"
+        "- Sebut nama anak (kalau diketahui) untuk personalisasi\n"
+        "- Tanyakan ada yang bisa kamu bantu hari ini\n"
+        "- Maksimal 1-2 kalimat\n"
+        "- 1-2 emoji wajar (🧚 ✨ 👋 💙)\n"
+        "- JANGAN sebutkan hasil scan, streak, atau detail teknis lain\n"
+        "- JANGAN tanya pertanyaan medis spesifik\n\n"
+        "KONTEKS USER:\n"
+        "- Orang tua: {user_name}\n"
+        "- Anak: {child_name}\n"
+    )
+
+    template = prompts.get("generate_smalltalk")
+    if not template:
+        logger.warning(
+            "[generate] 'generate_smalltalk' prompt not in state.prompts — "
+            "using inline fallback. Run scripts/seed_prompts.py to populate DB."
+        )
+        template = SMALLTALK_FALLBACK
+
+    # Inject {user_name} + {child_name}
+    ctx = state.get("user_context", {})
+    user = ctx.get("user") or {}
+    child = ctx.get("child") or {}
+
+    user_name = user.get("nickname") or user.get("full_name") or "Bunda/Ayah"
+    child_name = child.get("nickname") or child.get("full_name") or "si kecil"
+
+    rendered = template.replace("{user_name}", user_name)
+    rendered = rendered.replace("{child_name}", child_name)
+
+    return rendered
+
 
 def _build_system_prompt(state: AgentState) -> str:
     """
@@ -34,13 +93,25 @@ def _build_system_prompt(state: AgentState) -> str:
     3. Memory context (L2 summary + L3 facts)
     4. Hasil agent (docs, profile data, dll)
     5. Response mode instructions
+
+    Step 2b: Early branch ke lean smalltalk prompt jika state.is_smalltalk=True
+    (set by pre_router via strict regex check). Skip injection brushing/scan/memory.
     """
     prompts = state.get("prompts", {})
 
-    # Override system prompt penuh (RnD mode)
+    # Override system prompt penuh (RnD mode) — UNCHANGED
     if "_override_system" in prompts:
         return prompts["_override_system"]
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # SMALLTALK PATH (Step 2b — Q2B): early return with lean prompt
+    # ─────────────────────────────────────────────────────────────────────────
+    if state.get("is_smalltalk"):
+        return _build_smalltalk_system_prompt(state, prompts)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # NORMAL PATH (existing logic — UNCHANGED below)
+    # ─────────────────────────────────────────────────────────────────────────
     # Persona base
     persona = prompts.get(
         "persona_system",

@@ -411,6 +411,293 @@ async def test_18_fix1_generate_build_messages_defensive():
     print("    ✅ PASSED — Defensive filter working (DB empty rows handled)")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# FIX2 TESTS — agent_node strips content (single-responsibility)
+# ═══════════════════════════════════════════════════════════════════════════
+# Mock LLM to verify agent_node behavior without real Gemini call.
+
+class _MockLLM:
+    """Minimal mock of LangChain ChatModel for testing agent_node."""
+    def __init__(self, return_content: str = "", return_tool_calls: list | None = None):
+        self._content = return_content
+        self._tool_calls = return_tool_calls or []
+
+    def bind_tools(self, tools):
+        return self  # mock chains as self
+
+    async def ainvoke(self, messages, config=None):
+        return AIMessage(content=self._content, tool_calls=self._tool_calls)
+
+
+async def test_19_fix2_smalltalk_content_stripped():
+    print("\n[Test 19] FIX2: Smalltalk — Gemini returns content, agent_node STRIPS it")
+    from app.agents.nodes import agent as agent_module
+    from app.config import llm as llm_module
+    from unittest.mock import patch
+
+    state = _build_state(user_message="halo peri", allowed_agents=["kb_dental"])
+
+    # Mock LLM that returns content (simulating Gemini disobeying prompt)
+    mock_llm = _MockLLM(return_content="Halo Ayah Hanif! Senang ketemu...", return_tool_calls=[])
+
+    with patch.object(llm_module, "get_llm", return_value=mock_llm):
+        update = await agent_module.agent_node(state)
+
+    msgs = update.get("messages", [])
+    assert len(msgs) == 1
+    ai_msg = msgs[0]
+    # CRITICAL: content must be stripped
+    assert ai_msg.content == "", f"Content NOT stripped! Got: {ai_msg.content!r}"
+    assert ai_msg.tool_calls == []
+    # LLMCallLog must record content_was_stripped=True
+    logs = update.get("llm_call_logs", [])
+    assert len(logs) == 1
+    assert logs[0].metadata.get("content_was_stripped") is True
+    assert logs[0].metadata.get("stripped_content_len") > 0
+    print("    ✅ PASSED — Content stripped, audit logged")
+
+
+async def test_20_fix2_tool_path_tool_calls_preserved():
+    print("\n[Test 20] FIX2: Tool path — tool_calls preserved, any preamble content stripped")
+    from app.agents.nodes import agent as agent_module
+    from app.config import llm as llm_module
+    from unittest.mock import patch
+
+    state = _build_state(user_message="kenapa gigi sakit", allowed_agents=["kb_dental"])
+
+    # Mock LLM returns tool_call WITH preamble content (Gemini sometimes does this)
+    mock_llm = _MockLLM(
+        return_content="Saya akan cari info...",  # preamble — should be stripped
+        return_tool_calls=[
+            {"name": "search_dental_knowledge", "args": {"query": "gigi sakit"},
+             "id": "c1", "type": "tool_call"}
+        ],
+    )
+
+    with patch.object(llm_module, "get_llm", return_value=mock_llm):
+        update = await agent_module.agent_node(state)
+
+    ai_msg = update["messages"][0]
+    # Content stripped, tool_calls KEPT
+    assert ai_msg.content == "", f"Content NOT stripped: {ai_msg.content!r}"
+    assert len(ai_msg.tool_calls) == 1
+    assert ai_msg.tool_calls[0]["name"] == "search_dental_knowledge"
+    print("    ✅ PASSED — tool_calls preserved, preamble content stripped")
+
+
+async def test_21_fix2_empty_response_no_strip_logged():
+    print("\n[Test 21] FIX2: Compliant Gemini (empty content) — no strip logged")
+    from app.agents.nodes import agent as agent_module
+    from app.config import llm as llm_module
+    from unittest.mock import patch
+
+    state = _build_state(user_message="halo peri", allowed_agents=["kb_dental"])
+
+    # Mock LLM that PROPERLY follows new prompt — returns empty
+    mock_llm = _MockLLM(return_content="", return_tool_calls=[])
+
+    with patch.object(llm_module, "get_llm", return_value=mock_llm):
+        update = await agent_module.agent_node(state)
+
+    ai_msg = update["messages"][0]
+    assert ai_msg.content == ""
+    logs = update["llm_call_logs"]
+    # No strip event since content was already empty
+    assert logs[0].metadata.get("content_was_stripped") is False
+    assert logs[0].metadata.get("stripped_content_len") == 0
+    print("    ✅ PASSED — No spurious strip logged when LLM compliant")
+
+
+async def test_22_fix2_full_e2e_smalltalk_clean_to_generate():
+    print("\n[Test 22] FIX2 e2e: agent_node strip → _build_legacy_dict_state → clean prompt to generate")
+    from app.agents.nodes import agent as agent_module
+    from app.agents.nodes.agent_dispatcher import _build_legacy_dict_state
+    from app.config import llm as llm_module
+    from unittest.mock import patch
+
+    state = _build_state(user_message="halo peri", allowed_agents=["kb_dental"])
+
+    # Simulate Gemini violating "no content" rule (worst case for fix2)
+    mock_llm = _MockLLM(return_content="Halo Ayah!", return_tool_calls=[])
+
+    with patch.object(llm_module, "get_llm", return_value=mock_llm):
+        update = await agent_module.agent_node(state)
+
+    # Apply graph reducer manually (add_messages appends)
+    new_state = state.model_copy(update={
+        "messages": [*state.messages, *update["messages"]],
+    })
+
+    # Convert to legacy dict (what generate would receive)
+    legacy = _build_legacy_dict_state(new_state)
+    msgs = legacy["messages"]
+
+    # Should have ONLY user "halo peri" — agent_node AIMessage was content-stripped → empty → filtered by fix1
+    assert len(msgs) == 1, f"Expected 1 user msg, got {len(msgs)}: {msgs}"
+    assert msgs[0]["role"] == "user"
+    assert msgs[0]["content"] == "halo peri"
+    print("    ✅ PASSED — E2E: smalltalk reaches generate with clean conversation history")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STEP 2B TESTS — DB seed prompts + smalltalk detection
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def test_23_step2b_smalltalk_detection_positive():
+    print("\n[Test 23] Step2b: pre_router smalltalk detection — POSITIVE cases")
+    from app.agents.nodes.pre_router import _detect_smalltalk
+
+    positive_cases = [
+        "halo peri",
+        "halo",
+        "hai peri",
+        "makasih ya",
+        "terima kasih",
+        "kamu siapa?",
+        "apa kabar",
+        "ok",
+        "oke",
+        "thanks",
+        "pagi",
+    ]
+
+    for msg in positive_cases:
+        assert _detect_smalltalk(msg), f"Should be smalltalk: {msg!r}"
+
+    print(f"    ✅ PASSED — {len(positive_cases)} positive cases all detected as smalltalk")
+
+
+async def test_24_step2b_smalltalk_detection_negative():
+    print("\n[Test 24] Step2b: pre_router smalltalk detection — NEGATIVE cases (strict criteria)")
+    from app.agents.nodes.pre_router import _detect_smalltalk
+
+    negative_cases = [
+        # Has dental keyword (criterion 3 fail)
+        ("halo, gigi anak ada berapa?", "ada 'gigi'"),
+        ("halo gigi", "ada 'gigi'"),
+        ("makasih untuk info gigi", "ada 'gigi'"),
+        ("streak anakku berapa?", "ada 'streak' + no regex match"),
+        ("kenapa gigi anak berlubang?", "ada 'gigi' + 'berlubang'"),
+        # Too long (criterion 2 fail)
+        ("halo peri, gigi anak ada berapa", "lebih dari 5 kata"),
+        ("halo apa kabar peri sayang banget", "lebih dari 5 kata"),
+        # No regex match (criterion 1 fail)
+        ("kenapa anakku rewel?", "no regex match"),
+        ("bagaimana cara sikat gigi yang benar", "no regex match"),
+        # Empty
+        ("", "empty"),
+        ("   ", "whitespace only"),
+    ]
+
+    for msg, reason in negative_cases:
+        assert not _detect_smalltalk(msg), f"Should NOT be smalltalk ({reason}): {msg!r}"
+
+    print(f"    ✅ PASSED — {len(negative_cases)} negative cases correctly NOT smalltalk")
+
+
+async def test_25_step2b_pre_router_sets_is_smalltalk_flag():
+    print("\n[Test 25] Step2b: pre_router_node SETS state.is_smalltalk correctly")
+    from app.agents.nodes.pre_router import pre_router_node
+
+    # Smalltalk message
+    state_smalltalk = _build_state(user_message="halo peri")
+    update = await pre_router_node(state_smalltalk)
+    assert update.get("is_smalltalk") is True, f"Expected True for 'halo peri', got {update.get('is_smalltalk')}"
+    assert update.get("forced_tool_calls") == []
+
+    # Substantive question
+    state_question = _build_state(user_message="kenapa gigi anak berlubang?")
+    update = await pre_router_node(state_question)
+    assert update.get("is_smalltalk") is False, f"Expected False for question, got {update.get('is_smalltalk')}"
+
+    # Image upload (image wins, smalltalk should be False even if greeting)
+    state_image = _build_state(image_url="https://test.jpg", user_message="halo peri")
+    update = await pre_router_node(state_image)
+    assert update.get("is_smalltalk") is False, "Image flow should win over smalltalk"
+    assert len(update.get("forced_tool_calls", [])) == 1
+    assert update["forced_tool_calls"][0]["name"] == "analyze_chat_image"
+
+    print("    ✅ PASSED — pre_router correctly sets is_smalltalk flag (smalltalk=True, question=False, image=False)")
+
+
+async def test_26_step2b_generate_smalltalk_lean_prompt():
+    print("\n[Test 26] Step2b: generate._build_system_prompt smalltalk path = LEAN (no scan/streak/memory)")
+    from app.agents.nodes.generate import _build_system_prompt
+
+    # Build legacy dict state with smalltalk + heavy context (scan, streak, memory)
+    legacy_state = {
+        "is_smalltalk": True,
+        "prompts": {},  # empty prompts → triggers fallback path
+        "user_context": {
+            "user": {"nickname": "Hanif", "gender": "M"},
+            "child": {"nickname": "aaa", "age_years": 5},
+            "brushing": {"current_streak": 7, "best_streak": 14},  # should be SKIPPED
+            "mata_peri_last_result": {  # should be SKIPPED
+                "summary_text": "Gigi sangat bersih 100%",
+                "summary_status": "ok",
+                "scan_date": "2026-04-28",
+            },
+        },
+        "memory_context": {  # should be SKIPPED
+            "session_summaries": ["Sebelumnya tanya soal gigi berlubang"],
+            "user_facts": [{"value": "Anak suka coklat"}],
+        },
+        "agent_results": {},
+        "retrieved_docs": [],
+    }
+
+    prompt = _build_system_prompt(legacy_state)
+
+    # Must have user/child name
+    assert "Hanif" in prompt, "user_name should be in smalltalk prompt"
+    assert "aaa" in prompt, "child_name should be in smalltalk prompt"
+
+    # Must NOT have heavy DATA injected (scan results, streak numbers, memory text)
+    # Note: kata "streak" sendiri ada di instructions ("JANGAN sebutkan ... streak ...")
+    # — itu OK. Yang TIDAK boleh adalah DATA-nya (e.g. "7 hari", "100% bersih").
+    assert "100%" not in prompt, f"Scan result data leaked! Prompt:\n{prompt}"
+    assert "7 hari" not in prompt and "14 hari" not in prompt, f"Streak number leaked! Prompt:\n{prompt}"
+    assert "Gigi sangat bersih" not in prompt, f"Scan summary text leaked! Prompt:\n{prompt}"
+    assert "Sebelumnya tanya" not in prompt, f"Memory summary leaked! Prompt:\n{prompt}"
+    assert "coklat" not in prompt, f"User fact leaked! Prompt:\n{prompt}"
+    assert "2026-04-28" not in prompt, f"Scan date leaked! Prompt:\n{prompt}"
+
+    # Length should be substantially shorter than normal path (normal ~2000+ chars with all context)
+    assert len(prompt) < 1000, f"Smalltalk prompt too long ({len(prompt)} chars), should be lean"
+
+    print(f"    ✅ PASSED — Smalltalk prompt LEAN ({len(prompt)} chars), no scan/streak data leaked")
+
+
+async def test_27_step2b_agent_router_v2_db_consume():
+    print("\n[Test 27] Step2b: agent._build_system_prompt consumes 'agent_router_v2' from DB")
+    from app.agents.nodes.agent import _build_system_prompt as agent_build_prompt
+
+    # Build state WITH DB prompt
+    state_with_db = _build_state(user_message="halo")
+    state_with_db = state_with_db.model_copy(update={
+        "prompts": {
+            "agent_router_v2": (
+                "Kamu adalah ROUTER. parent={parent_name} child={child_name}{age_str} {mode_limit}"
+            ),
+        },
+    })
+
+    prompt = agent_build_prompt(state_with_db)
+    assert "Kamu adalah ROUTER" in prompt, "DB template should be used"
+    assert "parent=" in prompt, "Variables should be rendered"
+    assert "MODE SIMPLE" in prompt, "mode_limit should be injected"
+
+    # Build state WITHOUT DB prompt (should fallback to inline + log warning)
+    state_no_db = _build_state(user_message="halo")
+    # state.prompts is already empty by default
+    prompt_fallback = agent_build_prompt(state_no_db)
+    assert "ROUTER" in prompt_fallback, "Fallback should still have router persona"
+    assert "search_dental_knowledge" in prompt_fallback, "Fallback should have tool guidance"
+
+    print("    ✅ PASSED — DB consumption works + graceful fallback when DB key missing")
+
+
 async def main():
     print("=" * 70)
     print("Phase 2 Step 2a — Sandbox Functional Tests")
@@ -436,6 +723,17 @@ async def main():
         test_16_fix1_real_assistant_content_preserved,
         test_17_fix1_user_empty_content_kept,
         test_18_fix1_generate_build_messages_defensive,
+        # === FIX2: agent_node strips content (single-responsibility) ===
+        test_19_fix2_smalltalk_content_stripped,
+        test_20_fix2_tool_path_tool_calls_preserved,
+        test_21_fix2_empty_response_no_strip_logged,
+        test_22_fix2_full_e2e_smalltalk_clean_to_generate,
+        # === STEP 2B: DB seed prompts + smalltalk detection ===
+        test_23_step2b_smalltalk_detection_positive,
+        test_24_step2b_smalltalk_detection_negative,
+        test_25_step2b_pre_router_sets_is_smalltalk_flag,
+        test_26_step2b_generate_smalltalk_lean_prompt,
+        test_27_step2b_agent_router_v2_db_consume,
     ]
 
     failed = 0

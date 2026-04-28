@@ -38,18 +38,22 @@ logger = logging.getLogger(__name__)
 # Inline default system prompt (Step 2b will migrate to DB)
 # =============================================================================
 
-_PERSONA_BASE = """Kamu adalah Peri, asisten kesehatan gigi anak yang ramah, hangat, dan suportif untuk orang tua di Indonesia.
+_PERSONA_BASE = """Kamu adalah ROUTER untuk asisten Peri Bugi (kesehatan gigi anak).
 
-Persona kamu:
-- Bicara seperti hygienist + ibu yang peduli — hangat, encouraging, tidak menggurui
-- Pakai Bahasa Indonesia santai, sapa orang tua dengan "Ayah/Bunda" sesuai gender
-- Sebut nama anak (kalau diketahui) untuk personalisasi
-- Berikan saran berdasarkan evidence, tapi disampaikan dengan empati
-- Pakai 1-2 emoji secara natural (🦷 💙 🧚 ✨), jangan berlebihan
-- Jangan diagnostic — kalau ada concern medis, refer ke dokter gigi anak (Sp.KGA)
+TUGAS KAMU HANYA SATU: Pilih tool yang TEPAT untuk menjawab pertanyaan orang tua.
+KAMU BUKAN yang menyusun jawaban final — itu tugas node lain.
 
-Tugas kamu adalah memilih tool yang TEPAT untuk menjawab pertanyaan orang tua.
-Setelah tool jalan, response final akan di-generate untuk user.
+ATURAN MUTLAK:
+1. JANGAN tulis content/jawaban apa pun. Kosongkan content.
+2. Untuk pertanyaan yang butuh data/info → panggil tool yang sesuai.
+3. Untuk smalltalk/sapaan ("halo", "terima kasih", "ok", "gimana kabar") → JANGAN panggil tool, JANGAN tulis jawaban. Cukup return tanpa apa-apa (empty content + no tool_calls). Node lain yang akan menyapa user dengan hangat.
+4. Kalau ragu antara tool A dan B, pilih yang paling cocok berdasarkan KATA KUNCI di pertanyaan.
+
+Output kamu HANYA berupa:
+- tool_calls (kalau perlu cari info/data), ATAU
+- empty (kalau smalltalk atau pertanyaan yang tidak perlu tool)
+
+JANGAN PERNAH menulis jawaban dalam content — itu akan di-discard.
 """
 
 _TOOL_GUIDANCE = """
@@ -69,8 +73,10 @@ Untuk pertanyaan SPESIFIK ANAK (streak, progress, riwayat scan):
 Untuk pertanyaan multi-aspek (e.g. "anak streak 5 tapi gigi sakit"):
 → Boleh pilih beberapa tool sekaligus (parallel)
 
-Untuk SMALLTALK / SAPAAN ("halo", "terima kasih", "ok"):
-→ JANGAN panggil tool. Langsung respond hangat.
+Untuk SMALLTALK / SAPAAN ("halo", "terima kasih", "ok", "halo peri", dll):
+→ JANGAN panggil tool. JANGAN tulis jawaban di content.
+→ Cukup return empty (tidak perlu tool, tidak perlu content).
+→ Node lain (generate) yang akan menyapa user dengan hangat memakai persona Peri.
 
 Profil orang tua dan anak sudah otomatis tersedia — JANGAN panggil get_user_profile
 kecuali kamu butuh detail spesifik yang tidak ada di system context.
@@ -84,27 +90,76 @@ _MODE_LIMITS = {
 
 
 def _build_system_prompt(state: AgentState) -> str:
-    """Build inline system prompt for agent_node. Step 2b migrate to DB."""
-    parts = [_PERSONA_BASE, _TOOL_GUIDANCE]
+    """Build inline system prompt for agent_node.
 
-    mode = state.session.response_mode
-    parts.append(_MODE_LIMITS.get(mode, _MODE_LIMITS["simple"]))
+    Step 2b: Pull prompt template from `state.prompts['agent_router_v2']` (DB).
+    Graceful fallback to inline default if DB prompt missing (Q3A decision).
 
-    # Auto-inject user context (Hanif's Q2 decision: auto-kasih)
+    Variables di template (di-render via str.replace):
+      {parent_name} {sapaan} {child_name}{age_str} {mode_limit}
+    """
+    # Build context vars (same logic regardless of DB or fallback prompt)
     ctx = state.user_context.model_dump() if state.user_context else {}
     user = ctx.get("user") or {}
     child = ctx.get("child") or {}
+
+    parent_name = (user.get("nickname") or user.get("full_name") or "Bunda/Ayah") if user else "Bunda/Ayah"
+    gender = user.get("gender") if user else None
+    sapaan = "Ayah" if gender == "M" else ("Bunda" if gender == "F" else "Bunda/Ayah")
+
+    child_name = (child.get("nickname") or child.get("full_name") or "anak") if child else "anak"
+    child_age = child.get("age_years") if child else None
+    age_str = f", umur {child_age} tahun" if child_age else ""
+
+    mode = state.session.response_mode
+    mode_limit = _MODE_LIMITS.get(mode, _MODE_LIMITS["simple"])
+
+    # Try DB prompt first (Step 2b)
+    prompts = state.prompts or {}
+    db_template = prompts.get("agent_router_v2")
+
+    if db_template:
+        # DB-driven path — render template variables
+        rendered = db_template
+        rendered = rendered.replace("{parent_name}", parent_name)
+        rendered = rendered.replace("{sapaan}", sapaan)
+        rendered = rendered.replace("{child_name}", child_name)
+        rendered = rendered.replace("{age_str}", age_str)
+        rendered = rendered.replace("{mode_limit}", mode_limit)
+
+        # Append memory context if available (kept dynamic — not in DB template
+        # because it's per-session data, not static config)
+        mem = state.memory.model_dump() if state.memory else {}
+        if mem.get("session_summaries") or mem.get("user_facts"):
+            mem_parts = ["\n\nMEMORI PERCAKAPAN SEBELUMNYA:"]
+            for s in (mem.get("session_summaries") or [])[:2]:
+                mem_parts.append(f"- {s}")
+            for f in (mem.get("user_facts") or [])[:5]:
+                if isinstance(f, dict):
+                    mem_parts.append(f"- {f.get('fact', '')}")
+            rendered += "\n".join(mem_parts)
+
+        return rendered
+
+    # ────────────────────────────────────────────────────────────────────────
+    # FALLBACK PATH (Step 2b — Q3A: graceful fallback)
+    # Triggered when DB seeder belum jalan / prompt key missing.
+    # Sistem tetap jalan dengan inline default + warning log.
+    # ────────────────────────────────────────────────────────────────────────
+    logger.warning(
+        "[agent_node] 'agent_router_v2' prompt not in state.prompts — "
+        "using inline fallback. Run scripts/seed_prompts.py to populate DB."
+    )
+
+    parts = [_PERSONA_BASE, _TOOL_GUIDANCE]
+    parts.append(mode_limit)
+
+    # Auto-inject user context (Hanif's Q2 decision: auto-kasih)
     if user or child:
         parts.append("\nKONTEKS USER (auto-tersedia, sudah pasti benar):")
         if user:
-            parent_name = user.get("nickname") or user.get("full_name", "User")
-            gender = user.get("gender")
-            sapaan = "Ayah" if gender == "M" else ("Bunda" if gender == "F" else "Bunda/Ayah")
             parts.append(f"- Orang tua: {parent_name} ({sapaan})")
         if child:
-            child_name = child.get("nickname") or child.get("full_name", "anak")
-            child_age = child.get("age_years")
-            age_str = f", umur {child_age} tahun" if child_age else ""
             parts.append(f"- Anak: {child_name}{age_str}")
 
     # Memory context (kalau ada)
@@ -271,6 +326,34 @@ async def agent_node(state: AgentState) -> dict[str, Any]:
             # Fallback: empty AIMessage; generate will run with no tool results
             ai_msg = AIMessage(content="")
 
+        # ────────────────────────────────────────────────────────────────────
+        # PHASE 2A FIX2: STRIP CONTENT (single-responsibility principle)
+        # ────────────────────────────────────────────────────────────────────
+        # agent_node = TOOL SELECTOR ONLY. Tidak boleh menjawab.
+        # generate_node = RESPONSE SYNTHESIZER. Yang berwenang menjawab user.
+        #
+        # Background bug: Untuk smalltalk ("halo peri"), Gemini bind_tools
+        # kadang patuh prompt "respond hangat" lalu kasih content "Halo Ayah!..."
+        # tanpa tool_calls. Content ini ke-append ke state.messages oleh
+        # add_messages reducer. generate_node lalu lihat conversation history
+        # punya assistant turn yang sudah jawab → LLM thinks done → 0 tokens.
+        #
+        # Fix: discard content dari agent_node, regardless apa pun. Tool selection
+        # (tool_calls) preserved. generate_node always responsible for synthesis.
+        #
+        # Saved content untuk audit/diagnostic via observability span saja.
+        agent_content_stripped = ai_msg.content if (ai_msg.content and str(ai_msg.content).strip()) else None
+        if agent_content_stripped:
+            logger.info(
+                f"[agent_node] Stripped LLM content (len={len(agent_content_stripped)}) — "
+                f"agent_node is tool selector only. content preserved in span for audit."
+            )
+
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=ai_msg.tool_calls or [],
+        )
+
         # Apply mode_behavior tool limit (defensive trim)
         if ai_msg.tool_calls:
             mode = state.session.response_mode
@@ -299,6 +382,10 @@ async def agent_node(state: AgentState) -> dict[str, Any]:
                 "tool_calls_count": len(ai_msg.tool_calls or []),
                 "tool_calls_names": [tc.get("name") for tc in (ai_msg.tool_calls or [])],
                 "response_mode": state.session.response_mode,
+                # Phase 2a fix2: track whether Gemini violated the "no content"
+                # rule so we can monitor prompt compliance via DB queries.
+                "content_was_stripped": bool(agent_content_stripped),
+                "stripped_content_len": len(agent_content_stripped) if agent_content_stripped else 0,
             },
         )
 
@@ -315,6 +402,11 @@ async def agent_node(state: AgentState) -> dict[str, Any]:
                 "tool_calls_count": len(ai_msg.tool_calls or []),
                 "latency_ms": latency_ms,
                 "success": success,
+                # Phase 2a fix2: log stripped content for audit/debugging.
+                # Content is discarded from state.messages but kept here so
+                # we can verify Gemini prompt compliance via Langfuse trace.
+                "stripped_content": (agent_content_stripped[:500] if agent_content_stripped else None),
+                "content_was_stripped": bool(agent_content_stripped),
             })
 
         return {

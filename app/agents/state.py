@@ -233,6 +233,16 @@ class AgentState(BaseModel):
     # Format: [{"name": "tool_name", "args": dict}]
     forced_tool_calls: list[dict] = Field(default_factory=list)
 
+    # ── Phase 2 Step 2b: smalltalk detection ──────────────────────────────────
+    # is_smalltalk: set by pre_router_node when user message matches smalltalk
+    # pattern via STRICT criteria (Q4A):
+    #   1. regex match (^(halo|hai|hi|...) etc, dari pattern Phase 1 router legacy)
+    #   2. word count <= 5
+    #   3. NO dental keyword (gigi, karies, plak, scan, streak, etc)
+    # When True, generate_node uses lean smalltalk prompt (Q2B: keep nama anak
+    # doang) — skip injection of brushing/scan/memory data.
+    is_smalltalk: bool = False
+
     # ── Per-agent results (Phase 1: dict keyed by agent_key) ──────────────────
     agent_results: dict[str, Any] = Field(default_factory=dict)
     retrieved_docs: list[str] = Field(default_factory=list)
@@ -308,6 +318,8 @@ class AgentState(BaseModel):
             return self.execution_plan
         elif key == "forced_tool_calls":
             return self.forced_tool_calls
+        elif key == "is_smalltalk":
+            return self.is_smalltalk
         elif key == "agent_results":
             return self.agent_results
         elif key == "retrieved_docs":
