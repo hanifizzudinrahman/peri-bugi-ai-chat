@@ -34,11 +34,6 @@ class Settings(BaseSettings):
     QDRANT_COLLECTION: str = "peri_bugi_dental"
     QDRANT_FAQ_COLLECTION: str = "peri_bugi_faq"      # NEW: untuk app_faq agent
 
-    # Embedding
-    EMBEDDING_PROVIDER: str = "local"
-    EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    EMBEDDING_DEVICE: str = "auto"
-
     # Redis (shared dengan peri-bugi-api — connect via host.docker.internal)
     # Kosong = rate limiting RnD endpoint dinonaktifkan
     REDIS_URL: str = ""
@@ -46,6 +41,17 @@ class Settings(BaseSettings):
     # External
     AI_CV_URL: str = ""
     PERI_API_URL: str = ""
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Database (Phase 1 — LangGraph PostgresSaver checkpointer)
+    # Shared dengan peri-bugi-api (sama-sama akses peri_bugi_db).
+    # ai-chat connect ke DB via network `peri-bugi-shared` (container hostname `peri_bugi_db`).
+    # ─────────────────────────────────────────────────────────────────────────
+    DB_HOST: str = "db"   # default: service name "db" di network peri-bugi-shared (sama dengan api)
+    DB_PORT: int = 5432
+    DB_NAME: str = "peri_bugi"
+    DB_USER: str = "peri_bugi_user"
+    DB_PASSWORD: str = ""
 
     # RnD mode
     RND_MODE: bool = True

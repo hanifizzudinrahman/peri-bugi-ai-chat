@@ -1,27 +1,35 @@
 """
 Node: supervisor
-Planner yang menentukan agent mana yang perlu dipanggil untuk menjawab pertanyaan user.
 
-Approach: hybrid
-1. Rule-based fast-path (instant, tanpa LLM)
-2. LLM fallback untuk kasus ambigu
+Phase 1 refactor: return dict (LangGraph signature) instead of yield SSE events.
+Logic preserved 1:1 dari supervisor.py original — hanya signature berubah.
 
-Output:
-- agents_selected: list agent yang perlu dipanggil
-- execution_plan: {mode: parallel|sequential, reasoning}
+SSE thinking events di-emit oleh stream_adapter (app/agents/streaming.py)
+based on `thinking_steps` field di state update yang di-return.
+
+Approach: hybrid routing
+1. Force intent (RnD only) — short-circuit
+2. Image auto-route — kalau ada image_url, route ke mata_peri
+3. Rule-based regex (~80 patterns, fast, free)
+4. LLM fallback (kalau supervisor_route prompt ada di DB — currently absent)
+5. Default ke kb_dental kalau allowed
 """
+from __future__ import annotations
+
+import logging
 import re
 import time
-from typing import AsyncIterator
+from typing import Optional
 
-from app.agents.state import AgentState
-from app.schemas.chat import LLMCallLogPayload, make_thinking_event
+from app.agents.state import AgentState, ThinkingStep, LLMCallLog
+
+logger = logging.getLogger(__name__)
+
 
 # =============================================================================
-# Rule-based routing
+# Rule-based routing (preserved dari supervisor.py original)
 # =============================================================================
 
-# Pattern per agent — ordered by specificity
 _AGENT_RULES: list[tuple[str, list[str]]] = [
     ("mata_peri", [
         r"foto gigi",
@@ -71,7 +79,6 @@ _AGENT_RULES: list[tuple[str, list[str]]] = [
         r"peri bugi (itu|ini)",
         r"(apa itu|apa sih) (mata|rapot|cerita|janji|tanya) peri",
     ]),
-    # kb_dental sebagai catch-all dental questions
     ("kb_dental", [
         r"gigi",
         r"karies",
@@ -96,7 +103,6 @@ _AGENT_RULES: list[tuple[str, list[str]]] = [
     ]),
 ]
 
-# Intent yang tidak butuh agent khusus (smalltalk/clarification)
 _SMALLTALK_PATTERNS = [
     r"^(halo|hai|hi|hey|assalam|pagi|siang|sore|malam)\b",
     r"^apa kabar",
@@ -113,24 +119,21 @@ _CLARIFICATION_ANSWER_PATTERNS = [
 ]
 
 
-def _classify_rule_based(message: str, allowed_agents: list[str]) -> list[str] | None:
-    """
-    Coba klasifikasi dengan rules. Return list agent atau None jika tidak match.
-    Hanya return agents yang ada di allowed_agents.
-    """
+def _classify_rule_based(message: str, allowed_agents: list[str]) -> Optional[list[str]]:
+    """Try rule-based classification. Return list of agents or None if no match."""
     text = message.lower().strip()
 
-    # Smalltalk → tidak butuh agent
+    # Smalltalk → empty (no agent needed)
     for pattern in _SMALLTALK_PATTERNS:
         if re.search(pattern, text):
-            return []  # empty = smalltalk, tidak perlu agent
+            return []
 
-    # Clarification answer → tidak butuh agent baru
+    # Clarification answer → empty (handle di generate)
     for pattern in _CLARIFICATION_ANSWER_PATTERNS:
         if re.search(pattern, text):
-            return []  # handle di generate node
+            return []
 
-    # Multi-match: kumpulkan semua agent yang match, filter by allowed
+    # Multi-match: collect all matching agents
     matched = []
     for agent_key, patterns in _AGENT_RULES:
         if agent_key not in allowed_agents:
@@ -148,39 +151,36 @@ async def _classify_by_llm(
     message: str,
     allowed_agents: list[str],
     prompt_template: str,
-    provider: str | None,
-    model: str | None,
-    state: dict | None = None,
-) -> tuple[list[str], LLMCallLogPayload]:
-    """LLM fallback: return list agent yang perlu dipanggil.
-
-    Args:
-        state: AgentState — untuk Langfuse trace metadata. Optional.
-    """
+    state: AgentState,
+) -> tuple[list[str], LLMCallLog]:
+    """LLM fallback: return list agent yang perlu dipanggil + log payload."""
     from langchain_core.messages import HumanMessage
     from app.config.llm import get_llm, get_model_name, get_provider_name
     from app.config.observability import build_trace_config
 
-    llm = get_llm(temperature=0, max_tokens=50, streaming=False,
-                  provider=provider, model=model)
+    provider = state.rnd.llm_provider
+    model = state.rnd.llm_model
+
+    llm = get_llm(temperature=0, max_tokens=50, streaming=False, provider=provider, model=model)
 
     agents_str = ", ".join(allowed_agents)
-    prompt = prompt_template \
-        .replace("{user_message}", message) \
-        .replace("{allowed_agents}", agents_str)
+    prompt = prompt_template.replace("{user_message}", message).replace("{allowed_agents}", agents_str)
 
     start = time.monotonic()
     success = True
     error_msg = None
     agents_selected: list[str] = []
+    raw = ""
 
     # Per-call trace config (no-op kalau Langfuse disabled)
-    trace_config = build_trace_config(state=state, agent_name="supervisor")
+    trace_config = build_trace_config(
+        state={"session_id": state.session.session_id, "user_context": state.user_context.model_dump()},
+        agent_name="supervisor",
+    )
 
     try:
         result = await llm.ainvoke([HumanMessage(content=prompt)], config=trace_config)
         raw = result.content.strip().lower()
-        # Parse: "kb_dental,user_profile" atau "kb_dental" atau "none"
         if raw and raw != "none":
             candidates = [a.strip() for a in raw.split(",")]
             agents_selected = [a for a in candidates if a in allowed_agents]
@@ -192,13 +192,13 @@ async def _classify_by_llm(
         agents_selected = ["kb_dental"] if "kb_dental" in allowed_agents else []
 
     latency_ms = int((time.monotonic() - start) * 1000)
-    log = LLMCallLogPayload(
+    log = LLMCallLog(
         prompt_key="supervisor_route",
         model=get_model_name(provider=provider, model=model),
         provider=get_provider_name(provider=provider),
         node="supervisor",
         latency_ms=latency_ms,
-        output_tokens=len(raw.split(",")) if "raw" in dir() else 1,
+        output_tokens=len(raw.split(",")) if raw else 1,
         success=success,
         error_message=error_msg,
         metadata={"agents_selected": agents_selected},
@@ -206,101 +206,119 @@ async def _classify_by_llm(
     return agents_selected, log
 
 
-async def supervisor_node(state: AgentState) -> AsyncIterator[str]:
-    """
-    LangGraph node: supervisor
-    Determine which agents to call for this message.
-    Updates state with agents_selected and execution_plan.
-    """
-    user_messages = [
-        m for m in state.get("messages", [])
-        if isinstance(m, dict) and m.get("role") == "user"
-    ]
-    last_message = user_messages[-1].get("content", "") if user_messages else ""
-    allowed_agents = state.get("allowed_agents", [])
+# =============================================================================
+# LangGraph node
+# =============================================================================
 
-    # Phase 4: wrap node body with trace span
+
+async def supervisor_node(state: AgentState) -> dict:
+    """
+    LangGraph node signature: receives AgentState, returns partial state update dict.
+
+    Returns dict dengan:
+    - agents_selected: list[str]
+    - execution_plan: dict
+    - thinking_steps: appended ThinkingStep
+    - llm_call_logs: appended LLMCallLog (kalau LLM fallback dipakai)
+    """
+    # Phase 4: wrap node body with trace span (preserve Langfuse)
     from app.config.observability import trace_node
+
+    # Extract last user message
+    user_messages = [m for m in state.messages if hasattr(m, "type") and m.type == "human"]
+    last_message = user_messages[-1].content if user_messages else ""
+    if not isinstance(last_message, str):
+        last_message = str(last_message)
+
+    allowed = state.control.allowed_agents
+
+    # Pseudo-state untuk trace_node (pakai legacy dict format untuk kompat)
+    legacy_state = {
+        "session_id": state.session.session_id,
+        "user_context": state.user_context.model_dump(),
+        "response_mode": state.session.response_mode,
+    }
 
     async with trace_node(
         name="supervisor",
-        state=state,
+        state=legacy_state,
         input_data={
-            "user_message": last_message[:500] if isinstance(last_message, str) else "",
-            "has_image": bool(state.get("image_url")),
-            "force_intent": state.get("force_intent"),
-            "allowed_agents": allowed_agents,
+            "user_message": last_message[:500],
+            "has_image": state.image is not None,
+            "force_intent": state.rnd.force_intent,
+            "allowed_agents": allowed,
         },
     ) as span:
-        yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=False)
+        thinking_done = ThinkingStep(step=1, label="Memahami pertanyaanmu...", done=True)
 
-        # Force intent dari RnD mode
-        force_intent = state.get("force_intent")
-        if force_intent:
-            state["agents_selected"] = [force_intent] if force_intent in allowed_agents else []
-            state["execution_plan"] = {"mode": "sequential", "reasoning": "force_intent"}
+        # ── Force intent (RnD only) ────────────────────────────────────────
+        if state.rnd.force_intent:
+            agents = [state.rnd.force_intent] if state.rnd.force_intent in allowed else []
+            plan = {"mode": "sequential", "reasoning": "force_intent", "decision_path": "force_intent"}
             if span:
                 span.update(output={
-                    "agents_selected": state["agents_selected"],
-                    "execution_plan": state["execution_plan"],
+                    "agents_selected": agents,
+                    "execution_plan": plan,
                     "decision_path": "force_intent",
                 })
-            yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=True)
-            state["thinking_steps"].append({"step": 1, "label": "Memahami pertanyaanmu...", "done": True})
-            return
+            return {
+                "agents_selected": agents,
+                "execution_plan": plan,
+                "thinking_steps": [*state.thinking_steps, thinking_done],
+            }
 
-        # Juga cek image_url — otomatis tambah mata_peri
-        if state.get("image_url") and "mata_peri" in allowed_agents:
-            state["agents_selected"] = ["mata_peri"]
-            state["execution_plan"] = {"mode": "sequential", "reasoning": "image_detected"}
+        # ── Image auto-route ────────────────────────────────────────────────
+        if state.image is not None and "mata_peri" in allowed:
+            agents = ["mata_peri"]
+            plan = {"mode": "sequential", "reasoning": "image_detected", "decision_path": "image_auto"}
             if span:
                 span.update(output={
-                    "agents_selected": state["agents_selected"],
-                    "execution_plan": state["execution_plan"],
+                    "agents_selected": agents,
+                    "execution_plan": plan,
                     "decision_path": "image_auto",
                 })
-            yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=True)
-            state["thinking_steps"].append({"step": 1, "label": "Memahami pertanyaanmu...", "done": True})
-            return
+            return {
+                "agents_selected": agents,
+                "execution_plan": plan,
+                "thinking_steps": [*state.thinking_steps, thinking_done],
+            }
 
-        # Rule-based
-        agents = _classify_rule_based(last_message, allowed_agents)
+        # ── Rule-based ──────────────────────────────────────────────────────
+        agents = _classify_rule_based(last_message, allowed)
         decision_path = "rule_based"
+        new_logs: list[LLMCallLog] = []
 
         if agents is None:
-            # LLM fallback
+            # ── LLM fallback ────────────────────────────────────────────────
             decision_path = "llm_fallback"
-            supervisor_prompt = state.get("prompts", {}).get("supervisor_route", "")
+            supervisor_prompt = state.prompts.get("supervisor_route", "")
             if supervisor_prompt:
                 agents, log = await _classify_by_llm(
                     message=last_message,
-                    allowed_agents=allowed_agents,
+                    allowed_agents=allowed,
                     prompt_template=supervisor_prompt,
-                    provider=state.get("llm_provider_override"),
-                    model=state.get("llm_model_override"),
-                    state=state,  # untuk Langfuse trace metadata
+                    state=state,
                 )
-                state["llm_call_logs"].append(log.model_dump())
+                new_logs.append(log)
             else:
-                # No prompt → default ke kb_dental jika allowed
-                agents = ["kb_dental"] if "kb_dental" in allowed_agents else []
+                # Prompt tidak ada di DB (current state) → default ke kb_dental
+                agents = ["kb_dental"] if "kb_dental" in allowed else []
                 decision_path = "no_prompt_default"
 
-        # Tentukan mode eksekusi
-        # Sequential jika satu agent butuh hasil agent lain (saat ini belum ada case)
-        # Parallel untuk semua kasus lainnya
+        # ── Determine execution mode ────────────────────────────────────────
         mode = "parallel" if len(agents) > 1 else "sequential"
+        plan = {"mode": mode, "reasoning": "auto", "decision_path": decision_path}
 
-        state["agents_selected"] = agents
-        state["execution_plan"] = {"mode": mode, "reasoning": "auto"}
-
-        # Phase 4: capture decision output
         if span:
             span.update(output={
                 "agents_selected": agents,
-                "execution_plan": state["execution_plan"],
+                "execution_plan": plan,
                 "decision_path": decision_path,
             })
 
-        yield make_thinking_event(step=1, label="Memahami pertanyaanmu...", done=True)
-        state["thinking_steps"].append({"step": 1, "label": "Memahami pertanyaanmu...", "done": True})
+        return {
+            "agents_selected": agents,
+            "execution_plan": plan,
+            "thinking_steps": [*state.thinking_steps, thinking_done],
+            "llm_call_logs": [*state.llm_call_logs, *new_logs],
+        }

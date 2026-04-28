@@ -102,8 +102,57 @@ async def health():
 
 @app.get("/health/agents")
 async def health_agents():
-    from app.agents.graph import _AGENT_REGISTRY
+    # Phase 1: _AGENT_REGISTRY moved from graph.py to nodes/agent_dispatcher.py
+    from app.agents.nodes.agent_dispatcher import _AGENT_REGISTRY
     return {"status": "ok", "registered_agents": list(_AGENT_REGISTRY.keys()), "agent_count": len(_AGENT_REGISTRY)}
+
+
+# =============================================================================
+# Phase 1 — LangGraph checkpointer lifecycle hooks
+# =============================================================================
+
+
+@app.on_event("startup")
+async def startup_checkpointer():
+    """Warm up LangGraph PostgresSaver checkpointer pool + ensure tables exist."""
+    try:
+        from app.agents.memory.checkpointer import get_checkpointer
+        cp = await get_checkpointer()
+        if cp is not None:
+            log.info("checkpointer_ready", status="ok")
+        else:
+            log.warning("checkpointer_unavailable",
+                       status="degraded",
+                       msg="Tanya Peri akan jalan tanpa state persistence")
+    except Exception as e:
+        log.error("checkpointer_init_failed", error=str(e))
+
+
+@app.on_event("shutdown")
+async def shutdown_checkpointer_hook():
+    """Cleanly close checkpointer pool."""
+    try:
+        from app.agents.memory.checkpointer import shutdown_checkpointer
+        await shutdown_checkpointer()
+        log.info("checkpointer_shutdown", status="ok")
+    except Exception as e:
+        log.error("checkpointer_shutdown_failed", error=str(e))
+
+
+@app.get("/health/checkpointer")
+async def health_checkpointer():
+    """Health check khusus untuk LangGraph checkpointer (Phase 1)."""
+    from app.agents.memory.checkpointer import checkpointer_healthy
+    healthy = await checkpointer_healthy()
+    return {
+        "status": "ok" if healthy else "degraded",
+        "checkpointer_healthy": healthy,
+        "note": (
+            "Checkpointer healthy = state persistence aktif."
+            if healthy
+            else "Checkpointer not available — chat masih jalan tanpa persistence."
+        ),
+    }
 
 
 @app.get("/health/gpu")
