@@ -421,11 +421,13 @@ class _MockLLM:
     def __init__(self, return_content: str = "", return_tool_calls: list | None = None):
         self._content = return_content
         self._tool_calls = return_tool_calls or []
+        self.invocation_count = 0  # Step 2b fix: track for skip-LLM tests
 
     def bind_tools(self, tools):
         return self  # mock chains as self
 
     async def ainvoke(self, messages, config=None):
+        self.invocation_count += 1
         return AIMessage(content=self._content, tool_calls=self._tool_calls)
 
 
@@ -698,6 +700,112 @@ async def test_27_step2b_agent_router_v2_db_consume():
     print("    ✅ PASSED — DB consumption works + graceful fallback when DB key missing")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# STEP 2B FIX TESTS — agent_node smalltalk skip + agent_dispatcher forward
+# Bug found in production smoke test: is_smalltalk flag was set by pre_router
+# but DROPPED by _build_legacy_dict_state, so generate_node never saw it.
+# Plus agent_node didn't check the flag → Gemini overzealously called tools.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def test_28_step2bfix_agent_dispatcher_forwards_is_smalltalk():
+    print("\n[Test 28] Step2b FIX: _build_legacy_dict_state forwards is_smalltalk flag")
+    from app.agents.nodes.agent_dispatcher import _build_legacy_dict_state
+
+    # Build state with is_smalltalk=True (set by pre_router)
+    state = _build_state(user_message="halo peri")
+    state = state.model_copy(update={"is_smalltalk": True})
+
+    legacy = _build_legacy_dict_state(state)
+
+    assert "is_smalltalk" in legacy, (
+        f"is_smalltalk MUST be in legacy dict! Without this, generate_node "
+        f"never sees the flag and smalltalk path stays dead code. "
+        f"Legacy keys: {sorted(legacy.keys())}"
+    )
+    assert legacy["is_smalltalk"] is True, (
+        f"Expected True, got {legacy['is_smalltalk']!r}"
+    )
+
+    # Also verify False propagates correctly
+    state_normal = _build_state(user_message="kenapa gigi sakit")
+    legacy_normal = _build_legacy_dict_state(state_normal)
+    assert legacy_normal.get("is_smalltalk") is False, (
+        f"Default False should propagate, got {legacy_normal.get('is_smalltalk')!r}"
+    )
+
+    print("    ✅ PASSED — is_smalltalk propagates True + False correctly through bridge layer")
+
+
+async def test_29_step2bfix_agent_node_skips_llm_for_smalltalk():
+    print("\n[Test 29] Step2b FIX: agent_node SKIPS LLM when is_smalltalk=True")
+    from app.agents.nodes import agent as agent_module
+    from app.config import llm as llm_module
+    from unittest.mock import patch
+
+    state = _build_state(user_message="halo peri", allowed_agents=["kb_dental"])
+    state = state.model_copy(update={"is_smalltalk": True})
+
+    # Mock LLM yang HARUS NOT dipanggil
+    mock_llm = _MockLLM(return_content="should not be called", return_tool_calls=[])
+
+    with patch.object(llm_module, "get_llm", return_value=mock_llm):
+        update = await agent_module.agent_node(state)
+
+    # Verify LLM tidak dipanggil
+    assert mock_llm.invocation_count == 0, (
+        f"agent_node should SKIP LLM for smalltalk, but LLM was called "
+        f"{mock_llm.invocation_count} times. This wastes ~2.5k tokens + 1.3s latency."
+    )
+
+    # Verify output: empty AIMessage, no tool_calls
+    assert "messages" in update
+    assert len(update["messages"]) == 1
+    ai_msg = update["messages"][0]
+    assert ai_msg.content == "", f"Expected empty content, got: {ai_msg.content!r}"
+    assert ai_msg.tool_calls == [], f"Expected no tool_calls, got: {ai_msg.tool_calls}"
+
+    # Verify thinking step appended
+    assert "thinking_steps" in update
+    assert len(update["thinking_steps"]) >= 1
+
+    print("    ✅ PASSED — LLM skipped, empty AIMessage emitted, thinking step set")
+
+
+async def test_30_step2bfix_agent_node_forced_path_takes_precedence_over_smalltalk():
+    print("\n[Test 30] Step2b FIX: forced_tool_calls (image) takes precedence over smalltalk")
+    from app.agents.nodes import agent as agent_module
+    from app.config import llm as llm_module
+    from unittest.mock import patch
+
+    # Edge case: image upload + greeting text. Image should win.
+    state = _build_state(
+        user_message="halo peri",
+        image_url="https://test.jpg",
+        allowed_agents=["mata_peri"],
+    )
+    # Both flags set (in practice pre_router won't set both, but we test priority logic)
+    state = state.model_copy(update={
+        "is_smalltalk": True,  # Should be ignored when forced is set
+        "forced_tool_calls": [{"name": "analyze_chat_image", "args": {}}],
+    })
+
+    mock_llm = _MockLLM(return_content="x", return_tool_calls=[])
+
+    with patch.object(llm_module, "get_llm", return_value=mock_llm):
+        update = await agent_module.agent_node(state)
+
+    # LLM still skipped, but tool_calls = analyze_chat_image (forced), NOT empty
+    assert mock_llm.invocation_count == 0
+    ai_msg = update["messages"][0]
+    assert len(ai_msg.tool_calls) == 1
+    assert ai_msg.tool_calls[0]["name"] == "analyze_chat_image", (
+        f"Forced path should win over smalltalk. Got: {ai_msg.tool_calls}"
+    )
+
+    print("    ✅ PASSED — Forced path (image) correctly takes precedence over smalltalk")
+
+
 async def main():
     print("=" * 70)
     print("Phase 2 Step 2a — Sandbox Functional Tests")
@@ -734,6 +842,10 @@ async def main():
         test_25_step2b_pre_router_sets_is_smalltalk_flag,
         test_26_step2b_generate_smalltalk_lean_prompt,
         test_27_step2b_agent_router_v2_db_consume,
+        # === STEP 2B FIX: agent_node skip + agent_dispatcher forward ===
+        test_28_step2bfix_agent_dispatcher_forwards_is_smalltalk,
+        test_29_step2bfix_agent_node_skips_llm_for_smalltalk,
+        test_30_step2bfix_agent_node_forced_path_takes_precedence_over_smalltalk,
     ]
 
     failed = 0

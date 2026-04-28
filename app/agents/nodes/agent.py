@@ -215,6 +215,7 @@ async def agent_node(state: AgentState) -> dict[str, Any]:
 
     user_message = _extract_user_message_for_llm(state)
     forced = state.forced_tool_calls or []
+    is_smalltalk = state.is_smalltalk
 
     async with trace_node(
         name="agent_node",
@@ -223,9 +224,52 @@ async def agent_node(state: AgentState) -> dict[str, Any]:
             "user_message": user_message[:500],
             "has_image": state.image is not None,
             "forced_tool_calls": [t.get("name") for t in forced],
+            "is_smalltalk": is_smalltalk,
             "response_mode": state.session.response_mode,
         },
     ) as span:
+        # ────────────────────────────────────────────────────────────────────
+        # Path A1: Smalltalk (Step 2b fix) — skip LLM entirely.
+        # pre_router sudah detect smalltalk via strict regex+length+keyword.
+        # No tools needed, no LLM call needed. Emit empty AIMessage.
+        # generate_node will respond using lean smalltalk prompt (state.is_smalltalk
+        # propagated via _build_legacy_dict_state in agent_dispatcher.py).
+        #
+        # Why skip LLM here even though Gemini "should" follow no-tool rule:
+        # - Gemini compliance for negative instructions ("JANGAN call tool")
+        #   unreliable. Defense-in-depth.
+        # - Cost saving: ~2,500 prompt tokens + 1.3s latency avoided per smalltalk.
+        # - Cleaner trace: no spurious tool_calls in Langfuse.
+        # ────────────────────────────────────────────────────────────────────
+        if is_smalltalk and not forced:
+            ai_msg = AIMessage(content="", tool_calls=[])
+
+            thinking_done = ThinkingStep(
+                step=2,
+                label="Menyiapkan jawaban...",
+                done=True,
+            )
+
+            if span:
+                span.update(output={
+                    "decision_path": "smalltalk_skip_llm",
+                    "tool_calls": [],
+                    "tool_calls_count": 0,
+                    "is_smalltalk": True,
+                    "content_was_stripped": False,
+                    "stripped_content": None,
+                })
+
+            logger.info(
+                f"[agent_node] Smalltalk path — skip LLM, emit empty AIMessage. "
+                f"user_message={user_message[:50]!r}"
+            )
+
+            return {
+                "messages": [ai_msg],
+                "thinking_steps": [*state.thinking_steps, thinking_done],
+            }
+
         # ────────────────────────────────────────────────────────────────────
         # Path A: Forced routing (image flow) — skip LLM, emit AIMessage with
         # the forced tool_calls. ToolNode will execute them.

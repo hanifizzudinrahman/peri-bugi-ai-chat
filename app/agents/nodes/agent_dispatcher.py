@@ -122,6 +122,11 @@ def _build_legacy_dict_state(state: AgentState) -> dict:
         # Routing decisions
         "agents_selected": state.agents_selected,
         "execution_plan": state.execution_plan,
+        # Step 2b: smalltalk flag forwarded so generate_node bisa branch
+        # ke lean prompt path (Q2B: keep nama anak doang).
+        # Without this, smalltalk path NEVER activates because generate_node
+        # checks legacy_state.get("is_smalltalk") which would be None.
+        "is_smalltalk": state.is_smalltalk,
         # Agent results (input untuk berikutnya kalau sequential)
         "agent_results": dict(state.agent_results),
         "retrieved_docs": list(state.retrieved_docs),
