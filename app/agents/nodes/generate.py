@@ -1,56 +1,47 @@
 """
 Node: generate
+Generate response dari LLM dengan streaming token per token.
 
-Phase 1 refactor: return dict (LangGraph signature) instead of yield SSE events.
-ALL logic dari generate_node original PRESERVED 1:1:
-- Mode-specific system prompt (simple/medium/detailed)
-- Image analysis prompt injection (DB or hardcoded fallback)
-- Memory injection (L2 summaries + L3 facts)
-- Agent results injection
-- Clarification / quick_reply early return
-- LLM streaming with metrics (TTFT, latency, tokens)
-- Langfuse trace_generation wrapping
-- LLM call log
-
-Token-level streaming TIDAK lagi yield dari node ini (LangGraph node return dict).
-Stream adapter (app/agents/streaming.py) capture token events via
-graph.astream_events() pattern → emit SSE token events ke FE.
+Update v2:
+- Support response_mode (simple/medium/detailed) → pilih prompt template berbeda
+- Build context dari agent_results (multi-agent)
+- Inject memory context (L2+L3) ke system prompt
+- Support quick_reply event
 """
-from __future__ import annotations
-
 import json
-import logging
 import time
-from typing import Any, Optional
+from typing import Any, AsyncIterator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from app.agents.state import AgentState, LLMCallLog, ThinkingStep
-
-logger = logging.getLogger(__name__)
-
-
-# =============================================================================
-# System prompt builder (preserved 1:1 dari generate.py original)
-# =============================================================================
+from app.agents.state import AgentState
+from app.config.llm import get_llm, get_model_name, get_provider_name
+from app.config.observability import build_trace_config
+from app.schemas.chat import (
+    LLMCallLogPayload,
+    make_clarify_event,
+    make_quick_reply_event,
+    make_thinking_event,
+    make_token_event,
+)
 
 
 def _build_system_prompt(state: AgentState) -> str:
     """
-    Build system prompt dengan komposisi:
-    1. Persona Tanya Peri (DB atau default)
+    Build system prompt dengan:
+    1. Persona Tanya Peri (dari DB atau default)
     2. Data user & anak dari user_context
     3. Memory context (L2 summary + L3 facts)
-    4. Hasil agent (docs, profile, image analysis, dll)
+    4. Hasil agent (docs, profile data, dll)
     5. Response mode instructions
     """
-    prompts = state.prompts
+    prompts = state.get("prompts", {})
 
-    # RnD override
+    # Override system prompt penuh (RnD mode)
     if "_override_system" in prompts:
         return prompts["_override_system"]
 
-    # ── Persona base ──────────────────────────────────────────────────────────
+    # Persona base
     persona = prompts.get(
         "persona_system",
         "Kamu adalah Tanya Peri 🧚, asisten kesehatan gigi anak dari aplikasi Peri Bugi. "
@@ -59,7 +50,8 @@ def _build_system_prompt(state: AgentState) -> str:
         "Selalu sarankan konsultasi dokter gigi untuk masalah serius.",
     )
 
-    ctx = state.user_context.model_dump()
+    # Inject user & child data
+    ctx = state.get("user_context", {})
     user = ctx.get("user") or {}
     child = ctx.get("child") or {}
 
@@ -71,7 +63,7 @@ def _build_system_prompt(state: AgentState) -> str:
     system = system.replace("{child_name}", child_name)
     system = system.replace("{child_age}", child_age)
 
-    # ── Brushing context ──────────────────────────────────────────────────────
+    # Brushing data dari user_context (juga bisa dari rapot_peri agent di Phase 2)
     brushing = ctx.get("brushing")
     if brushing:
         system += (
@@ -80,7 +72,7 @@ def _build_system_prompt(state: AgentState) -> str:
             f"rekor terbaik {brushing.get('best_streak', 0)} hari."
         )
 
-    # ── Mata Peri last result (from user_context) ─────────────────────────────
+    # Mata Peri scan result
     mata_peri = ctx.get("mata_peri_last_result")
     if mata_peri and mata_peri.get("summary_text"):
         system += (
@@ -90,8 +82,8 @@ def _build_system_prompt(state: AgentState) -> str:
             f"Status: {mata_peri.get('summary_status', 'tidak diketahui')}."
         )
 
-    # ── Memory context (L2 summaries + L3 facts) ──────────────────────────────
-    memory = state.memory.model_dump()
+    # ── Memory context (L2 + L3) ──────────────────────────────────────────────
+    memory = state.get("memory_context", {})
 
     summaries = memory.get("session_summaries", [])
     if summaries:
@@ -106,11 +98,11 @@ def _build_system_prompt(state: AgentState) -> str:
         system += f"\n\nYang kamu ketahui tentang user ini:\n{facts_text}"
 
     # ── Agent results ─────────────────────────────────────────────────────────
-    agent_results = state.agent_results
+    agent_results = state.get("agent_results", {})
 
     # KB Dental docs
     kb_result = agent_results.get("kb_dental", {})
-    kb_docs = kb_result.get("docs", []) or state.retrieved_docs
+    kb_docs = kb_result.get("docs", []) or state.get("retrieved_docs", [])
     if kb_docs:
         docs_text = "\n\n".join(kb_docs[:3])
         system += f"\n\nReferensi dari knowledge base:\n{docs_text}"
@@ -122,14 +114,14 @@ def _build_system_prompt(state: AgentState) -> str:
         faq_text = "\n\n".join(faq_docs[:3])
         system += f"\n\nInfo aplikasi yang relevan:\n{faq_text}"
 
-    # Image analysis (Mata Peri image flow)
-    image_analysis = state.image_analysis
+    # Image analysis (Mata Peri agent - Phase 2 / Tanya Peri image - Phase 4 Batch B)
+    # Phase 6: prompts pindah ke DB — dipilih berdasarkan response_mode.
+    image_analysis = state.get("image_analysis")
     if image_analysis:
-        session_summary = (
-            image_analysis.get("session_summary")
-            if isinstance(image_analysis, dict)
-            else None
-        )
+        # AnalyzeResponse dari ai-cv punya struktur:
+        # { session_summary: { summary_status, summary_text, recommendation_text, ... }, results: [...] }
+        # Backward compat: kalau dari _analyze_image lama (deprecated), fallback ke field 'summary'.
+        session_summary = image_analysis.get("session_summary") if isinstance(image_analysis, dict) else None
 
         if session_summary:
             sum_status = session_summary.get("summary_status") or "tidak diketahui"
@@ -137,6 +129,7 @@ def _build_system_prompt(state: AgentState) -> str:
             rec_text = session_summary.get("recommendation_text") or ""
             requires_review = session_summary.get("requires_dentist_review", False)
 
+            # Status emoji untuk visual reinforcement
             status_emoji = {
                 "ok": "✅",
                 "perlu_perhatian": "⚠️",
@@ -144,11 +137,14 @@ def _build_system_prompt(state: AgentState) -> str:
                 "gagal": "❌",
             }.get(sum_status, "📋")
 
-            response_mode = state.session.response_mode
+            # Pull prompt template dari DB berdasarkan response_mode aktif.
+            # Key: tanya_peri_image_response_{simple|medium|detailed}
+            response_mode = state.get("response_mode", "simple")
             image_prompt_key = f"tanya_peri_image_response_{response_mode}"
             image_prompt_template = prompts.get(image_prompt_key)
 
             if image_prompt_template:
+                # Render template dengan placeholder
                 try:
                     rendered = image_prompt_template.format(
                         summary_status=sum_status,
@@ -160,31 +156,35 @@ def _build_system_prompt(state: AgentState) -> str:
                     )
                     system += "\n\n" + rendered
                 except KeyError as e:
+                    # Prompt ada placeholder yang tidak kita support — log + fallback
                     logger.warning(
                         f"[generate] Prompt {image_prompt_key} pakai placeholder "
-                        f"yang tidak dikenal: {e}. Fallback ke hardcoded."
+                        f"yang tidak dikenal: {e}. Fallback ke hardcoded format."
                     )
                     system += _build_image_analysis_fallback_prompt(
                         sum_status, sum_text, rec_text, child_name,
                         requires_review, status_emoji,
                     )
             else:
+                # DB tidak punya prompt (seeder belum jalan / disabled) → hardcoded fallback
                 system += _build_image_analysis_fallback_prompt(
                     sum_status, sum_text, rec_text, child_name,
                     requires_review, status_emoji,
                 )
         else:
+            # Backward compat — old _analyze_image format (Phase 2)
             system += (
                 f"\n\nHasil analisis gambar gigi: "
                 f"{image_analysis.get('summary', 'tidak tersedia')}."
             )
 
     # ── Response mode instructions ────────────────────────────────────────────
-    response_mode = state.session.response_mode
+    response_mode = state.get("response_mode", "simple")
     mode_key = f"generate_{response_mode}"
     mode_instruction = prompts.get(mode_key)
 
     if not mode_instruction:
+        # Default instructions per mode
         if response_mode == "simple":
             mode_instruction = (
                 "Jawab dengan singkat, ramah, dan mudah dipahami. "
@@ -211,52 +211,31 @@ def _build_system_prompt(state: AgentState) -> str:
     return system
 
 
-def _build_image_analysis_fallback_prompt(
-    sum_status: str,
-    sum_text: str,
-    rec_text: str,
-    child_name: str,
-    requires_review: bool,
-    status_emoji: str,
-) -> str:
-    """Hardcoded fallback kalau DB belum punya prompt key tanya_peri_image_response_*."""
-    return (
-        f"\n\n=== KONTEKS PENTING ===\n"
-        f"USER SUDAH MENGIRIM FOTO GIGI ANAK dan SUDAH dianalisis oleh sistem AI. "
-        f"JANGAN minta user upload foto lagi.\n\n"
-        f"📸 Hasil Analisis Foto Gigi {child_name}:\n"
-        f"{status_emoji} Status: {sum_status}\n"
-        f"📝 Ringkasan: {sum_text}\n"
-        f"💡 Saran: {rec_text}\n\n"
-        f"INSTRUKSI MERESPON:\n"
-        f"1. JANGAN minta user upload foto — foto sudah ada dan sudah dianalisis.\n"
-        f"2. Acknowledge hasil analisis singkat (1-2 kalimat empati).\n"
-        f"3. Jawab pertanyaan user kalau ada.\n"
-        f"4. Hasil sudah ditampilkan di card terpisah — cukup komentar singkat.\n"
-        f"5. {'Anjurkan konsultasi dokter gigi.' if requires_review else 'Tetap pantau dan jaga kebiasaan sikat gigi.'}\n"
-        f"=== AKHIR KONTEKS ===\n"
-    )
-
-
 def _build_messages(state: AgentState, system_prompt: str) -> list:
-    """Build LangChain messages: SystemMessage + history dari state.messages."""
+    """Build list LangChain messages dari state."""
     lc_messages = [SystemMessage(content=system_prompt)]
-    # state.messages already in BaseMessage format (from build_initial_state)
-    lc_messages.extend(state.messages)
+    for msg in state.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "user":
+            lc_messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            lc_messages.append(AIMessage(content=content))
     return lc_messages
 
 
 def _get_llm_for_state(state: AgentState):
-    """Get LLM dengan possible per-agent override."""
-    from app.config.llm import get_llm
+    """Dapatkan LLM — bisa pakai override per-agent atau default global."""
+    # Cek apakah ada agent-specific config
+    agents_selected = state.get("agents_selected", [])
+    agent_configs = state.get("agent_configs", {})
 
-    agents_selected = state.agents_selected
-    agent_configs = state.control.agent_configs
+    provider_override = state.get("llm_provider_override")
+    model_override = state.get("llm_model_override")
 
-    provider_override = state.rnd.llm_provider
-    model_override = state.rnd.llm_model
-
-    # Single-agent mode → use agent-specific config kalau ada
+    # Jika ada satu agent dengan config khusus dan tidak ada multi-agent
     if len(agents_selected) == 1 and not provider_override:
         agent_key = agents_selected[0]
         agent_conf = agent_configs.get(agent_key, {})
@@ -269,39 +248,16 @@ def _get_llm_for_state(state: AgentState):
         streaming=True,
         provider=provider_override,
         model=model_override,
-        temperature=state.rnd.llm_temperature,
-        max_tokens=state.rnd.llm_max_tokens,
+        temperature=state.get("llm_temperature_override"),
+        max_tokens=state.get("llm_max_tokens_override"),
     ), provider_override, model_override
 
 
-def _get_child_name(state: AgentState) -> str:
-    ctx = state.user_context.model_dump()
-    child = ctx.get("child") or {}
-    return child.get("nickname") or child.get("full_name") or "si kecil"
+async def generate_node(state: AgentState) -> AsyncIterator[str]:
+    """Node: generate — stream response dari LLM."""
+    thinking_step = len(state.get("thinking_steps", [])) + 1
 
-
-# =============================================================================
-# LangGraph node
-# =============================================================================
-
-
-async def generate_node(state: AgentState) -> dict:
-    """
-    LangGraph node: generate final response from LLM.
-
-    Returns state update dict. Token streaming captured via LangGraph
-    astream_events() di stream_adapter, NOT yield dari node.
-
-    Early return cases (no LLM call):
-    - needs_clarification + clarification_data: stream adapter emit clarify event
-    - quick_reply_data: stream adapter emit quick_reply event
-    """
-    from app.config.llm import get_model_name, get_provider_name
-    from app.config.observability import build_trace_config, trace_generation, _safe_dict_for_trace
-
-    thinking_step_num = len(state.thinking_steps) + 1
-
-    # Build thinking label based on agents
+    agents_selected = state.get("agents_selected", [])
     intent_label = {
         "kb_dental": "Menyiapkan jawaban kesehatan gigi...",
         "user_profile": f"Membaca data {_get_child_name(state)}...",
@@ -312,35 +268,46 @@ async def generate_node(state: AgentState) -> dict:
         "janji_peri": "Mencari informasi dokter...",
     }
 
-    if len(state.agents_selected) > 1:
+    if len(agents_selected) > 1:
         thinking_label = "Merangkum informasi untuk kamu..."
-    elif state.agents_selected:
-        thinking_label = intent_label.get(state.agents_selected[0], "Menyiapkan respons...")
+    elif agents_selected:
+        thinking_label = intent_label.get(agents_selected[0], "Menyiapkan respons...")
     else:
         thinking_label = "Menyiapkan respons..."
 
-    thinking_done = ThinkingStep(step=thinking_step_num, label=thinking_label, done=True)
+    yield make_thinking_event(step=thinking_step, label=thinking_label, done=False)
 
-    # ── Early return: clarification ───────────────────────────────────────────
-    if state.needs_clarification and state.clarification_data:
-        return {
-            "thinking_steps": [*state.thinking_steps, thinking_done],
-            # clarification_data tetap di state — stream adapter akan emit clarify event
-        }
+    # Handle clarification (sudah ada di state dari check sebelumnya)
+    if state.get("needs_clarification") and state.get("clarification_data"):
+        clarify = state["clarification_data"]
+        yield make_thinking_event(step=thinking_step, label=thinking_label, done=True)
+        yield make_clarify_event(
+            question=clarify.get("question", ""),
+            options=clarify.get("options", []),
+            allow_multiple=clarify.get("allow_multiple", False),
+        )
+        state["thinking_steps"].append({"step": thinking_step, "label": thinking_label, "done": True})
+        return
 
-    # ── Early return: quick_reply ─────────────────────────────────────────────
-    if state.quick_reply_data:
-        return {
-            "thinking_steps": [*state.thinking_steps, thinking_done],
-        }
+    # Handle quick reply
+    if state.get("quick_reply_data"):
+        qr = state["quick_reply_data"]
+        yield make_thinking_event(step=thinking_step, label=thinking_label, done=True)
+        yield make_quick_reply_event(
+            qr_type=qr.get("type", "single_select"),
+            question=qr.get("question"),
+            options=qr.get("options", []),
+            allow_multiple=qr.get("allow_multiple", False),
+            dismissible=qr.get("dismissible", True),
+        )
+        state["thinking_steps"].append({"step": thinking_step, "label": thinking_label, "done": True})
+        return
 
-    # ── Build prompt + messages ────────────────────────────────────────────────
     system_prompt = _build_system_prompt(state)
     lc_messages = _build_messages(state, system_prompt)
 
-    prompt_debug = None
-    if state.rnd.include_prompt_debug:
-        prompt_debug = {
+    if state.get("include_prompt_debug"):
+        state["prompt_debug"] = {
             "system": system_prompt,
             "messages": [
                 {"role": type(m).__name__, "content": m.content}
@@ -348,64 +315,68 @@ async def generate_node(state: AgentState) -> dict:
             ],
         }
 
-    llm, provider, model = _get_llm_for_state(state)
+    llm, _provider, _model = _get_llm_for_state(state)
 
-    # ── LLM streaming call ────────────────────────────────────────────────────
     t_start = time.monotonic()
-    t_first_token: Optional[float] = None
+    t_first_token: float | None = None
     full_response = ""
     output_tokens = 0
     success = True
-    error_msg: Optional[str] = None
+    error_msg: str | None = None
 
-    # Per-call trace config (Langfuse)
-    trace_config = build_trace_config(
-        state={
-            "session_id": state.session.session_id,
-            "user_context": state.user_context.model_dump(),
-            "response_mode": state.session.response_mode,
-        },
-        agent_name="generate",
-    )
+    yield make_thinking_event(step=thinking_step, label=thinking_label, done=True)
+    state["thinking_steps"].append({"step": thinking_step, "label": thinking_label, "done": True})
 
-    # Extract last user message untuk trace input
+    # Per-call trace config (no-op kalau Langfuse disabled)
+    trace_config = build_trace_config(state=state, agent_name="generate")
+
+    # Phase 4: extract last user message untuk trace input
     user_msg_text = ""
     last_user_msg = next(
-        (m for m in reversed(state.messages) if hasattr(m, "type") and m.type == "human"),
+        (m for m in reversed(state.get("messages", []))
+         if isinstance(m, dict) and m.get("role") == "user"),
         None,
     )
     if last_user_msg:
-        content = last_user_msg.content
+        content = last_user_msg.get("content", "")
         if isinstance(content, str):
             user_msg_text = content
         elif isinstance(content, list):
+            # Multimodal — extract text part
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     user_msg_text = part.get("text", "")
                     break
 
-    # Phase 4.5: full agent_results capture untuk Langfuse diagnostic
-    agent_results_snapshot = state.agent_results
-    image_analysis_snapshot = state.image_analysis
-    memory_snapshot = state.memory.model_dump()
+    # Phase 4: generation span — capture full prompt + output untuk diagnostic
+    # Phase 4.5: tambah agent_results context yang membentuk system_prompt
+    from app.config.observability import trace_generation, _safe_dict_for_trace
+
+    # Phase 4.5: extract agent_results context — yang ini di-inject ke system_prompt
+    agent_results = state.get("agent_results", {})
+    image_analysis = state.get("image_analysis")
+    memory_context = state.get("memory_context", {})
+    retrieved_docs = state.get("retrieved_docs", []) or []
 
     async with trace_generation(
         name="generate",
-        model=get_model_name(provider=provider, model=model),
+        model=get_model_name(provider=_provider, model=_model),
         system_prompt=system_prompt,
         messages=lc_messages,
         user_message=user_msg_text,
         metadata={
-            "agents_used": list(agent_results_snapshot.keys()),
-            "response_mode": state.session.response_mode,
-            "has_image_analysis": bool(image_analysis_snapshot),
+            "agents_used": list(agent_results.keys()),
+            "response_mode": state.get("response_mode", "simple"),
+            "has_image_analysis": bool(image_analysis),
             "child_name": _get_child_name(state),
-            "provider": get_provider_name(provider=provider),
-            "agent_results_keys": list(agent_results_snapshot.keys()),
-            "image_analysis_present": bool(image_analysis_snapshot),
-            "kb_docs_count": len(state.retrieved_docs),
-            "memory_summaries_count": len(memory_snapshot.get("session_summaries", [])),
-            "memory_facts_count": len(memory_snapshot.get("user_facts", [])),
+            "provider": get_provider_name(provider=_provider),
+            # Phase 4.5: cross-reference info supaya Hanif bisa correlate
+            # context yang masuk → system_prompt yang di-render
+            "agent_results_keys": list(agent_results.keys()),
+            "image_analysis_present": bool(image_analysis),
+            "kb_docs_count": len(retrieved_docs),
+            "memory_summaries_count": len(memory_context.get("session_summaries", [])),
+            "memory_facts_count": len(memory_context.get("user_facts", [])),
         },
     ) as gen_span:
         try:
@@ -417,13 +388,11 @@ async def generate_node(state: AgentState) -> dict:
                     t_first_token = time.monotonic()
                 full_response += token
                 output_tokens += 1
-                # NOTE: token-level emission ke FE happens via LangGraph
-                # astream_events('on_chat_model_stream') captured di stream_adapter.
-                # Node itself doesn't yield.
+                yield make_token_event(token)
+
         except Exception as e:
             success = False
             error_msg = str(e)
-            logger.error(f"[generate_node] LLM streaming error: {e}", exc_info=True)
             if gen_span:
                 gen_span.update(
                     output=f"[ERROR] {str(e)[:500]}",
@@ -431,22 +400,25 @@ async def generate_node(state: AgentState) -> dict:
                     status_message=str(e)[:200],
                 )
 
-        # Capture output ke generation span
+        # Phase 4: capture output ke generation span (sebelum exit context)
+        # Phase 4.5: tambah agent_results di metadata untuk full diagnostic
         if gen_span and success:
             try:
                 gen_span.update(
                     output=full_response[:5000] if full_response else "(empty)",
-                    usage_details={"output": output_tokens},
+                    usage_details={
+                        "output": output_tokens,  # approx token count
+                    },
+                    # Phase 4.5: capture agent_results in update metadata —
+                    # diakses via "Additional Input" panel di Langfuse UI
                     metadata={
-                        "agent_results_summary": _safe_dict_for_trace(agent_results_snapshot),
-                        "image_analysis_summary": _safe_dict_for_trace(image_analysis_snapshot)
-                            if image_analysis_snapshot else None,
-                        "memory_context_summary": _safe_dict_for_trace(memory_snapshot)
-                            if memory_snapshot else None,
+                        "agent_results_summary": _safe_dict_for_trace(agent_results),
+                        "image_analysis_summary": _safe_dict_for_trace(image_analysis) if image_analysis else None,
+                        "memory_context_summary": _safe_dict_for_trace(memory_context) if memory_context else None,
                     },
                 )
             except Exception:
-                pass  # defensive
+                pass  # defensive — jangan break flow kalau Langfuse error
 
     t_end = time.monotonic()
     total_latency_ms = int((t_end - t_start) * 1000)
@@ -454,33 +426,42 @@ async def generate_node(state: AgentState) -> dict:
     generation_ms = int((t_end - t_first_token) * 1000) if t_first_token else None
     tps = round(output_tokens / (generation_ms / 1000), 1) if generation_ms and generation_ms > 0 else None
 
-    # Build llm_metadata untuk done event (FE consume)
+    state["final_response"] = full_response
+    # Build llm_metadata for client. Tambahan field has_image_analysis +
+    # scan_session_id untuk FE render compact card di chat bubble.
     metadata: dict[str, Any] = {
-        "model": get_model_name(provider=provider, model=model),
-        "provider": get_provider_name(provider=provider),
-        "agents_used": list(agent_results_snapshot.keys()),
-        "response_mode": state.session.response_mode,
+        "model": get_model_name(provider=_provider, model=_model),
+        "provider": get_provider_name(provider=_provider),
+        "agents_used": list(state.get("agent_results", {}).keys()),
+        "response_mode": state.get("response_mode", "simple"),
         "latency_ms": total_latency_ms,
         "ttft_ms": ttft_ms,
         "generation_ms": generation_ms,
         "tokens_per_second": tps,
         "output_tokens_approx": output_tokens,
     }
-
-    # Tag has_image_analysis kalau ada session_summary (FE render compact card)
-    if isinstance(image_analysis_snapshot, dict) and image_analysis_snapshot.get("session_summary"):
+    # Tag has_image_analysis kalau ada session_summary structure
+    # (Tanya Peri image analysis dari Phase 4 Batch B).
+    image_analysis_state = state.get("image_analysis")
+    if isinstance(image_analysis_state, dict) and image_analysis_state.get("session_summary"):
         metadata["has_image_analysis"] = True
-        if state.scan_session_id:
-            metadata["scan_session_id"] = state.scan_session_id
-        ss = image_analysis_snapshot.get("session_summary", {})
+        scan_session_id = state.get("scan_session_id")
+        if scan_session_id:
+            metadata["scan_session_id"] = scan_session_id
+        # Include compact subset of session_summary buat FE render card tanpa fetch ulang
+        ss = image_analysis_state.get("session_summary", {})
         metadata["image_analysis_summary"] = {
             "summary_status": ss.get("summary_status"),
             "summary_text": ss.get("summary_text"),
             "recommendation_text": ss.get("recommendation_text"),
             "requires_dentist_review": ss.get("requires_dentist_review", False),
         }
-        # Forward overlay artifact URLs (5-view scan)
-        image_results = image_analysis_snapshot.get("results", []) or []
+        # Phase 6 — Forward overlay artifact URLs (mask gigi hijau + karies merah).
+        # Konsisten dengan Mata Peri 5-view: same pattern dari ai-cv pipeline.
+        # FE detail screen pakai ini untuk render foto dengan annotation.
+        # NOTE: URL ini signed dengan TTL 1 jam. Untuk akses ulang setelah expired,
+        # FE harus fetch detail dari /mata-peri/sessions/{id} yang regenerate URL fresh.
+        image_results = image_analysis_state.get("results", []) or []
         if image_results and isinstance(image_results, list):
             artifacts_list = []
             for ir in image_results:
@@ -500,12 +481,12 @@ async def generate_node(state: AgentState) -> dict:
                     })
             if artifacts_list:
                 metadata["image_artifacts"] = artifacts_list
+    state["llm_metadata"] = metadata
 
-    # Build LLM call log
-    call_log = LLMCallLog(
-        prompt_key=f"generate_{state.session.response_mode}",
-        model=get_model_name(provider=provider, model=model),
-        provider=get_provider_name(provider=provider),
+    log = LLMCallLogPayload(
+        prompt_key=f"generate_{state.get('response_mode', 'simple')}",
+        model=get_model_name(provider=_provider, model=_model),
+        provider=get_provider_name(provider=_provider),
         node="generate",
         output_tokens=output_tokens,
         latency_ms=total_latency_ms,
@@ -513,22 +494,57 @@ async def generate_node(state: AgentState) -> dict:
         success=success,
         error_message=error_msg,
         metadata={
-            "agents_used": list(agent_results_snapshot.keys()),
-            "response_mode": state.session.response_mode,
+            "agents_used": list(state.get("agent_results", {}).keys()),
+            "response_mode": state.get("response_mode", "simple"),
             "generation_ms": generation_ms,
             "tokens_per_second": tps,
         },
     )
+    state["llm_call_logs"].append(log.model_dump())
 
-    # Build state update dict
-    update: dict[str, Any] = {
-        "final_response": full_response,
-        "llm_metadata": metadata,
-        "thinking_steps": [*state.thinking_steps, thinking_done],
-        "llm_call_logs": [*state.llm_call_logs, call_log],
-    }
+    # Emit suggestion chips jika ada
+    if state.get("suggestion_chips"):
+        from app.schemas.chat import make_suggestions_event
+        yield make_suggestions_event(state["suggestion_chips"])
 
-    if prompt_debug is not None:
-        update["prompt_debug"] = prompt_debug
 
-    return update
+def _get_child_name(state: AgentState) -> str:
+    ctx = state.get("user_context", {})
+    child = ctx.get("child") or {}
+    return child.get("nickname") or child.get("full_name") or "si kecil"
+
+
+def _build_image_analysis_fallback_prompt(
+    sum_status: str,
+    sum_text: str,
+    rec_text: str,
+    child_name: str,
+    requires_review: bool,
+    status_emoji: str,
+) -> str:
+    """
+    Hardcoded fallback prompt untuk image analysis kalau DB belum punya
+    prompt key `tanya_peri_image_response_{simple|medium|detailed}`.
+
+    Pattern: konteks + instruction berbasis poin (bukan paragraph).
+    Pakai bahasa explicit "JANGAN minta upload" karena small LLM mudah miss.
+
+    Catatan: setelah seeder jalan, function ini tidak akan ke-trigger.
+    Sengaja simpan untuk safety net + dev tanpa DB seed.
+    """
+    return (
+        f"\n\n=== KONTEKS PENTING ===\n"
+        f"USER SUDAH MENGIRIM FOTO GIGI ANAK dan SUDAH dianalisis oleh sistem AI. "
+        f"JANGAN minta user upload foto lagi.\n\n"
+        f"📸 Hasil Analisis Foto Gigi {child_name}:\n"
+        f"{status_emoji} Status: {sum_status}\n"
+        f"📝 Ringkasan: {sum_text}\n"
+        f"💡 Saran: {rec_text}\n\n"
+        f"INSTRUKSI MERESPON:\n"
+        f"1. JANGAN minta user upload foto — foto sudah ada dan sudah dianalisis.\n"
+        f"2. Acknowledge hasil analisis singkat (1-2 kalimat empati).\n"
+        f"3. Jawab pertanyaan user kalau ada.\n"
+        f"4. Hasil sudah ditampilkan di card terpisah — cukup komentar singkat.\n"
+        f"5. {'Anjurkan konsultasi dokter gigi.' if requires_review else 'Tetap pantau dan jaga kebiasaan sikat gigi.'}\n"
+        f"=== AKHIR KONTEKS ===\n"
+    )

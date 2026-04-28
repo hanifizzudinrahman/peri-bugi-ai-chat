@@ -332,6 +332,14 @@ class AgentState(BaseModel):
             return self.rnd.force_intent
         elif key == "include_prompt_debug":
             return self.rnd.include_prompt_debug
+        elif key == "llm_provider_override":
+            return self.rnd.llm_provider
+        elif key == "llm_model_override":
+            return self.rnd.llm_model
+        elif key == "llm_temperature_override":
+            return self.rnd.llm_temperature
+        elif key == "llm_max_tokens_override":
+            return self.rnd.llm_max_tokens
         # Fallback: direct attribute (untuk extensions di Phase 2)
         if hasattr(self, key):
             return getattr(self, key)

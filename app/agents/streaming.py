@@ -1,24 +1,27 @@
 """
-Stream adapter — convert LangGraph astream_events() output → existing SSE format.
+Stream adapter — Hybrid LangGraph + native async generator pattern.
 
-CRITICAL: Preserves existing FE contract 1:1. FE tidak butuh perubahan.
+PHASE 1 STREAMING APPROACH (Hybrid — final):
 
-SSE events yang di-emit (sama dengan custom orchestrator sebelumnya):
-- thinking      : per-step indicator
-- token         : per-token streaming
-- clarify       : view_hint clarification
-- quick_reply   : interactive options
-- tool          : agent tool calls (rare di Phase 1, lebih banyak di Phase 2)
-- suggestions   : suggestion chips after response
-- done          : final marker dengan metadata
-- error         : kegagalan
+  Step 1: invoke compiled graph (supervisor → agent_dispatcher → END)
+          - Capture state updates, emit thinking/tool events
+          - Graph terminates di END setelah agent_dispatcher selesai
+  Step 2: Get final state snapshot dari checkpointer
+  Step 3: Call generate_node(state) langsung sebagai async generator
+          - Per-token streaming via `yield make_token_event(token)`
+          - Identical pattern dengan original (proven work)
+          - LangChain LLM .astream() emit chunks real-time
 
-Pattern:
-1. Wrap dengan Langfuse parent span (preserve observability)
-2. Build initial Pydantic state
-3. Iterate astream_events() — map per event type ke SSE
-4. Heartbeat task background untuk long-running nodes
-5. Submit LLM call logs ke api setelah selesai
+Kenapa hybrid:
+- LangGraph astream(stream_mode="messages") TIDAK reliable emit per-token chunks
+  untuk Gemini via langchain_google_genai. Buffering issue di langgraph 0.2.60.
+- Original pattern (yield from async generator) PROVEN work — kita preserve untuk
+  generate node yang punya streaming concern.
+- Supervisor + dispatcher tidak perlu streaming (cuma return state update),
+  jadi cocok di graph.
+
+Phase 2 nanti akan revisit setelah migrate ke ReAct loop dengan ToolNode +
+LangGraph custom stream writer pattern.
 """
 from __future__ import annotations
 
@@ -31,7 +34,6 @@ from typing import Any, AsyncIterator, Optional
 
 from app.agents.state import AgentState, ImageInput
 from app.schemas.chat import (
-    ChatRequest,
     make_thinking_event,
     make_token_event,
     make_clarify_event,
@@ -57,10 +59,9 @@ HEARTBEAT_LONG_RUNNING_THRESHOLD_SEC = 30.0
 
 async def langgraph_to_sse_stream(initial_state: AgentState) -> AsyncIterator[str]:
     """
-    Top-level streaming entry: invoke LangGraph + emit SSE events.
+    Top-level streaming entry: invoke graph + emit SSE events.
 
     Wrapped dengan Langfuse parent span untuk observability.
-    Submit LLM call logs ke api setelah selesai.
     """
     from app.config.observability import get_langfuse_client
 
@@ -71,7 +72,6 @@ async def langgraph_to_sse_stream(initial_state: AgentState) -> AsyncIterator[st
             yield event
         return
 
-    # Langfuse parent span (logic preserved dari graph.py original)
     user_message = _extract_user_msg(initial_state)
     has_image = initial_state.image is not None
     response_mode = initial_state.session.response_mode
@@ -92,7 +92,6 @@ async def langgraph_to_sse_stream(initial_state: AgentState) -> AsyncIterator[st
             if has_image:
                 tags.append("with-image")
 
-            # Update trace dengan user info dari state
             ctx = initial_state.user_context.model_dump()
             user = ctx.get("user") or {}
             user_id = user.get("id") or "unknown"
@@ -111,7 +110,6 @@ async def langgraph_to_sse_stream(initial_state: AgentState) -> AsyncIterator[st
             async for event in _stream_internal(initial_state, captured_output):
                 yield event
 
-            # After completion — capture output
             output_summary = {
                 "text": captured_output.get("text", "")[:1000],
                 "tokens": captured_output.get("tokens", 0),
@@ -130,7 +128,7 @@ async def langgraph_to_sse_stream(initial_state: AgentState) -> AsyncIterator[st
 
 
 # =============================================================================
-# Internal streaming — actual graph invocation + event mapping
+# Internal streaming — graph invocation + generate as async generator
 # =============================================================================
 
 
@@ -139,12 +137,13 @@ async def _stream_internal(
     captured: Optional[dict] = None,
 ) -> AsyncIterator[str]:
     """
-    Invoke compiled LangGraph + map astream_events() output ke SSE.
-
-    Heartbeat: separate background task yang emit thinking events kalau
-    no other event muncul dalam HEARTBEAT_INTERVAL_SEC.
+    Hybrid streaming:
+    - Step 1: invoke graph (supervisor + agent_dispatcher) via astream(stream_mode="updates")
+    - Step 2: get final state, call generate_node(state) as async generator
+    - Step 3: emit clarify/quick_reply/suggestions/done after generate selesai
     """
     from app.agents.builder import get_compiled_graph
+    from app.agents.nodes.generate import generate_node
 
     if captured is None:
         captured = {"text": "", "needs_clarification": False, "error": None, "tokens": 0}
@@ -157,219 +156,195 @@ async def _stream_internal(
         captured["error"] = str(e)
         return
 
-    # Thread config (untuk checkpointer)
     thread_id = initial_state.session.session_id or f"thread-{uuid.uuid4()}"
     config = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": 25,
     }
 
-    # State tracking untuk extract clarification/quick_reply/suggestions
-    # post-graph (event aggregator pattern)
-    final_state_snapshot: Optional[dict] = None
-
-    # Heartbeat tracking
+    final_state: Optional[AgentState] = None
     last_event_time = time.monotonic()
     started_time = last_event_time
-    event_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
-    heartbeat_active = asyncio.Event()
-    heartbeat_active.set()
 
-    async def heartbeat_loop():
-        """Emit thinking heartbeat every HEARTBEAT_INTERVAL_SEC saat node lama."""
-        nonlocal last_event_time
-        try:
-            while heartbeat_active.is_set():
-                await asyncio.sleep(2.0)  # Check every 2s
-                now = time.monotonic()
-                idle = now - last_event_time
-                total_running = now - started_time
-                if (
-                    idle >= HEARTBEAT_INTERVAL_SEC
-                    and total_running >= HEARTBEAT_LONG_RUNNING_THRESHOLD_SEC
-                ):
-                    label = "Masih memproses, sebentar ya..."
-                    await event_queue.put(make_thinking_event(99, label, done=False))
-                    last_event_time = now
-        except asyncio.CancelledError:
-            pass
+    emitted_thinking_steps: set = set()
+    emitted_tool_calls: set = set()
 
-    heartbeat_task = asyncio.create_task(heartbeat_loop())
-
-    async def graph_runner():
-        """Run graph + emit SSE events ke queue."""
-        nonlocal final_state_snapshot, last_event_time
-        try:
-            current_node: Optional[str] = None
-            generate_token_emitted = False  # untuk suppress duplicate tokens
-
-            async for event in graph.astream_events(
-                initial_state, config=config, version="v2"
-            ):
-                last_event_time = time.monotonic()
-                event_type = event.get("event", "")
-                event_name = event.get("name", "")
-                event_data = event.get("data", {})
-
-                # ── Per-node start: emit thinking ──────────────────────────
-                if event_type == "on_chain_start" and event_name in (
-                    "supervisor", "agent_dispatcher", "generate"
-                ):
-                    current_node = event_name
-                    # Thinking emitted by node itself (returned in state update);
-                    # we don't double-emit here.
-
-                # ── Per-node end: capture state update ─────────────────────
-                if event_type == "on_chain_end" and event_name in (
-                    "supervisor", "agent_dispatcher", "generate"
-                ):
-                    # event_data["output"] = node return dict (state update)
-                    output = event_data.get("output") or {}
-
-                    # Emit new thinking_steps yang muncul di update ini
-                    new_thinking = output.get("thinking_steps") or []
-                    if isinstance(new_thinking, list) and new_thinking:
-                        # Hanya emit yang TERAKHIR (yang baru ditambah node ini)
-                        latest = new_thinking[-1]
-                        if isinstance(latest, dict):
-                            await event_queue.put(
-                                make_thinking_event(
-                                    step=latest.get("step", 1),
-                                    label=latest.get("label", ""),
-                                    done=latest.get("done", True),
-                                )
-                            )
-                        elif hasattr(latest, "model_dump"):
-                            d = latest.model_dump()
-                            await event_queue.put(
-                                make_thinking_event(
-                                    step=d.get("step", 1),
-                                    label=d.get("label", ""),
-                                    done=d.get("done", True),
-                                )
-                            )
-
-                    # Emit tool events kalau ada tool_calls baru
-                    new_tools = output.get("tool_calls") or []
-                    if isinstance(new_tools, list):
-                        for tc in new_tools[-3:]:  # Last 3 only (avoid spam)
-                            if isinstance(tc, dict):
-                                await event_queue.put(
-                                    make_tool_event(
-                                        tool=tc.get("tool", "unknown"),
-                                        input=tc.get("input", {}),
-                                        result=tc.get("result", {}),
-                                    )
-                                )
-
-                # ── LLM token streaming ────────────────────────────────────
-                if event_type == "on_chat_model_stream":
-                    chunk = event_data.get("chunk")
-                    if chunk and hasattr(chunk, "content"):
-                        token = chunk.content
-                        if token and isinstance(token, str):
-                            captured["text"] += token
-                            captured["tokens"] += 1
-                            await event_queue.put(make_token_event(token))
-                            generate_token_emitted = True
-
-            # ── After graph done: get final state snapshot ──────────────────
-            try:
-                state_obj = await graph.aget_state(config)
-                if state_obj and state_obj.values:
-                    if hasattr(state_obj.values, "model_dump"):
-                        final_state_snapshot = state_obj.values.model_dump()
-                    elif isinstance(state_obj.values, dict):
-                        final_state_snapshot = state_obj.values
-            except Exception as e:
-                logger.warning(f"[stream_adapter] aget_state failed: {e}")
-
-        except Exception as e:
-            logger.error(f"[stream_adapter] Graph execution error: {e}", exc_info=True)
-            captured["error"] = str(e)
-            await event_queue.put(make_error_event(f"Maaf, terjadi kesalahan: {str(e)[:100]}"))
-        finally:
-            heartbeat_active.clear()
-            await event_queue.put(None)  # Sentinel
-
-    runner_task = asyncio.create_task(graph_runner())
-
-    # Drain event queue
+    # ========================================================================
+    # STEP 1: Run graph (supervisor + agent_dispatcher) — emit thinking/tool events
+    # ========================================================================
     try:
-        while True:
-            event = await event_queue.get()
-            if event is None:
-                break
-            yield event
-    finally:
-        heartbeat_active.clear()
-        heartbeat_task.cancel()
-        try:
-            await heartbeat_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await runner_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
+        async for event_tuple in graph.astream(
+            initial_state,
+            config=config,
+            stream_mode="updates",
+        ):
+            last_event_time = time.monotonic()
 
-    # ── Post-graph: emit clarify / quick_reply / suggestions / done ───────────
-    if final_state_snapshot is None:
-        if not captured.get("error"):
-            yield make_error_event("Maaf, gagal memuat respons.")
-            captured["error"] = "no_final_state"
+            if not isinstance(event_tuple, dict):
+                continue
+
+            for node_name, update in event_tuple.items():
+                if not isinstance(update, dict):
+                    continue
+
+                # Emit new thinking_steps
+                thinking_steps = update.get("thinking_steps") or []
+                if isinstance(thinking_steps, list):
+                    for step in thinking_steps:
+                        step_dict = (
+                            step if isinstance(step, dict)
+                            else step.model_dump() if hasattr(step, "model_dump")
+                            else None
+                        )
+                        if step_dict is None:
+                            continue
+                        step_key = (step_dict.get("step"), step_dict.get("label"))
+                        if step_key in emitted_thinking_steps:
+                            continue
+                        emitted_thinking_steps.add(step_key)
+                        yield make_thinking_event(
+                            step=step_dict.get("step", 1),
+                            label=step_dict.get("label", ""),
+                            done=step_dict.get("done", True),
+                        )
+
+                # Emit tool_calls
+                tool_calls = update.get("tool_calls") or []
+                if isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        tc_dict = (
+                            tc if isinstance(tc, dict)
+                            else tc.model_dump() if hasattr(tc, "model_dump")
+                            else None
+                        )
+                        if tc_dict is None:
+                            continue
+                        tc_key = (
+                            tc_dict.get("tool"),
+                            tc_dict.get("agent"),
+                            json.dumps(tc_dict.get("input", {}), sort_keys=True, default=str),
+                        )
+                        if tc_key in emitted_tool_calls:
+                            continue
+                        emitted_tool_calls.add(tc_key)
+                        yield make_tool_event(
+                            tool=tc_dict.get("tool", "unknown"),
+                            input=tc_dict.get("input", {}),
+                            result=tc_dict.get("result", {}),
+                        )
+
+        # ========================================================================
+        # STEP 2: Get final state snapshot dari graph (post-dispatcher)
+        # ========================================================================
+        try:
+            state_obj = await graph.aget_state(config)
+            if state_obj and state_obj.values:
+                if isinstance(state_obj.values, AgentState):
+                    final_state = state_obj.values
+                elif isinstance(state_obj.values, dict):
+                    # Reconstruct AgentState from dict
+                    final_state = AgentState(**state_obj.values)
+        except Exception as e:
+            logger.warning(f"[stream_adapter] aget_state failed: {e}", exc_info=True)
+            final_state = initial_state  # fallback
+
+        if final_state is None:
+            final_state = initial_state
+
+    except Exception as e:
+        logger.error(f"[stream_adapter] Graph execution error: {e}", exc_info=True)
+        captured["error"] = str(e)
+        yield make_error_event(f"Maaf, terjadi kesalahan: {str(e)[:100]}")
         return
 
-    needs_clarify = final_state_snapshot.get("needs_clarification", False)
-    clarification_data = final_state_snapshot.get("clarification_data")
+    # ========================================================================
+    # STEP 3: Generate node sebagai async generator (per-token streaming)
+    # ========================================================================
+    # CRITICAL: generate_node (legacy) expect dict-state karena pakai
+    # state["key"] = value (setitem) untuk mutate final_response, llm_metadata,
+    # prompt_debug. Pydantic AgentState immutable by design — pakai dict shim.
+    #
+    # Pattern: convert Pydantic AgentState → legacy dict (sama seperti
+    # agent_dispatcher pakai _build_legacy_dict_state). Setelah generate_node
+    # selesai, extract final_response, llm_metadata, prompt_debug dari dict
+    # untuk submit_llm_logs + langfuse capture.
+    from app.agents.nodes.agent_dispatcher import _build_legacy_dict_state
 
-    if needs_clarify and clarification_data:
+    legacy_dict_state = _build_legacy_dict_state(final_state)
+
+    try:
+        async for sse_event in generate_node(legacy_dict_state):
+            # generate_node yields SSE strings already (make_thinking_event, make_token_event,
+            # make_clarify_event, make_quick_reply_event, make_suggestions_event)
+            # NOTE: generate_node TIDAK yield make_done_event — itu tanggung jawab caller (kita).
+            # Track captured tokens untuk Langfuse output summary
+            if "data:" in sse_event and '"type":"token"' in sse_event:
+                captured["tokens"] += 1
+                # Try extract token text untuk captured.text
+                try:
+                    json_part = sse_event.split("data:", 1)[1].strip()
+                    if json_part.endswith("\n\n"):
+                        json_part = json_part.rstrip("\n")
+                    parsed = json.loads(json_part)
+                    if parsed.get("type") == "token":
+                        captured["text"] += parsed.get("content", "") or parsed.get("token", "")
+                except Exception:
+                    pass
+            yield sse_event
+    except Exception as e:
+        logger.error(f"[stream_adapter] generate_node error: {e}", exc_info=True)
+        captured["error"] = str(e)
+        yield make_error_event(f"Maaf, terjadi kesalahan: {str(e)[:100]}")
+        return
+
+    # ========================================================================
+    # STEP 4: Emit make_done_event — CRITICAL untuk FE!
+    #
+    # Mirror logic dari original graph.py line 285-305:
+    # - Early return kalau needs_clarification + no final_response (FE handle clarify event sendiri)
+    # - Early return kalau quick_reply_data + no final_response
+    # - Otherwise: yield make_done_event dengan content + metadata + llm_call_logs
+    #
+    # Tanpa done event: FE stuck di "Sedang menjawab..." forever, tombol thumbs up/down
+    # tidak muncul, tombol stop tidak hilang.
+    # ========================================================================
+    needs_clarification = legacy_dict_state.get("needs_clarification", False)
+    quick_reply_data = legacy_dict_state.get("quick_reply_data")
+    final_response = legacy_dict_state.get("final_response", "") or ""
+
+    if needs_clarification and not final_response:
+        # Clarify event sudah di-yield generate_node — FE handle sendiri, tidak perlu done
         captured["needs_clarification"] = True
-        try:
-            yield make_clarify_event(
-                question=clarification_data.get("question", "Pilih opsi:"),
-                options=clarification_data.get("options", []),
-                allow_multiple=clarification_data.get("allow_multiple", False),
-            )
-            yield make_done_event(
-                content="",
-                metadata=final_state_snapshot.get("llm_metadata", {}),
-            )
-        except Exception as e:
-            logger.error(f"[stream_adapter] Clarify event error: {e}")
-            yield make_error_event("Format clarification tidak valid.")
-        # Submit LLM logs sebelum return
-        await _submit_llm_logs(final_state_snapshot)
         return
 
-    quick_reply_data = final_state_snapshot.get("quick_reply_data")
-    if quick_reply_data:
-        try:
-            yield make_quick_reply_event(
-                title=quick_reply_data.get("title", "Pilih:"),
-                description=quick_reply_data.get("description"),
-                options=quick_reply_data.get("options", []),
-                ui_variant=quick_reply_data.get("ui_variant", "list"),
-                meta=quick_reply_data.get("meta"),
-            )
-        except Exception as e:
-            logger.error(f"[stream_adapter] Quick reply error: {e}")
-            yield make_error_event("Format quick reply tidak valid.")
+    if quick_reply_data and not final_response:
+        # Quick reply sudah di-yield generate_node — FE handle, tidak perlu done
+        return
 
-    # Suggestion chips
-    suggestion_chips = final_state_snapshot.get("suggestion_chips") or []
-    if suggestion_chips:
-        yield make_suggestions_event(suggestion_chips)
+    # Build metadata persis seperti original graph.py
+    agents_used = list(legacy_dict_state.get("agent_results", {}).keys())
+    llm_call_logs = legacy_dict_state.get("llm_call_logs", []) or []
+    session_id = legacy_dict_state.get("session_id", "") or ""
 
-    # Done event
-    final_response = final_state_snapshot.get("final_response", "") or captured.get("text", "")
-    metadata = final_state_snapshot.get("llm_metadata", {}) or {}
-    yield make_done_event(content=final_response, metadata=metadata)
+    # Stamp session_id ke logs yang belum punya (parity dengan original)
+    for log in llm_call_logs:
+        if isinstance(log, dict) and not log.get("session_id"):
+            log["session_id"] = session_id
 
-    # Submit LLM call logs (background — don't block stream)
-    await _submit_llm_logs(final_state_snapshot)
+    yield make_done_event(
+        content=final_response,
+        metadata={
+            **legacy_dict_state.get("llm_metadata", {}),
+            "agents_used": agents_used,
+            "llm_call_logs": llm_call_logs,
+        },
+    )
+
+    # ========================================================================
+    # STEP 5: Submit LLM logs (best-effort, fire-and-forget)
+    # Extract LLM call logs dari legacy_dict_state (yang di-mutate generate_node)
+    # ========================================================================
+    await _submit_llm_logs_from_legacy_dict(legacy_dict_state, final_state)
 
 
 # =============================================================================
@@ -391,34 +366,78 @@ def _extract_user_msg(state: AgentState) -> str:
     return ""
 
 
-async def _submit_llm_logs(final_state: dict) -> None:
-    """Submit LLM call logs ke peri-bugi-api (best-effort, non-blocking)."""
+async def _submit_llm_logs_from_legacy_dict(
+    legacy_dict_state: dict,
+    fallback_state: AgentState,
+) -> None:
+    """Submit LLM call logs ke peri-bugi-api (best-effort, non-blocking).
+
+    Generate_node mutate legacy_dict_state["llm_call_logs"] (append baru).
+    Kita extract dari sana, fallback ke fallback_state.llm_call_logs kalau
+    legacy_dict_state tidak punya logs (defensive).
+    """
     try:
-        logs = final_state.get("llm_call_logs") or []
+        # Prefer legacy dict (yang di-mutate generate_node)
+        logs = legacy_dict_state.get("llm_call_logs") or []
+        if not logs and fallback_state is not None:
+            # Fallback: ambil dari Pydantic state (sebelum generate)
+            logs = [l.model_dump() if hasattr(l, "model_dump") else dict(l)
+                    for l in fallback_state.llm_call_logs]
+
         if not logs:
             return
 
-        from app.utils.llm_log_submitter import submit_llm_call_logs
+        session_id = (
+            legacy_dict_state.get("session_id")
+            or (fallback_state.session.session_id if fallback_state else None)
+        )
 
-        # Convert to legacy format yang api expect
         payloads = []
-        session_id = final_state.get("session", {}).get("session_id") if isinstance(
-            final_state.get("session"), dict
-        ) else None
-
         for log in logs:
             if isinstance(log, dict):
                 payload = dict(log)
-                if not payload.get("session_id"):
-                    payload["session_id"] = session_id
-                payloads.append(payload)
             elif hasattr(log, "model_dump"):
                 payload = log.model_dump()
-                if not payload.get("session_id"):
-                    payload["session_id"] = session_id
-                payloads.append(payload)
+            else:
+                continue
+            if not payload.get("session_id"):
+                payload["session_id"] = session_id
+            payloads.append(payload)
 
         if payloads:
-            asyncio.create_task(submit_llm_call_logs(payloads))
+            from app.services.llm_logger import fire_and_forget_logs
+            fire_and_forget_logs(payloads, session_id=session_id)
+    except Exception as e:
+        logger.warning(f"[stream_adapter] Submit LLM logs error: {e}")
+
+
+async def _submit_llm_logs(final_state: AgentState) -> None:
+    """[LEGACY] Submit LLM call logs dari Pydantic state.
+
+    Kept for compat — kalau ada code lain yang panggil. Phase 1 main path
+    pakai _submit_llm_logs_from_legacy_dict.
+    """
+    try:
+        logs = final_state.llm_call_logs or []
+        if not logs:
+            return
+
+        session_id = final_state.session.session_id
+
+        payloads = []
+        for log in logs:
+            if hasattr(log, "model_dump"):
+                payload = log.model_dump()
+            elif isinstance(log, dict):
+                payload = dict(log)
+            else:
+                continue
+            if not payload.get("session_id"):
+                payload["session_id"] = session_id
+            payloads.append(payload)
+
+        if payloads:
+            from app.services.llm_logger import fire_and_forget_logs
+            fire_and_forget_logs(payloads, session_id=session_id)
     except Exception as e:
         logger.warning(f"[stream_adapter] Submit LLM logs error: {e}")
