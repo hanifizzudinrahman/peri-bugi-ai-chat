@@ -47,8 +47,13 @@ async def send_llm_call_logs(
 
     # Phase 3: trace HTTP call as child observation.
     # NOTE: send_llm_call_logs dipanggil sebagai background task (asyncio.create_task)
-    # SETELAH "done" event di-yield. Saat ini, parent span sudah closed —
-    # span akan jadi standalone trace. Itu OK untuk fire-and-forget logging.
+    # SETELAH "done" event di-yield. Parent span (tanya-peri-message) sudah closed —
+    # span ini akan jadi standalone trace.
+    #
+    # FIX (Langfuse audit): Link standalone trace ke main session via update_trace.
+    # Sebelumnya: trace ini orphan, tidak filterable by session_id di Langfuse UI.
+    # Setelah fix: walaupun trace terpisah, session_id di trace property level
+    # supaya bisa di-search "tampilkan semua trace untuk session X".
     # Phase 4.5: pass body summary so log content visible per fire-and-forget trace
     from app.config.observability import trace_http_call
 
@@ -67,6 +72,18 @@ async def send_llm_call_logs(
         body_keys=["logs"],
         metadata={"log_count": len(logs)},
     ) as span:
+        # FIX (Langfuse audit): Link orphan trace ke main session_id.
+        # Tanpa ini, trace ini tidak bisa di-search by session di Langfuse UI.
+        if span and session_id:
+            try:
+                span.update_trace(
+                    session_id=session_id,
+                    tags=["fire-and-forget", "llm-logging"],
+                )
+            except Exception:
+                # Defensive — jangan block flow kalau update_trace gagal
+                pass
+
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(

@@ -445,11 +445,23 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
     memory_context = state.get("memory_context", {})
     retrieved_docs = state.get("retrieved_docs", []) or []
 
+    # FIX (Langfuse audit): Filter SystemMessage dari messages untuk trace
+    # supaya tidak duplicate dengan system_prompt arg yang sudah di-pass.
+    # Sebelumnya: system prompt muncul 2x di Langfuse UI (sebagai arg + sebagai messages[0]).
+    messages_for_trace = [m for m in lc_messages if not isinstance(m, SystemMessage)]
+
+    # FIX (Langfuse audit): Track actual input/output token counts dari LLM response.
+    # Sebelumnya: usage_details cuma report `output: chunk_count` (bukan token count).
+    # Akibat: trace report "0 prompt → 7 completion" padahal actual 539 prompt → 119 completion.
+    # Gemini API expose usage_metadata di chunks (terutama last chunk).
+    input_tokens_actual = 0
+    output_tokens_actual = 0
+
     async with trace_generation(
         name="generate",
         model=get_model_name(provider=_provider, model=_model),
         system_prompt=system_prompt,
-        messages=lc_messages,
+        messages=messages_for_trace,  # FIX: tanpa SystemMessage (avoid duplicate)
         user_message=user_msg_text,
         metadata={
             "agents_used": list(agent_results.keys()),
@@ -468,6 +480,20 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
     ) as gen_span:
         try:
             async for chunk in llm.astream(lc_messages, config=trace_config):
+                # FIX (Langfuse audit): Capture token counts dari API response.
+                # Gemini chunks may carry usage_metadata (terutama last chunk).
+                # Pakai max() supaya kalau muncul di multiple chunks, ambil yang terbesar.
+                usage_meta = getattr(chunk, "usage_metadata", None)
+                if usage_meta:
+                    input_tokens_actual = max(
+                        input_tokens_actual,
+                        usage_meta.get("input_tokens", 0) or 0,
+                    )
+                    output_tokens_actual = max(
+                        output_tokens_actual,
+                        usage_meta.get("output_tokens", 0) or 0,
+                    )
+
                 token = chunk.content
                 if not token:
                     continue
@@ -491,17 +517,31 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
         # Phase 4.5: tambah agent_results di metadata untuk full diagnostic
         if gen_span and success:
             try:
+                # FIX (Langfuse audit): Report actual token counts from API response.
+                # Fallback ke chunk count kalau API tidak expose usage_metadata.
+                # Naming follows Langfuse convention: "input"/"output" tokens.
+                usage_payload: dict = {}
+                if input_tokens_actual > 0:
+                    usage_payload["input"] = input_tokens_actual
+                if output_tokens_actual > 0:
+                    usage_payload["output"] = output_tokens_actual
+                else:
+                    # Fallback: chunk count (better than nothing, kalau API tidak expose)
+                    usage_payload["output"] = output_tokens
+
                 gen_span.update(
                     output=full_response[:5000] if full_response else "(empty)",
-                    usage_details={
-                        "output": output_tokens,  # approx token count
-                    },
+                    usage_details=usage_payload,
                     # Phase 4.5: capture agent_results in update metadata —
                     # diakses via "Additional Input" panel di Langfuse UI
                     metadata={
                         "agent_results_summary": _safe_dict_for_trace(agent_results),
                         "image_analysis_summary": _safe_dict_for_trace(image_analysis) if image_analysis else None,
                         "memory_context_summary": _safe_dict_for_trace(memory_context) if memory_context else None,
+                        # FIX (Langfuse audit): Track output_tokens accuracy untuk debug
+                        "output_chunks_yielded": output_tokens,
+                        "output_tokens_from_api": output_tokens_actual,
+                        "input_tokens_from_api": input_tokens_actual,
                     },
                 )
             except Exception:
