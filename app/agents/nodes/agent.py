@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -89,7 +89,7 @@ _MODE_LIMITS = {
 }
 
 
-def _build_system_prompt(state: AgentState) -> str:
+def _build_system_prompt(state: AgentState, tools: Optional[list] = None) -> str:
     """Build inline system prompt for agent_node.
 
     Step 2b: Pull prompt template from `state.prompts['agent_router_v2']` (DB).
@@ -97,6 +97,13 @@ def _build_system_prompt(state: AgentState) -> str:
 
     Variables di template (di-render via str.replace):
       {parent_name} {sapaan} {child_name}{age_str} {mode_limit}
+    
+    Bagian C v2 — Layer 1: Tool name guard injection.
+    Args:
+        state: AgentState
+        tools: List of bound tools (langchain Tool objects). Used to inject
+               strict "ONLY call these tools" guard untuk prevent halusinasi
+               tool name. Optional untuk backward compat.
     """
     # Build context vars (same logic regardless of DB or fallback prompt)
     ctx = state.user_context.model_dump() if state.user_context else {}
@@ -139,6 +146,9 @@ def _build_system_prompt(state: AgentState) -> str:
                     mem_parts.append(f"- {f.get('fact', '')}")
             rendered += "\n".join(mem_parts)
 
+        # Bagian C v2 — Layer 1: Inject strict tool guard
+        rendered += _build_tool_guard(tools, state)
+
         return rendered
 
     # ────────────────────────────────────────────────────────────────────────
@@ -172,7 +182,81 @@ def _build_system_prompt(state: AgentState) -> str:
             if isinstance(f, dict):
                 parts.append(f"- {f.get('fact', '')}")
 
-    return "\n".join(parts)
+    result = "\n".join(parts)
+    # Bagian C v2 — Layer 1: Inject strict tool guard
+    result += _build_tool_guard(tools, state)
+    return result
+
+
+def _build_tool_guard(tools: Optional[list], state: AgentState) -> str:
+    """Build strict tool name guard untuk prevent LLM hallucination.
+    
+    Bagian C v2 — Layer 1 defense:
+    LLM kadang halusinasi tool names karena training prior knowledge atau
+    conversation history leak. Guard ini explicit list tools yang ALLOWED
+    + tools yang TIDAK AVAILABLE (dari allowed_agents diff).
+    
+    Args:
+        tools: List of bound tools (langchain Tool objects). Each has .name attr.
+        state: AgentState — used untuk derive features yang OFF.
+    
+    Returns:
+        String to append to system prompt. Empty kalau tools=None (backward compat).
+    """
+    if not tools:
+        return ""
+    
+    available_tool_names = [getattr(t, "name", "") for t in tools]
+    available_tool_names = [n for n in available_tool_names if n]
+    
+    # Derive features yang OFF dari registry × allowed_agents
+    try:
+        from app.agents.tools.registry import iter_tool_specs, AGENT_KEY_TO_FEATURE_NAME
+        
+        all_specs = iter_tool_specs()
+        allowed_agents = set(state.control.allowed_agents or [])
+        
+        # Tools registered tapi required_agent TIDAK in allowed → OFF
+        unavailable_features = set()
+        for spec in all_specs:
+            if spec.required_agent and spec.required_agent not in allowed_agents:
+                feature = AGENT_KEY_TO_FEATURE_NAME.get(
+                    spec.agent_key, spec.agent_key.replace("_", " ").title()
+                )
+                unavailable_features.add(feature)
+    except Exception as e:
+        logger.warning(f"[_build_tool_guard] Failed to derive unavailable features: {e}")
+        unavailable_features = set()
+    
+    guard = (
+        "\n\n=== ATURAN STRICT TOOL CALLING (WAJIB DIIKUTI) ===\n"
+        f"Tools yang TERSEDIA untuk user ini ({len(available_tool_names)} tools):\n"
+    )
+    for name in available_tool_names:
+        guard += f"  ✓ {name}\n"
+    
+    if unavailable_features:
+        features_list = ", ".join(sorted(unavailable_features))
+        guard += (
+            f"\nFitur yang TIDAK AKTIF di akun user ini: {features_list}\n"
+            f"Tools-nya TIDAK ADA di list di atas dan TIDAK BOLEH dipanggil.\n"
+        )
+    
+    guard += (
+        "\nLARANGAN KERAS:\n"
+        "1. JANGAN panggil tool yang TIDAK ADA di list 'TERSEDIA' di atas. "
+        "Walaupun kamu 'tahu' tool itu pernah ada, JANGAN panggil.\n"
+        "2. JANGAN halusinasi nama tool (mis. mengarang nama tool dari memory "
+        "summary atau conversation history).\n"
+        "3. Kalau user tanya tentang fitur yang TIDAK AKTIF (lihat list di atas), "
+        "JANGAN coba panggil tool-nya. Cukup jawab langsung tanpa panggil tool — "
+        "kasih tahu user dengan ramah bahwa fitur tersebut belum tersedia.\n"
+        "4. Kalau ragu apakah pertanyaan user butuh tool, default-nya: "
+        "JANGAN panggil tool, jawab langsung.\n"
+        "=== END ATURAN ===\n"
+    )
+    
+    return guard
 
 
 def _extract_user_message_for_llm(state: AgentState) -> str:
@@ -347,7 +431,8 @@ async def agent_node(state: AgentState) -> dict[str, Any]:
         # Build messages: system prompt + last user message
         # We don't pass full history here — generate_node has full context.
         # agent_node's job is just tool selection, not response synthesis.
-        system_prompt = _build_system_prompt(state)
+        # Bagian C v2: pass tools untuk inject strict tool guard (Layer 1)
+        system_prompt = _build_system_prompt(state, tools=tools)
         messages_for_llm = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_message),

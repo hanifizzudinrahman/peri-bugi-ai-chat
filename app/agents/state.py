@@ -255,6 +255,14 @@ class AgentState(BaseModel):
     quick_reply_data: Optional[dict] = None
     suggestion_chips: Optional[list[str]] = None
 
+    # ── Bagian C v2: Tool unavailable tracking ───────────────────────────────
+    # unavailable_tools: list of tool names yang LLM panggil tapi tidak ada
+    # di tools_by_name (gated off via allowed_agents). tool_bridge_node detect
+    # via is_tool_unavailable_result() dan populate field ini supaya
+    # generate.py bisa inject "feature unavailable" warning ke system prompt.
+    # Pattern: ["get_cerita_progress", "get_brushing_stats", ...]
+    unavailable_tools: list[str] = Field(default_factory=list)
+
     # ── Audit & metrics ───────────────────────────────────────────────────────
     thinking_steps: list[ThinkingStep] = Field(default_factory=list)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)

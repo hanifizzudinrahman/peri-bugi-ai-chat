@@ -226,6 +226,45 @@ def _build_system_prompt(state: AgentState) -> str:
         if injection_text:
             system += injection_text
 
+    # Bagian C v2 — Layer 4: Inject "tool unavailable" warning ke system prompt
+    # Kalau LLM panggil tool yang tidak available (gated off via allowed_agents),
+    # tool_bridge_node sudah mark di state.unavailable_tools. Inject penjelasan
+    # ke LLM supaya kasih honest answer, bukan halusinasi data.
+    unavailable_tools = state.get("unavailable_tools", []) or []
+    if unavailable_tools:
+        from app.agents.tools.registry import get_friendly_feature_name
+
+        # Group by friendly feature name (deduplicate)
+        unavailable_features = []
+        seen_features = set()
+        for tool_name in unavailable_tools:
+            feature = get_friendly_feature_name(tool_name)
+            if feature not in seen_features:
+                unavailable_features.append(feature)
+                seen_features.add(feature)
+
+        features_text = ", ".join(unavailable_features)
+        system += (
+            f"\n\n⚠️ INSTRUKSI PENTING — FITUR TIDAK AKTIF:\n"
+            f"User mencoba mengakses fitur berikut yang TIDAK AKTIF di akun mereka: "
+            f"**{features_text}**.\n"
+            f"\n"
+            f"WAJIB:\n"
+            f"1. JANGAN karang/halusinasi data (jumlah modul selesai, badge, hasil scan, dll). "
+            f"Kamu TIDAK PUNYA data tentang fitur tersebut.\n"
+            f"2. Beri tahu user dengan ramah bahwa fitur '{features_text}' "
+            f"belum tersedia untuk akun mereka saat ini.\n"
+            f"3. Sarankan alternative: pertanyaan tentang kesehatan gigi umum, "
+            f"tips sikat gigi, atau fitur lain yang tersedia.\n"
+            f"4. JANGAN sebut alasan teknis (admin, allowed_agents, gated, dll) — "
+            f"cukup bilang 'belum tersedia'.\n"
+            f"\n"
+            f"Contoh respons baik:\n"
+            f"\"Maaf Hanif, saat ini fitur {features_text} belum tersedia di akun "
+            f"{child_name}. Tapi Peri masih bisa bantu jawab pertanyaan seputar "
+            f"kesehatan gigi atau tips sikat gigi anak ya! 🧚✨\""
+        )
+
     # NOTE: KB dental & FAQ docs inject lewat registry sekarang. Behavior 1:1
     # preserved — _inject_dental_kb dan _inject_app_faq di knowledge.py mirror
     # exact format string sebelumnya ("Referensi dari knowledge base:\n...").

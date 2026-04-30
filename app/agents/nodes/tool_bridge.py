@@ -135,7 +135,35 @@ async def tool_bridge_node(state: AgentState) -> dict[str, Any]:
                 unknown_tools.append(tool_name)
                 continue
 
-            # Audit record
+            # Bagian C v2: Layer 3 defense — detect "tool unavailable" result.
+            # LLM kadang halusinasi panggil tool yang tidak di-bind (gated off via
+            # allowed_agents). Tools_node return synthetic error msg untuk ini.
+            # Kita detect, mark di ctx.unavailable_tools, dan SKIP populate
+            # agent_results (supaya LLM tidak kira tool jalan dengan empty data).
+            from app.agents.tools.registry import is_tool_unavailable_result
+
+            if is_tool_unavailable_result(result):
+                logger.warning(
+                    f"[tool_bridge] LLM called unavailable tool '{tool_name}' — "
+                    f"feature gated off via allowed_agents. Marking di "
+                    f"ctx.unavailable_tools, NOT populating agent_results."
+                )
+                ctx.unavailable_tools.append(tool_name)
+
+                # Audit record (still log it untuk diagnostic)
+                new_tool_call_records.append(ToolCallRecord(
+                    tool=tool_name,
+                    agent=spec.agent_key,
+                    input={},
+                    result={
+                        "has_data": False,
+                        "error": "tool_unavailable",
+                        "needs_clarification": False,
+                    },
+                ))
+                continue  # SKIP bridge_handler — don't pollute agent_results
+
+            # Audit record (normal path)
             new_tool_call_records.append(ToolCallRecord(
                 tool=tool_name,
                 agent=spec.agent_key,
@@ -180,11 +208,17 @@ async def tool_bridge_node(state: AgentState) -> dict[str, Any]:
         if new_tool_call_records:
             update["tool_calls"] = [*state.tool_calls, *new_tool_call_records]
 
+        # Bagian C v2: Layer 3 — propagate unavailable_tools ke state supaya
+        # generate.py bisa inject warning ke system prompt.
+        if ctx.unavailable_tools:
+            update["unavailable_tools"] = ctx.unavailable_tools
+
         logger.info(
             f"[tool_bridge] Bridged {len(tool_messages)} tool result(s) "
             f"→ agent_results keys: {list(agent_results.keys())}, "
             f"needs_clarification={ctx.needs_clarification}"
             + (f", UNKNOWN_TOOLS={unknown_tools}" if unknown_tools else "")
+            + (f", UNAVAILABLE_TOOLS={ctx.unavailable_tools}" if ctx.unavailable_tools else "")
         )
 
         # Capture span output for diagnostic (B2 fix preserved)
@@ -196,7 +230,9 @@ async def tool_bridge_node(state: AgentState) -> dict[str, Any]:
                 "image_analysis_present": ctx.image_analysis is not None,
                 "scan_session_id": ctx.scan_session_id,
                 "tool_call_records_added": len(new_tool_call_records),
-                "unknown_tools": unknown_tools,  # diagnostic: surface bugs early
+                "unknown_tools": unknown_tools,
+                # Bagian C v2: surface unavailable tools untuk debug
+                "unavailable_tools": ctx.unavailable_tools,
             })
 
         return update

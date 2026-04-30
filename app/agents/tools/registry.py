@@ -59,12 +59,88 @@ class BridgeContext:
     
     Untuk tools yang perlu update field di luar agent_results
     (e.g., retrieved_docs, image_analysis, scan_session_id, needs_clarification).
+    
+    Bagian C v2: Added unavailable_tools — list tools yang LLM panggil
+    tapi tidak available (gated off via allowed_agents). Generate.py akan
+    inject warning ke system prompt supaya LLM kasih honest answer.
     """
     retrieved_docs: list = field(default_factory=list)
     image_analysis: Optional[dict] = None
     scan_session_id: Optional[str] = None
     needs_clarification: bool = False
     clarification_data: Optional[dict] = None
+    # Bagian C v2: track tools yang dipanggil tapi tidak available
+    unavailable_tools: list = field(default_factory=list)
+
+
+# =============================================================================
+# Tool unavailability detection — shared logic
+# =============================================================================
+
+# Pattern yang ditandai tools_node saat tool tidak ditemukan in tools_by_name.
+# See nodes/tools_node.py — `_missing` synthetic ToolMessage.
+_UNAVAILABLE_ERROR_MARKER = "not available for this user"
+
+
+def is_tool_unavailable_result(result: dict) -> bool:
+    """Check apakah tool result adalah error 'tool unavailable'.
+    
+    Tools_node generates synthetic error result saat LLM halusinasi panggil
+    tool yang tidak di-bind (karena gated off via allowed_agents). Format-nya:
+        {"error": "Tool 'X' not available for this user", "has_data": False}
+    
+    Bridge handler harus detect ini dan SKIP populate agent_results — supaya
+    LLM tidak kira tool berhasil tapi data kosong.
+    
+    Args:
+        result: Parsed dict dari ToolMessage.content
+    
+    Returns:
+        True kalau result adalah unavailable error.
+    """
+    if not isinstance(result, dict):
+        return False
+    error_msg = result.get("error", "") or ""
+    return _UNAVAILABLE_ERROR_MARKER in str(error_msg)
+
+
+# =============================================================================
+# Friendly feature names for user-facing messages
+# =============================================================================
+
+# Map agent_key (from allowed_agents) → friendly feature name (Indonesian).
+# Used by generate.py to compose "feature X tidak tersedia" messages.
+AGENT_KEY_TO_FEATURE_NAME = {
+    "kb_dental": "Konsultasi Kesehatan Gigi",
+    "app_faq": "Bantuan Aplikasi",
+    "user_profile": "Profil Pengguna",
+    "rapot_peri": "Rapot Sikat Gigi",
+    "rapot_peri_history": "Riwayat Sikat Gigi",
+    "rapot_peri_achievements": "Badge Sikat Gigi",
+    "caries_risk": "Kuesioner Risiko Karies",
+    "cerita_peri": "Cerita Peri",
+    "cerita_module_detail": "Modul Cerita Peri",
+    "mata_peri": "Mata Peri (Scan Gigi)",
+    "mata_peri_scan_detail": "Detail Hasil Scan",
+    "tips": "Tips Parenting Harian",
+}
+
+
+def get_friendly_feature_name(tool_name: str) -> str:
+    """Get user-facing feature name for a tool.
+    
+    Lookup via ToolSpec.agent_key → AGENT_KEY_TO_FEATURE_NAME.
+    Falls back to humanizing tool_name kalau tidak ada mapping.
+    """
+    spec = _REGISTRY.get(tool_name)
+    if spec is None:
+        # Tool tidak di-register — humanize tool_name
+        return tool_name.replace("_", " ").replace("get ", "").title()
+    
+    return AGENT_KEY_TO_FEATURE_NAME.get(
+        spec.agent_key,
+        spec.agent_key.replace("_", " ").title(),
+    )
 
 
 # =============================================================================
