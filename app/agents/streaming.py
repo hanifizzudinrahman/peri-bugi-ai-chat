@@ -308,17 +308,26 @@ async def _stream_internal(
             # generate_node yields SSE strings already (make_thinking_event, make_token_event,
             # make_clarify_event, make_quick_reply_event, make_suggestions_event)
             # NOTE: generate_node TIDAK yield make_done_event — itu tanggung jawab caller (kita).
-            # Track captured tokens untuk Langfuse output summary
-            if "data:" in sse_event and '"type":"token"' in sse_event:
-                captured["tokens"] += 1
+            #
+            # Track captured tokens untuk Langfuse output summary.
+            #
+            # SSE format (per app/schemas/chat.py:_sse):
+            #   data: {"event": "token", "data": "Halo"}\n\n
+            # Fields: "event" (event type) + "data" (payload, untuk token = string)
+            if "data:" in sse_event and '"event": "token"' in sse_event:
                 # Try extract token text untuk captured.text
                 try:
                     json_part = sse_event.split("data:", 1)[1].strip()
                     if json_part.endswith("\n\n"):
                         json_part = json_part.rstrip("\n")
                     parsed = json.loads(json_part)
-                    if parsed.get("type") == "token":
-                        captured["text"] += parsed.get("content", "") or parsed.get("token", "")
+                    if parsed.get("event") == "token":
+                        captured["tokens"] += 1
+                        # Field is "data" per _sse() helper, NOT "content"/"token".
+                        # For token events, data is the token string itself.
+                        token_text = parsed.get("data", "")
+                        if isinstance(token_text, str):
+                            captured["text"] += token_text
                 except Exception:
                     pass
             yield sse_event
