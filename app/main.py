@@ -363,7 +363,89 @@ async def memory_summarize(
         extract_topics_from_messages,
         send_summary_to_api,
     )
+    # FIX (Langfuse audit Bagian B4): Wrap memory job dengan parent span.
+    # Sebelumnya: memory_summarize jalan sebagai background task tanpa parent span.
+    # Trace muncul as "Unnamed trace" dengan ChatGoogleGenerativeAI orphan + http
+    # call orphan, TIDAK linked ke main session via session_id.
+    # Setelah fix: span "job:memory-summarize" muncul as proper parent + linked ke
+    # session via update_trace, supaya bisa di-search "tampilkan semua trace untuk
+    # session X" dan dapat memory summarize trace yang related.
+    from app.config.observability import get_langfuse_client
 
+    langfuse = get_langfuse_client()
+
+    if langfuse is None:
+        # Langfuse disabled — execute without trace wrapping
+        return await _do_memory_summarize(
+            request,
+            generate_session_summary,
+            extract_topics_from_messages,
+            send_summary_to_api,
+        )
+
+    # Langfuse enabled — wrap with parent span
+    try:
+        with langfuse.start_as_current_observation(
+            as_type="span",
+            name="job:memory-summarize",
+            input={
+                "session_id": request.session_id,
+                "messages_count": len(request.messages),
+                "agents_used": request.agents_used,
+            },
+        ) as span:
+            # CRITICAL: Link orphan trace ke main session_id supaya bisa di-search
+            # bersama main `tanya-peri-message` trace di Langfuse UI.
+            try:
+                span.update_trace(
+                    session_id=request.session_id,
+                    tags=["memory-summary", "background-job"],
+                    metadata={
+                        "agents_used": request.agents_used,
+                        "messages_count": len(request.messages),
+                    },
+                )
+            except Exception:
+                pass  # defensive
+
+            result = await _do_memory_summarize(
+                request,
+                generate_session_summary,
+                extract_topics_from_messages,
+                send_summary_to_api,
+            )
+
+            # Capture output for span
+            try:
+                span.update(output={
+                    "status": result.get("status"),
+                    "summary_length": result.get("summary_length", 0),
+                    "topics_count": len(result.get("topics", []) or []),
+                    "topics": result.get("topics", [])[:10],  # cap di 10 topics
+                })
+            except Exception:
+                pass
+
+            return result
+    except Exception as e:
+        # Trace setup failed — fallback to non-traced execution
+        # (jangan break flow karena tracing error)
+        return await _do_memory_summarize(
+            request,
+            generate_session_summary,
+            extract_topics_from_messages,
+            send_summary_to_api,
+        )
+
+
+async def _do_memory_summarize(
+    request,
+    generate_session_summary,
+    extract_topics_from_messages,
+    send_summary_to_api,
+):
+    """Pure logic — no trace setup. Extracted untuk B4 fix supaya bisa
+    di-call dengan/tanpa parent span wrapping."""
     summary_text = await generate_session_summary(
         session_id=request.session_id,
         user_id="",

@@ -162,18 +162,51 @@ def make_get_brushing_history_tool(user_id: Optional[str]):
                      compliance_percentage, current_streak
         - reason / fallback_message: only when has_data=False
         """
-        if not user_id:
-            return {
-                "has_data": False,
-                "reason": "no_user_id",
-                "fallback_message": "User ID tidak tersedia.",
-            }
+        # FIX (Langfuse audit Bagian B1): Add trace_node wrapper for consistency.
+        from app.config.observability import trace_node, _safe_dict_for_trace
 
-        path = f"/api/v1/internal/agent/brushing-history/{user_id}"
-        if month:
-            path += f"?month={month}"
+        async with trace_node(
+            name="tool:get_brushing_history",
+            state=None,
+            input_data={
+                "has_user_id": bool(user_id),
+                "month": month,
+            },
+        ) as span:
+            if not user_id:
+                result = {
+                    "has_data": False,
+                    "reason": "no_user_id",
+                    "fallback_message": "User ID tidak tersedia.",
+                }
+                if span:
+                    span.update(output={
+                        "has_data": False,
+                        "reason": "no_user_id",
+                    })
+                return result
 
-        return await call_internal_get(path)
+            path = f"/api/v1/internal/agent/brushing-history/{user_id}"
+            if month:
+                path += f"?month={month}"
+
+            data = await call_internal_get(path)
+
+            if span:
+                this_week = data.get("this_week") or {}
+                calendar = data.get("calendar") or {}
+                days_list = calendar.get("days") or []
+                span.update(output={
+                    "has_data": data.get("has_data", False),
+                    "month": data.get("month"),
+                    "days_in_calendar": len(days_list),
+                    "this_week_completed": this_week.get("completed_sessions"),
+                    "this_week_total": this_week.get("total_sessions"),
+                    "current_streak": this_week.get("current_streak"),
+                    "data": _safe_dict_for_trace(data),
+                })
+
+            return data
 
     return get_brushing_history
 
@@ -217,15 +250,45 @@ def make_get_brushing_achievements_tool(user_id: Optional[str]):
         - next_target: dict | null with milestone_days, label, days_remaining
         - achievements: list of {milestone_days, label, is_unlocked, achieved_at}
         """
-        if not user_id:
-            return {
-                "has_data": False,
-                "reason": "no_user_id",
-                "fallback_message": "User ID tidak tersedia.",
-            }
+        # FIX (Langfuse audit Bagian B1): Add trace_node wrapper for consistency.
+        from app.config.observability import trace_node, _safe_dict_for_trace
 
-        return await call_internal_get(
-            f"/api/v1/internal/agent/brushing-achievements/{user_id}"
-        )
+        async with trace_node(
+            name="tool:get_brushing_achievements",
+            state=None,
+            input_data={
+                "has_user_id": bool(user_id),
+            },
+        ) as span:
+            if not user_id:
+                result = {
+                    "has_data": False,
+                    "reason": "no_user_id",
+                    "fallback_message": "User ID tidak tersedia.",
+                }
+                if span:
+                    span.update(output={
+                        "has_data": False,
+                        "reason": "no_user_id",
+                    })
+                return result
+
+            data = await call_internal_get(
+                f"/api/v1/internal/agent/brushing-achievements/{user_id}"
+            )
+
+            if span:
+                next_target = data.get("next_target") or {}
+                span.update(output={
+                    "has_data": data.get("has_data", False),
+                    "current_streak": data.get("current_streak"),
+                    "total_unlocked": data.get("total_unlocked"),
+                    "total_available": data.get("total_available"),
+                    "next_target_label": next_target.get("label"),
+                    "next_target_days_remaining": next_target.get("days_remaining"),
+                    "data": _safe_dict_for_trace(data),
+                })
+
+            return data
 
     return get_brushing_achievements

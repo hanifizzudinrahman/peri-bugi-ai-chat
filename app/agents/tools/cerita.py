@@ -136,22 +136,60 @@ def make_get_cerita_module_detail_tool(user_id: Optional[str]):
         IMPORTANT: When module is locked, tell user when it will unlock — DO NOT
         provide any content from slides_summary.
         """
-        if not user_id:
-            return {
-                "has_data": False,
-                "reason": "no_user_id",
-                "fallback_message": "User ID tidak tersedia.",
-            }
+        # FIX (Langfuse audit Bagian B1): Add trace_node wrapper for consistency.
+        from app.config.observability import trace_node, _safe_dict_for_trace
 
-        if not isinstance(module_id, int) or module_id < 1 or module_id > 6:
-            return {
-                "has_data": False,
-                "reason": "invalid_module_id",
-                "fallback_message": "Modul Cerita Peri tersedia 1-6 saja.",
-            }
+        async with trace_node(
+            name="tool:get_cerita_module_detail",
+            state=None,
+            input_data={
+                "has_user_id": bool(user_id),
+                "module_id": module_id,
+            },
+        ) as span:
+            if not user_id:
+                result = {
+                    "has_data": False,
+                    "reason": "no_user_id",
+                    "fallback_message": "User ID tidak tersedia.",
+                }
+                if span:
+                    span.update(output={
+                        "has_data": False,
+                        "reason": "no_user_id",
+                    })
+                return result
 
-        return await call_internal_get(
-            f"/api/v1/internal/agent/cerita-module/{module_id}?user_id={user_id}"
-        )
+            if not isinstance(module_id, int) or module_id < 1 or module_id > 6:
+                result = {
+                    "has_data": False,
+                    "reason": "invalid_module_id",
+                    "fallback_message": "Modul Cerita Peri tersedia 1-6 saja.",
+                }
+                if span:
+                    span.update(output={
+                        "has_data": False,
+                        "reason": "invalid_module_id",
+                        "module_id_received": module_id,
+                    })
+                return result
+
+            data = await call_internal_get(
+                f"/api/v1/internal/agent/cerita-module/{module_id}?user_id={user_id}"
+            )
+
+            if span:
+                module = data.get("module") or {}
+                span.update(output={
+                    "has_data": data.get("has_data", False),
+                    "module_id": module.get("module_id"),
+                    "module_title": module.get("title"),
+                    "is_locked": module.get("is_locked"),
+                    "user_status": module.get("user_status"),
+                    # IMPORTANT: Don't dump full content if locked (sensitive)
+                    "data": _safe_dict_for_trace(data),
+                })
+
+            return data
 
     return get_cerita_module_detail

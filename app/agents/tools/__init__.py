@@ -103,6 +103,9 @@ def make_tools(state: AgentState) -> list[Any]:
 
     chat_message_id = state.session.chat_message_id
     trace_id = state.session.trace_id
+    # FIX (Langfuse audit Bagian B5): Extract session_id untuk threading ke
+    # analyze_chat_image factory → view_hint_detector trace.
+    session_id = state.session.session_id
 
     user_text = _extract_user_text(state)
 
@@ -169,6 +172,7 @@ def make_tools(state: AgentState) -> list[Any]:
             prompts=prompts,
             rnd_llm_provider=rnd_llm_provider,
             rnd_llm_model=rnd_llm_model,
+            session_id=session_id,  # FIX (Langfuse audit Bagian B5)
         ))
         # Phase 2 Tools Expansion
         tools.append(make_get_mata_peri_scan_detail_tool(user_id=user_id))

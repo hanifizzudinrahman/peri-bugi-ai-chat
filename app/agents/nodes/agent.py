@@ -217,15 +217,26 @@ async def agent_node(state: AgentState) -> dict[str, Any]:
     forced = state.forced_tool_calls or []
     is_smalltalk = state.is_smalltalk
 
+    # FIX (Langfuse audit Bagian B3): Enrich agent_node trace with diagnostic metadata.
+    # Compute tools_in_context info BEFORE entering trace_node — supaya bisa di-input.
+    # Note: make_tools(state) idempotent + cheap (just builds factory closures).
+    _mode = state.session.response_mode
+    _max_tools_map = {"simple": 1, "medium": 2, "detailed": 5}
+    _max_tools_for_mode = _max_tools_map.get(_mode, 1)
+
     async with trace_node(
-        name="agent_node",
+        name="node:agent",
         state=legacy_state_for_trace,
         input_data={
             "user_message": user_message[:500],
             "has_image": state.image is not None,
             "forced_tool_calls": [t.get("name") for t in forced],
             "is_smalltalk": is_smalltalk,
-            "response_mode": state.session.response_mode,
+            "response_mode": _mode,
+            # FIX (Langfuse audit Bagian B3): Add allowed_agents + tool count info
+            # supaya bisa debug "kenapa LLM tidak pilih tool X" — mungkin tidak in scope.
+            "allowed_agents": state.control.allowed_agents,
+            "max_tools_for_mode": _max_tools_for_mode,
         },
     ) as span:
         # ────────────────────────────────────────────────────────────────────
@@ -446,6 +457,13 @@ async def agent_node(state: AgentState) -> dict[str, Any]:
                 "tool_calls_count": len(ai_msg.tool_calls or []),
                 "latency_ms": latency_ms,
                 "success": success,
+                # FIX (Langfuse audit Bagian B3): Capture tool_args yang dipilih LLM
+                # supaya bisa debug "tool dipanggil dengan args yang aneh".
+                "tool_args": [tc.get("args") for tc in (ai_msg.tool_calls or [])],
+                # FIX (Langfuse audit Bagian B3): Capture tools_in_context count
+                # supaya bisa correlate "ada N tools available, LLM pilih X".
+                "tools_available_count": len(tools),
+                "tools_available_names": [getattr(t, "name", "") for t in tools],
                 # Phase 2a fix2: log stripped content for audit/debugging.
                 # Content is discarded from state.messages but kept here so
                 # we can verify Gemini prompt compliance via Langfuse trace.

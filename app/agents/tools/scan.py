@@ -160,6 +160,7 @@ def make_analyze_chat_image_tool(
     prompts: dict,
     rnd_llm_provider: Optional[str],
     rnd_llm_model: Optional[str],
+    session_id: Optional[str] = None,  # FIX (Langfuse audit Bagian B5): thread session_id
 ):
     """
     Factory: build analyze_chat_image tool with all auth/turn context as closures.
@@ -177,6 +178,8 @@ def make_analyze_chat_image_tool(
         prompts: Prompts dict (looks up "view_hint_classification")
         rnd_llm_provider: RnD-mode LLM provider override (top priority)
         rnd_llm_model: RnD-mode LLM model override (top priority)
+        session_id: Current session ID (FIX Langfuse audit Bagian B5) — used
+                    to thread session metadata into view_hint_detector trace.
 
     Returns:
         @tool decorated async function.
@@ -217,6 +220,7 @@ def make_analyze_chat_image_tool(
             prompts=prompts,
             rnd_llm_provider=rnd_llm_provider,
             rnd_llm_model=rnd_llm_model,
+            session_id=session_id,  # FIX (Langfuse audit Bagian B5): forward session_id
         )
 
     return analyze_chat_image
@@ -239,6 +243,7 @@ async def _analyze_chat_image_impl(
     prompts: dict,
     rnd_llm_provider: Optional[str],
     rnd_llm_model: Optional[str],
+    session_id: Optional[str] = None,  # FIX (Langfuse audit Bagian B5)
 ) -> dict[str, Any]:
     """
     Pure helper — analyze chat image with view_hint detection + CV pipeline.
@@ -301,12 +306,23 @@ async def _analyze_chat_image_impl(
 
             view_hint_prompt = (prompts or {}).get("view_hint_classification")
 
+            # FIX (Langfuse audit Bagian B5): Build state dict untuk detect_view_hint
+            # supaya LLM call view_hint_detector punya session_id + user_id metadata.
+            # Sebelumnya: state=None → orphan trace tanpa session linking.
+            # Setelah fix: trace muncul dengan session_id + user_id, searchable di Langfuse.
+            view_hint_state = None
+            if session_id or user_id:
+                view_hint_state = {
+                    "session_id": session_id,
+                    "user_context": {"user_id": user_id} if user_id else {},
+                }
+
             view_hint, decision_source = await detect_view_hint(
                 text=user_text or "",
                 llm_provider=llm_provider,
                 llm_model=llm_model,
                 prompt_template=view_hint_prompt,
-                state=None,  # tool layer tidak punya AgentState; trace masih jalan via parent
+                state=view_hint_state,  # FIX B5: pass state instead of None
             )
 
         # ===== Step 3a: Ambiguous → return clarification envelope =====
@@ -477,20 +493,54 @@ def make_get_mata_peri_scan_detail_tool(user_id: Optional[str]):
         IMPORTANT: When is_processing=True, tell user scan masih dianalisis.
         When requires_dentist_review=True, include this critical info in response.
         """
-        if not user_id:
-            return {
-                "has_data": False,
-                "reason": "no_user_id",
-                "fallback_message": "User ID tidak tersedia.",
-            }
+        # FIX (Langfuse audit Bagian B1): Add trace_node wrapper for consistency.
+        from app.config.observability import trace_node, _safe_dict_for_trace
 
-        # Build path
-        if session_id:
-            path = f"/api/v1/internal/agent/mata-peri-scan/{session_id}?user_id={user_id}"
-        else:
-            # "latest" sentinel value
-            path = f"/api/v1/internal/agent/mata-peri-scan/latest?user_id={user_id}"
+        async with trace_node(
+            name="tool:get_mata_peri_scan_detail",
+            state=None,
+            input_data={
+                "has_user_id": bool(user_id),
+                "session_id_provided": bool(session_id),
+                "session_id": session_id if session_id else "latest",
+            },
+        ) as span:
+            if not user_id:
+                result = {
+                    "has_data": False,
+                    "reason": "no_user_id",
+                    "fallback_message": "User ID tidak tersedia.",
+                }
+                if span:
+                    span.update(output={
+                        "has_data": False,
+                        "reason": "no_user_id",
+                    })
+                return result
 
-        return await call_internal_get(path)
+            # Build path
+            if session_id:
+                path = f"/api/v1/internal/agent/mata-peri-scan/{session_id}?user_id={user_id}"
+            else:
+                # "latest" sentinel value
+                path = f"/api/v1/internal/agent/mata-peri-scan/latest?user_id={user_id}"
+
+            data = await call_internal_get(path)
+
+            if span:
+                session = data.get("session") or {}
+                views = session.get("views") or []
+                span.update(output={
+                    "has_data": data.get("has_data", False),
+                    "session_id": session.get("session_id"),
+                    "is_processing": session.get("is_processing"),
+                    "summary_status": session.get("summary_status"),
+                    "worst_view_severity": session.get("worst_view_severity"),
+                    "requires_dentist_review": session.get("requires_dentist_review"),
+                    "views_count": len(views),
+                    "data": _safe_dict_for_trace(data),
+                })
+
+            return data
 
     return get_mata_peri_scan_detail

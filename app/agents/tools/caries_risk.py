@@ -58,15 +58,45 @@ def make_get_caries_risk_tool(user_id: Optional[str]):
         - submitted_at: ISO datetime string
         - reason / fallback_message: only when has_data=False
         """
-        if not user_id:
-            return {
-                "has_data": False,
-                "reason": "no_user_id",
-                "fallback_message": "User ID tidak tersedia.",
-            }
+        # FIX (Langfuse audit Bagian B1): Add trace_node wrapper for consistency
+        # dengan existing tools pattern (tool:get_brushing_stats, tool:get_user_profile, dll).
+        # Sebelumnya: tool execution invisible di trace tree, HTTP child span nempel ke agent_node.
+        # Sekarang: span "tool:get_caries_risk_latest" muncul as proper child di tools span.
+        from app.config.observability import trace_node, _safe_dict_for_trace
 
-        return await call_internal_get(
-            f"/api/v1/internal/agent/caries-risk/{user_id}"
-        )
+        async with trace_node(
+            name="tool:get_caries_risk_latest",
+            state=None,
+            input_data={
+                "has_user_id": bool(user_id),
+            },
+        ) as span:
+            if not user_id:
+                result = {
+                    "has_data": False,
+                    "reason": "no_user_id",
+                    "fallback_message": "User ID tidak tersedia.",
+                }
+                if span:
+                    span.update(output={
+                        "has_data": False,
+                        "reason": "no_user_id",
+                    })
+                return result
+
+            data = await call_internal_get(
+                f"/api/v1/internal/agent/caries-risk/{user_id}"
+            )
+
+            if span:
+                span.update(output={
+                    "has_data": data.get("has_data", False),
+                    "result_level": data.get("result_level"),
+                    "result_label": data.get("result_label"),
+                    "total_score": data.get("total_score"),
+                    "data": _safe_dict_for_trace(data),
+                })
+
+            return data
 
     return get_caries_risk_latest

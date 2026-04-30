@@ -144,48 +144,86 @@ async def pre_router_node(state: AgentState) -> dict[str, Any]:
         True = match smalltalk criteria → generate_node uses lean prompt path.
         False = normal flow.
     """
-    new_thinking = ThinkingStep(step=1, label="Memahami pertanyaanmu...", done=True)
-    thinking_update = [*state.thinking_steps, new_thinking]
+    # FIX (Langfuse audit Bagian B2): Wrap pre_router with trace_node for visibility.
+    # Sebelumnya: pre_router INVISIBLE di trace tree — tidak bisa lihat latency atau decision.
+    # Sekarang: span "node:pre_router" muncul as child of tanya-peri-message.
+    from app.config.observability import trace_node
 
-    forced: list[dict] = []
-    is_smalltalk: bool = False
-
-    # ────────────────────────────────────────────────────────────────────────
-    # Path 1: Image upload — force analyze_chat_image
-    # Image flow takes precedence over smalltalk (image always means analysis).
-    # ────────────────────────────────────────────────────────────────────────
-    if state.image is not None and state.image.image_url:
-        if "mata_peri" in (state.control.allowed_agents or []):
-            forced.append({
-                "name": "analyze_chat_image",
-                "args": {},  # no LLM-controlled args; tool reads from closure
-            })
-            logger.info(
-                f"[pre_router] Image detected, force analyze_chat_image. "
-                f"clarification_selected={state.image.clarification_selected}"
-            )
-        else:
-            logger.warning(
-                "[pre_router] Image detected but mata_peri not in allowed_agents — "
-                "agent_node will decide (image likely ignored)."
-            )
-
-    # ────────────────────────────────────────────────────────────────────────
-    # Path 2: Smalltalk detection (Step 2b)
-    # ONLY check if no image (image flow always wins).
-    # ────────────────────────────────────────────────────────────────────────
-    elif not forced:
-        user_message = _extract_user_message(state)
-        if _detect_smalltalk(user_message):
-            is_smalltalk = True
-            logger.info(
-                f"[pre_router] Smalltalk detected: '{user_message[:50]}' "
-                f"(words={len(user_message.split())}). "
-                f"generate_node will use lean prompt path."
-            )
-
-    return {
-        "thinking_steps": thinking_update,
-        "forced_tool_calls": forced,
-        "is_smalltalk": is_smalltalk,
+    legacy_state_for_trace = {
+        "session_id": state.session.session_id,
+        "user_context": state.user_context.model_dump() if state.user_context else {},
+        "response_mode": state.session.response_mode,
     }
+
+    user_message_preview = _extract_user_message(state)[:200] if state.image is None else ""
+
+    async with trace_node(
+        name="node:pre_router",
+        state=legacy_state_for_trace,
+        input_data={
+            "has_image": state.image is not None,
+            "has_clarification_selected": bool(
+                state.image.clarification_selected if state.image else None
+            ),
+            "user_text_preview": user_message_preview,
+            "allowed_agents": state.control.allowed_agents,
+        },
+    ) as span:
+        new_thinking = ThinkingStep(step=1, label="Memahami pertanyaanmu...", done=True)
+        thinking_update = [*state.thinking_steps, new_thinking]
+
+        forced: list[dict] = []
+        is_smalltalk: bool = False
+
+        # ────────────────────────────────────────────────────────────────────────
+        # Path 1: Image upload — force analyze_chat_image
+        # Image flow takes precedence over smalltalk (image always means analysis).
+        # ────────────────────────────────────────────────────────────────────────
+        if state.image is not None and state.image.image_url:
+            if "mata_peri" in (state.control.allowed_agents or []):
+                forced.append({
+                    "name": "analyze_chat_image",
+                    "args": {},  # no LLM-controlled args; tool reads from closure
+                })
+                logger.info(
+                    f"[pre_router] Image detected, force analyze_chat_image. "
+                    f"clarification_selected={state.image.clarification_selected}"
+                )
+            else:
+                logger.warning(
+                    "[pre_router] Image detected but mata_peri not in allowed_agents — "
+                    "agent_node will decide (image likely ignored)."
+                )
+
+        # ────────────────────────────────────────────────────────────────────────
+        # Path 2: Smalltalk detection (Step 2b)
+        # ONLY check if no image (image flow always wins).
+        # ────────────────────────────────────────────────────────────────────────
+        elif not forced:
+            user_message = _extract_user_message(state)
+            if _detect_smalltalk(user_message):
+                is_smalltalk = True
+                logger.info(
+                    f"[pre_router] Smalltalk detected: '{user_message[:50]}' "
+                    f"(words={len(user_message.split())}). "
+                    f"generate_node will use lean prompt path."
+                )
+
+        # FIX (Langfuse audit Bagian B2): Capture decision for diagnostic.
+        if span:
+            decision = (
+                "force_image" if forced else
+                "smalltalk" if is_smalltalk else
+                "passthrough"
+            )
+            span.update(output={
+                "decision": decision,
+                "forced_tool_calls": [f["name"] for f in forced],
+                "is_smalltalk": is_smalltalk,
+            })
+
+        return {
+            "thinking_steps": thinking_update,
+            "forced_tool_calls": forced,
+            "is_smalltalk": is_smalltalk,
+        }
