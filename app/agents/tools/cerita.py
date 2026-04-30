@@ -80,3 +80,78 @@ def make_get_cerita_progress_tool(user_id: Optional[str]):
             return data
 
     return get_cerita_progress
+
+
+# =============================================================================
+# Tool: get_cerita_module_detail (Phase 2 Tools Expansion)
+# =============================================================================
+
+def make_get_cerita_module_detail_tool(user_id: Optional[str]):
+    """
+    Factory: build get_cerita_module_detail tool.
+
+    CRITICAL: Tool RESPECT LOCK STATUS.
+    Cerita Peri = edukasi literasi bertahap (mingguan).
+    Tool tidak boleh kasih content modul yang masih LOCKED untuk user (no spoiler!).
+    """
+
+    @tool
+    async def get_cerita_module_detail(module_id: int) -> dict[str, Any]:
+        """Get DETAIL of a specific Cerita Peri module (literature content + quiz info).
+
+        Cerita Peri = staged literacy education on dental health.
+        6 modules per season, unlocking weekly after previous module completion.
+        Module unlock logic is RESPECTED — tool returns no content for locked modules.
+
+        ✅ USE THIS TOOL when the user asks about:
+        - "modul Tanda Masalah isinya apa?" (specific module by name)
+        - "cerita modul X ngajarin apa?"
+        - "ringkasan modul Cerita yang lagi anak baca?"
+        - "modul yang baru unlock topiknya apa?"
+        - "modul 4 isinya apa?" (specific module by number)
+
+        ❌ DO NOT use this tool when:
+        - User asks about progress (how many modules completed) → use get_cerita_progress
+        - User asks general dental topics → use search_dental_knowledge
+        - User does NOT specify which module → ask user to clarify which module
+
+        Args:
+            module_id: integer 1-6 (which module). MUST be int, not UUID or string.
+
+        Returns a dict with keys:
+        - has_data: bool
+        - module: dict with:
+          - module_id, title, subtitle, estimated_minutes
+          - is_locked: bool — IMPORTANT! Check this first
+          - user_status: "locked" | "available" | "in_progress" | "completed"
+          - IF locked:
+            - unlock_at: ISO datetime (when module unlocks)
+            - fallback_message: user-friendly message about unlock
+            - NO slides_summary (no spoiler!)
+          - IF unlocked (available/in_progress/completed):
+            - best_score, stars_earned, attempt_count, completed_at
+            - total_slides, total_quiz_questions
+            - slides_summary: list of {slide_order, headline, body_text}
+
+        IMPORTANT: When module is locked, tell user when it will unlock — DO NOT
+        provide any content from slides_summary.
+        """
+        if not user_id:
+            return {
+                "has_data": False,
+                "reason": "no_user_id",
+                "fallback_message": "User ID tidak tersedia.",
+            }
+
+        if not isinstance(module_id, int) or module_id < 1 or module_id > 6:
+            return {
+                "has_data": False,
+                "reason": "invalid_module_id",
+                "fallback_message": "Modul Cerita Peri tersedia 1-6 saja.",
+            }
+
+        return await call_internal_get(
+            f"/api/v1/internal/agent/cerita-module/{module_id}?user_id={user_id}"
+        )
+
+    return get_cerita_module_detail

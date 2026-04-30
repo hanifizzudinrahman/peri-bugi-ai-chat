@@ -415,3 +415,82 @@ async def _analyze_chat_image_impl(
                 "image_analysis": _safe_dict_for_trace(ai_response),
             })
         return result
+
+
+# =============================================================================
+# Tool: get_mata_peri_scan_detail (Phase 2 Tools Expansion)
+# =============================================================================
+
+def make_get_mata_peri_scan_detail_tool(user_id: Optional[str]):
+    """
+    Factory: build get_mata_peri_scan_detail tool.
+
+    Returns per-view scan findings (front/upper/lower/left/right) extracted from
+    AI pipeline result_json. Token-efficient: only user-relevant fields, no bbox/pixel coords.
+    """
+
+    @tool
+    async def get_mata_peri_scan_detail(session_id: Optional[str] = None) -> dict[str, Any]:
+        """Get DETAIL of a Mata Peri scan session — per-view findings (5 views).
+
+        Mata Peri scans 5 views: front (depan), upper (rahang atas), lower (rahang bawah),
+        left (kiri), right (kanan). Each view analyzed by AI for caries severity.
+
+        ✅ USE THIS TOOL when the user asks about:
+        - "hasil scan terakhir gimana?" (latest scan)
+        - "scan rahang atas anak saya gimana?" (specific view)
+        - "tanggal X scannya hasilnya apa?" (specific session)
+        - "rekomendasi dari scan terakhir apa?"
+        - "scan tadi pagi gimana hasilnya?"
+
+        ❌ DO NOT use this tool when:
+        - User just asks how many scans done → use get_scan_history (lighter, summary)
+        - User wants to do a NEW scan → tool is for existing scans only
+        - User asks about scan that doesn't exist → tool returns has_data=False
+
+        Args:
+            session_id: UUID string of the scan session, OR None to get latest scan
+                       (if None, tool will fetch user's most recent completed scan)
+
+        Returns a dict with keys:
+        - has_data: bool
+        - session: dict with:
+          - session_id, child_name, performed_at, completed_at
+          - is_processing: bool — True kalau scan masih dianalisis
+          - is_failed: bool — True kalau scan gagal dianalisis (kalau ada)
+          - summary_status: "ok" | "perlu_perhatian" | "segera_ke_dokter"
+          - summary_text, recommendation_text (already user-friendly Indonesian)
+          - confidence_overall: 0.0-1.0
+          - requires_dentist_review: bool (CRITICAL flag)
+          - worst_view_severity: "clean" | "moderate" | "severe" | "unknown"
+          - views: list of {
+              view_type ("front"|"upper"|"lower"|"left"|"right"),
+              view_label ("Tampak Depan", etc),
+              is_valid: bool,
+              severity ("clean"|"moderate"|"severe"|"unknown"),
+              severity_label (Indonesian),
+              clean_ratio (0.0-1.0, rounded 2 decimal),
+              teeth_detected_count, caries_detected_count,
+              invalid_reason (only if !is_valid)
+            }
+
+        IMPORTANT: When is_processing=True, tell user scan masih dianalisis.
+        When requires_dentist_review=True, include this critical info in response.
+        """
+        if not user_id:
+            return {
+                "has_data": False,
+                "reason": "no_user_id",
+                "fallback_message": "User ID tidak tersedia.",
+            }
+
+        # Build path
+        if session_id:
+            path = f"/api/v1/internal/agent/mata-peri-scan/{session_id}?user_id={user_id}"
+        else:
+            # "latest" sentinel value
+            path = f"/api/v1/internal/agent/mata-peri-scan/latest?user_id={user_id}"
+
+        return await call_internal_get(path)
+
+    return get_mata_peri_scan_detail

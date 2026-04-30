@@ -120,3 +120,112 @@ def make_get_brushing_stats_tool(
             return data
 
     return get_brushing_stats
+
+
+# =============================================================================
+# Tool: get_brushing_history (Phase 2 Tools Expansion)
+# =============================================================================
+
+def make_get_brushing_history_tool(user_id: Optional[str]):
+    """
+    Factory: build get_brushing_history tool.
+
+    Fetches monthly calendar + weekly stats for brushing history.
+    Reuses existing BrushingStatsService.get_calendar + .get_weekly_stats.
+    """
+
+    @tool
+    async def get_brushing_history(month: Optional[str] = None) -> dict[str, Any]:
+        """Get the child's BRUSHING HISTORY — monthly calendar + this week's stats.
+
+        ✅ USE THIS TOOL when the user asks about:
+        - "anak kemarin sikat ga?" (yesterday)
+        - "minggu ini anak sikat berapa hari?" (this week)
+        - "tanggal 15 anak sikat?" (specific date)
+        - "bulan ini progressnya gimana?" (monthly overview)
+        - "anak sikat di hari Senin Selasa Rabu kemarin?"
+
+        ❌ DO NOT use this tool when:
+        - User only asks about today's status / current streak → use get_brushing_stats (lighter)
+        - User asks about achievements/badges → use get_brushing_achievements
+        - User asks how to log brushing → use search_app_faq
+
+        Args:
+            month: format "YYYY-MM" (optional, default current month)
+
+        Returns a dict with keys:
+        - has_data: bool
+        - child_name: str
+        - month: "YYYY-MM" string
+        - calendar: dict with year, month, days (list of {date, morning, evening, complete})
+        - this_week: dict with week_start, week_end, completed_sessions, total_sessions,
+                     compliance_percentage, current_streak
+        - reason / fallback_message: only when has_data=False
+        """
+        if not user_id:
+            return {
+                "has_data": False,
+                "reason": "no_user_id",
+                "fallback_message": "User ID tidak tersedia.",
+            }
+
+        path = f"/api/v1/internal/agent/brushing-history/{user_id}"
+        if month:
+            path += f"?month={month}"
+
+        return await call_internal_get(path)
+
+    return get_brushing_history
+
+
+# =============================================================================
+# Tool: get_brushing_achievements (Phase 2 Tools Expansion)
+# =============================================================================
+
+def make_get_brushing_achievements_tool(user_id: Optional[str]):
+    """
+    Factory: build get_brushing_achievements tool.
+
+    Fetches list of all achievements (unlocked + locked) + next target.
+    Reuses existing BrushingService.get_achievements.
+    """
+
+    @tool
+    async def get_brushing_achievements() -> dict[str, Any]:
+        """Get the child's BRUSHING ACHIEVEMENTS / BADGES (milestone-based).
+
+        Achievements based on consecutive brushing days: 1, 3, 7, 14, 21, 30, 100, 365 days.
+
+        ✅ USE THIS TOOL when the user asks about:
+        - "anak saya udah dapat badge apa?"
+        - "achievement apa yang udah unlock?"
+        - "badge apa yang masih bisa didapat?"
+        - "anak saya udah pencapaian apa?"
+        - "tinggal berapa hari lagi anak dapat badge berikutnya?"
+
+        ❌ DO NOT use this tool when:
+        - User asks about general brushing progress / streak → use get_brushing_stats
+        - User asks about brushing history per day → use get_brushing_history
+        - User asks how to earn badges → use search_app_faq
+
+        Returns a dict with keys:
+        - has_data: bool
+        - child_name: str
+        - current_streak: int — current consecutive days
+        - total_unlocked: int — count of unlocked achievements
+        - total_available: int — total possible achievements (always 8)
+        - next_target: dict | null with milestone_days, label, days_remaining
+        - achievements: list of {milestone_days, label, is_unlocked, achieved_at}
+        """
+        if not user_id:
+            return {
+                "has_data": False,
+                "reason": "no_user_id",
+                "fallback_message": "User ID tidak tersedia.",
+            }
+
+        return await call_internal_get(
+            f"/api/v1/internal/agent/brushing-achievements/{user_id}"
+        )
+
+    return get_brushing_achievements

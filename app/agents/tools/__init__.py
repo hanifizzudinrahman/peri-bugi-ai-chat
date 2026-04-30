@@ -23,8 +23,14 @@ TOOL ↔ AGENT_KEY MAPPING (for allowed_agents filtering):
     app_faq      → search_app_faq
     user_profile → get_user_profile
     rapot_peri   → get_brushing_stats
+                   get_brushing_history          [NEW Phase 2 expansion]
+                   get_brushing_achievements     [NEW Phase 2 expansion]
+                   get_caries_risk_latest        [NEW Phase 2 expansion]
     cerita_peri  → get_cerita_progress
-    mata_peri    → get_scan_history + analyze_chat_image (both gated together)
+                   get_cerita_module_detail      [NEW Phase 2 expansion — RESPECT LOCK]
+    mata_peri    → get_scan_history + analyze_chat_image (existing)
+                   get_mata_peri_scan_detail     [NEW Phase 2 expansion]
+    tips         → get_parenting_tip_today       [NEW agent group + tool]
     janji_peri   → (Phase 6 — not implemented)
 """
 from __future__ import annotations
@@ -34,8 +40,16 @@ from typing import Any
 
 from app.agents.state import AgentState
 
-from app.agents.tools.brushing import make_get_brushing_stats_tool
-from app.agents.tools.cerita import make_get_cerita_progress_tool
+from app.agents.tools.brushing import (
+    make_get_brushing_stats_tool,
+    make_get_brushing_history_tool,        # NEW Phase 2 expansion
+    make_get_brushing_achievements_tool,   # NEW Phase 2 expansion
+)
+from app.agents.tools.caries_risk import make_get_caries_risk_tool  # NEW Phase 2 expansion
+from app.agents.tools.cerita import (
+    make_get_cerita_progress_tool,
+    make_get_cerita_module_detail_tool,    # NEW Phase 2 expansion
+)
 from app.agents.tools.knowledge import (
     make_search_app_faq_tool,
     make_search_dental_knowledge_tool,
@@ -44,7 +58,9 @@ from app.agents.tools.profile import make_get_user_profile_tool
 from app.agents.tools.scan import (
     make_analyze_chat_image_tool,
     make_get_scan_history_tool,
+    make_get_mata_peri_scan_detail_tool,   # NEW Phase 2 expansion
 )
+from app.agents.tools.tips import make_get_parenting_tip_today_tool  # NEW Phase 2 expansion (NEW agent group 'tips')
 
 logger = logging.getLogger(__name__)
 
@@ -125,12 +141,18 @@ def make_tools(state: AgentState) -> list[Any]:
             user_id=user_id,
             user_context=user_ctx_dump,
         ))
+        # Phase 2 Tools Expansion
+        tools.append(make_get_brushing_history_tool(user_id=user_id))
+        tools.append(make_get_brushing_achievements_tool(user_id=user_id))
+        tools.append(make_get_caries_risk_tool(user_id=user_id))
 
-    # ── Cerita Peri progress tool (gated by cerita_peri) ─────────────────────
+    # ── Cerita Peri tools (gated by cerita_peri) ─────────────────────────────
     if "cerita_peri" in allowed:
         tools.append(make_get_cerita_progress_tool(user_id=user_id))
+        # Phase 2 Tools Expansion (lock-aware)
+        tools.append(make_get_cerita_module_detail_tool(user_id=user_id))
 
-    # ── Mata Peri tools (gated by mata_peri — both history + analyze) ────────
+    # ── Mata Peri tools (gated by mata_peri — history + analyze + scan_detail) ─
     if "mata_peri" in allowed:
         tools.append(make_get_scan_history_tool(
             user_id=user_id,
@@ -148,6 +170,12 @@ def make_tools(state: AgentState) -> list[Any]:
             rnd_llm_provider=rnd_llm_provider,
             rnd_llm_model=rnd_llm_model,
         ))
+        # Phase 2 Tools Expansion
+        tools.append(make_get_mata_peri_scan_detail_tool(user_id=user_id))
+
+    # ── Tips Parenting tool (NEW agent group 'tips') ─────────────────────────
+    if "tips" in allowed:
+        tools.append(make_get_parenting_tip_today_tool(user_id=user_id))
 
     # ── janji_peri (Phase 6 — placeholder) ───────────────────────────────────
     # if "janji_peri" in allowed:
