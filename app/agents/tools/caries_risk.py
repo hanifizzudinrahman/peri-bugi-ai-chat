@@ -100,3 +100,65 @@ def make_get_caries_risk_tool(user_id: Optional[str]):
             return data
 
     return get_caries_risk_latest
+
+
+# =============================================================================
+# ToolSpec registration — Bagian C: registry pattern
+# =============================================================================
+from app.agents.tools.registry import ToolSpec, register_tool, BridgeContext
+
+
+def _bridge_caries_risk(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: caries risk → agent_results['caries_risk']."""
+    agent_results["caries_risk"] = result
+
+
+def _inject_caries_risk(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject caries risk questionnaire result to system prompt.
+    
+    CRITICAL: Sebelum fix, tool ini di-call tapi data dibuang — LLM halusinasi
+    jawaban tentang scan padahal user tanya kuesioner. Sekarang inject data REAL.
+    """
+    if not data or not data.get("has_data"):
+        if data and data.get("reason"):
+            return (
+                f"\n\nHasil kuesioner risiko karies {child_name}: BELUM PERNAH DIISI "
+                f"(reason: {data.get('reason')}). "
+                f"INSTRUKSI: Beri tahu user dengan jujur bahwa kuesioner belum diisi, "
+                f"sarankan mengisi via Beranda → Kuesioner Karies."
+            )
+        return ""
+    
+    total_score = data.get("total_score")
+    result_level = data.get("result_level")
+    result_label = data.get("result_label")
+    recommendation = data.get("recommendation")
+    submitted_at = data.get("submitted_at")
+    
+    text = (
+        f"\n\nHasil kuesioner risiko karies {child_name} (dari tool call — DATA TEPAT):"
+        f"\n- Skor total: {total_score}"
+        f"\n- Level risiko: {result_label} ({result_level})"
+        f"\n- Tanggal isi kuesioner: {submitted_at}"
+    )
+    
+    if recommendation:
+        text += f"\n- Rekomendasi: {recommendation}"
+    
+    text += (
+        f"\n\nINSTRUKSI: Pakai data ini untuk jawab user. JANGAN bingungkan dengan "
+        f"hasil scan Mata Peri (itu beda hal). Kuesioner karies = self-assessment, "
+        f"scan Mata Peri = analisis foto gigi."
+    )
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_caries_risk_latest",
+    agent_key="caries_risk",
+    required_agent="rapot_peri",  # gated under rapot_peri block in tools/__init__.py
+    bridge_handler=_bridge_caries_risk,
+    prompt_injector=_inject_caries_risk,
+    thinking_label="Mengecek hasil kuesioner risiko karies...",
+))

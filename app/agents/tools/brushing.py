@@ -292,3 +292,178 @@ def make_get_brushing_achievements_tool(user_id: Optional[str]):
             return data
 
     return get_brushing_achievements
+
+
+# =============================================================================
+# ToolSpec registrations — Bagian C: registry pattern
+# =============================================================================
+from app.agents.tools.registry import ToolSpec, register_tool, BridgeContext
+
+
+# ── get_brushing_stats ──────────────────────────────────────────────────────
+
+def _bridge_brushing_stats(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: stats result → agent_results['rapot_peri']."""
+    agent_results["rapot_peri"] = result
+
+
+def _inject_brushing_stats(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject brushing stats (streak, best_streak, achievements) to system prompt.
+    
+    CRITICAL — sebelumnya tool result HILANG (di-bridge tapi tidak di-consume).
+    Fix Bagian C: inject ke system prompt supaya LLM bisa jawab dengan data tepat.
+    """
+    if not data or not data.get("has_data"):
+        return ""
+    
+    streak = data.get("streak") or {}
+    current_streak = streak.get("current_streak", 0)
+    best_streak = streak.get("best_streak", 0)
+    weekly = data.get("weekly_summary") or {}
+    achievements = data.get("achievements") or []
+    
+    text = (
+        f"\n\nData rapot sikat gigi {child_name} (LATEST dari tool call):"
+        f"\n- Streak saat ini: {current_streak} hari"
+        f"\n- Rekor terbaik: {best_streak} hari"
+    )
+    if weekly:
+        text += (
+            f"\n- Minggu ini: {weekly.get('completed_sessions', 0)} dari "
+            f"{weekly.get('total_sessions', 14)} sesi sikat gigi tercatat"
+        )
+    if achievements:
+        unlocked = [a for a in achievements if a.get("is_unlocked")]
+        text += f"\n- Total badge unlocked: {len(unlocked)} dari {len(achievements)}"
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_brushing_stats",
+    agent_key="rapot_peri",
+    required_agent="rapot_peri",
+    bridge_handler=_bridge_brushing_stats,
+    prompt_injector=_inject_brushing_stats,
+    thinking_label="Mengecek rapot sikat gigi...",
+))
+
+
+# ── get_brushing_history ────────────────────────────────────────────────────
+
+def _bridge_brushing_history(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: history result → agent_results['rapot_peri_history'].
+    
+    Pakai key terpisah (bukan 'rapot_peri') supaya stats + history bisa coexist.
+    """
+    agent_results["rapot_peri_history"] = result
+
+
+def _inject_brushing_history(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject brushing history (calendar + weekly) to system prompt."""
+    if not data or not data.get("has_data"):
+        # Loud signal ke LLM bahwa tool returned empty/error
+        if data and data.get("reason"):
+            return (
+                f"\n\nData history sikat gigi {child_name}: TIDAK TERSEDIA "
+                f"(reason: {data.get('reason')}). "
+                f"JANGAN karang data — kasih tahu user dengan jujur."
+            )
+        return ""
+    
+    month = data.get("month", "-")
+    calendar = data.get("calendar") or {}
+    days = calendar.get("days") or []
+    this_week = data.get("this_week") or {}
+    
+    # Hitung total hari dengan brushing tercatat di bulan tersebut
+    days_with_brushing = sum(
+        1 for d in days if d.get("morning") or d.get("evening")
+    )
+    
+    text = (
+        f"\n\nData history sikat gigi {child_name} (bulan {month}, dari tool call):"
+        f"\n- Total hari dengan sikat gigi tercatat: {days_with_brushing} dari {len(days)} hari"
+        f"\n- Minggu ini: {this_week.get('completed_sessions', 0)} sesi tercatat "
+        f"(streak: {this_week.get('current_streak', 0)} hari)"
+    )
+    
+    # Detail per-hari (cap di 10 hari terakhir untuk avoid prompt bloat)
+    if days:
+        recent_days = days[-10:]
+        detail_lines = []
+        for d in recent_days:
+            date = d.get("date")
+            morning = "✓" if d.get("morning") else "✗"
+            evening = "✓" if d.get("evening") else "✗"
+            detail_lines.append(f"  {date}: pagi={morning} malam={evening}")
+        text += f"\n- Detail 10 hari terakhir:\n" + "\n".join(detail_lines)
+    
+    text += (
+        f"\n\nPENTING: Pakai data ini untuk jawab pertanyaan tanggal spesifik. "
+        f"Kalau tanggal tidak ada di list di atas, artinya BELUM ADA DATA, "
+        f"BUKAN belum sikat. Jawab dengan jujur."
+    )
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_brushing_history",
+    agent_key="rapot_peri_history",
+    required_agent="rapot_peri",
+    bridge_handler=_bridge_brushing_history,
+    prompt_injector=_inject_brushing_history,
+    thinking_label="Mengecek riwayat sikat gigi...",
+))
+
+
+# ── get_brushing_achievements ───────────────────────────────────────────────
+
+def _bridge_brushing_achievements(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: achievements result → agent_results['rapot_peri_achievements']."""
+    agent_results["rapot_peri_achievements"] = result
+
+
+def _inject_brushing_achievements(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject achievements (badges unlocked + next target) to system prompt."""
+    if not data or not data.get("has_data"):
+        return ""
+    
+    current_streak = data.get("current_streak", 0)
+    total_unlocked = data.get("total_unlocked", 0)
+    total_available = data.get("total_available", 0)
+    next_target = data.get("next_target") or {}
+    achievements = data.get("achievements") or []
+    
+    text = (
+        f"\n\nData badge/achievement {child_name} (dari tool call):"
+        f"\n- Streak saat ini: {current_streak} hari"
+        f"\n- Total badge unlocked: {total_unlocked} dari {total_available}"
+    )
+    
+    # List badges yang unlocked
+    unlocked = [a for a in achievements if a.get("is_unlocked")]
+    if unlocked:
+        names = [a.get("label") for a in unlocked if a.get("label")]
+        text += f"\n- Badge yang sudah diraih: {', '.join(names)}"
+    else:
+        text += f"\n- BELUM ADA BADGE yang diraih (streak masih {current_streak} hari)"
+    
+    if next_target:
+        text += (
+            f"\n- Target berikutnya: {next_target.get('label')} "
+            f"({next_target.get('days_remaining', 0)} hari lagi)"
+        )
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_brushing_achievements",
+    agent_key="rapot_peri_achievements",
+    required_agent="rapot_peri",
+    bridge_handler=_bridge_brushing_achievements,
+    prompt_injector=_inject_brushing_achievements,
+    thinking_label="Mengecek badge sikat gigi...",
+))

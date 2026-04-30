@@ -94,3 +94,44 @@ def make_get_parenting_tip_today_tool(user_id: Optional[str]):
             return data
 
     return get_parenting_tip_today
+
+
+# =============================================================================
+# ToolSpec registration — Bagian C: registry pattern
+# =============================================================================
+from app.agents.tools.registry import ToolSpec, register_tool, BridgeContext
+
+
+def _bridge_tips(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: tip → agent_results['tips']."""
+    agent_results["tips"] = result
+
+
+def _inject_tips(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject parenting tip to system prompt."""
+    if not data or not data.get("has_data"):
+        return ""
+    
+    tip = data.get("tip") or {}
+    title = tip.get("title", "-")
+    content = tip.get("content", "-")
+    category = tip.get("category", "-")
+    
+    return (
+        f"\n\nTips parenting hari ini (dari tool call):"
+        f"\n- Kategori: {category}"
+        f"\n- Judul: \"{title}\""
+        f"\n- Isi: {content}"
+        f"\n\nINSTRUKSI: Pakai tip ini sebagai source utama jawaban. "
+        f"Boleh sederhanakan bahasa, tapi JANGAN ubah substansi tip."
+    )
+
+
+register_tool(ToolSpec(
+    tool_name="get_parenting_tip_today",
+    agent_key="tips",
+    required_agent="tips",
+    bridge_handler=_bridge_tips,
+    prompt_injector=_inject_tips,
+    thinking_label="Mencari tips hari ini...",
+))

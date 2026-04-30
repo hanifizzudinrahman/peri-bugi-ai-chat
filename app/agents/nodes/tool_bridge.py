@@ -1,30 +1,22 @@
 """
-Tool bridge node — Phase 2 Step 2a
+Tool Bridge — Phase 2 Step 2a (Bagian C: now uses registry pattern)
 
-Runs AFTER tools_node (LangGraph prebuilt ToolNode). Maps tool outputs
-(stored as ToolMessage in state.messages) to LEGACY state fields that
-generate_node still reads:
+Purpose:
+    Convert ToolMessage outputs from tools_node into legacy state fields
+    yang dipakai oleh generate_node (agent_results, retrieved_docs, etc.).
 
-    state.agent_results       (keyed by legacy agent_key, not tool name)
-    state.retrieved_docs       (kb_dental docs, separate field)
-    state.image_analysis       (mata_peri scan result)
-    state.scan_session_id      (mata_peri scan session id)
-    state.needs_clarification  (mata_peri ambiguous view_hint)
-    state.clarification_data   (ClarificationCard payload)
+Why a separate node:
+    LangGraph add_messages reducer hanya append ToolMessage ke state.messages.
+    Tapi generate.py butuh data ter-struktur di agent_results, image_analysis,
+    retrieved_docs, dll. Tool_bridge translate ToolMessage → legacy state.
 
-This bridge keeps generate_node 100% unchanged in Step 2a. Step 6 (refactor
-generate.py) will eliminate this bridge by making generate read from
-state.messages directly.
+Bagian C refactor (architectural):
+    Sebelum: hardcode _TOOL_TO_AGENT_KEY dict + if/elif per tool.
+    Sesudah: lookup via tool registry. Setiap ToolSpec sudah declare
+    bridge_handler-nya sendiri di tool file. Bridge cuma orchestrate.
 
-TOOL → LEGACY KEY MAPPING:
-    search_dental_knowledge → agent_results["kb_dental"] + retrieved_docs
-    search_app_faq          → agent_results["app_faq"]
-    get_brushing_stats      → agent_results["rapot_peri"]
-    get_cerita_progress     → agent_results["cerita_peri"]
-    get_scan_history        → agent_results["mata_peri"]
-    analyze_chat_image      → agent_results["mata_peri"] + image_analysis +
-                              scan_session_id + (clarification fields if needed)
-    get_user_profile        → agent_results["user_profile"]
+    Benefit: tambah tool baru = update 1 file (tool's own file), tidak
+    perlu sentuh tool_bridge.py lagi.
 """
 from __future__ import annotations
 
@@ -35,20 +27,10 @@ from typing import Any
 from langchain_core.messages import ToolMessage
 
 from app.agents.state import AgentState, ToolCallRecord
+# Bagian C: import registry
+from app.agents.tools.registry import get_tool_spec, BridgeContext
 
 logger = logging.getLogger(__name__)
-
-
-# Tool name → legacy agent_key mapping
-_TOOL_TO_AGENT_KEY = {
-    "search_dental_knowledge": "kb_dental",
-    "search_app_faq": "app_faq",
-    "get_brushing_stats": "rapot_peri",
-    "get_cerita_progress": "cerita_peri",
-    "get_scan_history": "mata_peri",
-    "analyze_chat_image": "mata_peri",
-    "get_user_profile": "user_profile",
-}
 
 
 def _parse_tool_content(content: Any) -> dict:
@@ -74,10 +56,19 @@ async def tool_bridge_node(state: AgentState) -> dict[str, Any]:
     Reads recent ToolMessage entries from state.messages (those added by
     tools_node), converts them to legacy state fields, returns partial
     state update.
+
+    Bagian C: Setiap tool's bridge logic di-define di file tool itu sendiri
+    (via ToolSpec.bridge_handler). Node ini cuma:
+    1. Find recent ToolMessages
+    2. Lookup ToolSpec dari registry
+    3. Call spec.bridge_handler(parsed, agent_results, ctx)
+    4. Build state update dict
     """
+    # FIX (Langfuse audit Bagian B2): Wrap tool_bridge with trace_node for visibility.
+    from app.config.observability import trace_node
+
     # Find ToolMessages from this turn — they are the most recent ones
     # appended after the AIMessage with tool_calls.
-    # We walk state.messages from the end until we hit the AIMessage.
     tool_messages: list[ToolMessage] = []
     for msg in reversed(state.messages):
         if isinstance(msg, ToolMessage):
@@ -93,11 +84,6 @@ async def tool_bridge_node(state: AgentState) -> dict[str, Any]:
         # Pass through with no state changes.
         logger.debug("[tool_bridge] No ToolMessages found — pass through.")
         return {}
-
-    # FIX (Langfuse audit Bagian B2): Wrap tool_bridge with trace_node for visibility.
-    # Sebelumnya: bridging logic INVISIBLE — sulit debug "kenapa agent_results gak terisi?"
-    # Sekarang: span "node:tool_bridge" muncul + capture mapping decisions.
-    from app.config.observability import trace_node
 
     legacy_state_for_trace = {
         "session_id": state.session.session_id,
@@ -115,27 +101,44 @@ async def tool_bridge_node(state: AgentState) -> dict[str, Any]:
     ) as span:
         # Build state update incrementally
         agent_results: dict[str, Any] = dict(state.agent_results or {})
-        retrieved_docs: list = list(state.retrieved_docs or [])
-        image_analysis = state.image_analysis
-        scan_session_id = state.scan_session_id
-        needs_clarification = state.needs_clarification
-        clarification_data = state.clarification_data
         new_tool_call_records: list[ToolCallRecord] = []
         agents_selected_set: list[str] = list(state.agents_selected or [])
+
+        # Bagian C: BridgeContext untuk capture non-agent_results state updates
+        # (retrieved_docs, image_analysis, scan_session_id, clarification_data).
+        # Initialize with current state values supaya tools yang tidak update
+        # field tertentu tetap preserve existing value.
+        ctx = BridgeContext(
+            retrieved_docs=list(state.retrieved_docs or []),
+            image_analysis=state.image_analysis,
+            scan_session_id=state.scan_session_id,
+            needs_clarification=state.needs_clarification,
+            clarification_data=state.clarification_data,
+        )
+
+        unknown_tools: list[str] = []  # collect for end-of-loop loud error
 
         for tm in tool_messages:
             tool_name = tm.name or ""
             result = _parse_tool_content(tm.content)
-            agent_key = _TOOL_TO_AGENT_KEY.get(tool_name)
 
-            if not agent_key:
-                logger.warning(f"[tool_bridge] Unknown tool name: {tool_name!r} — skip")
+            # Bagian C: lookup ToolSpec dari registry
+            spec = get_tool_spec(tool_name)
+            if spec is None:
+                # Loud signal — tool executed but tidak ada ToolSpec.
+                # Ini bug — developer harus tambah ToolSpec di tool file.
+                logger.error(
+                    f"[tool_bridge] Tool '{tool_name}' executed tapi tidak terdaftar "
+                    f"di registry. Tambah ToolSpec di tools/<file>.py untuk fix. "
+                    f"Tool result akan di-DROP — LLM akan halusinasi tanpa data!"
+                )
+                unknown_tools.append(tool_name)
                 continue
 
             # Audit record
             new_tool_call_records.append(ToolCallRecord(
                 tool=tool_name,
-                agent=agent_key,
+                agent=spec.agent_key,
                 input={},  # ToolNode doesn't preserve input; agent_node trace has it
                 result={
                     "has_data": result.get("has_data"),
@@ -145,89 +148,55 @@ async def tool_bridge_node(state: AgentState) -> dict[str, Any]:
             ))
 
             # Update agents_selected (legacy field — generate.py uses for "agents_used" metadata)
-            if agent_key not in agents_selected_set:
-                agents_selected_set.append(agent_key)
+            if spec.agent_key not in agents_selected_set:
+                agents_selected_set.append(spec.agent_key)
 
-            # Tool-specific bridging
-            if tool_name == "search_dental_knowledge":
-                docs = result.get("docs", []) or []
-                agent_results["kb_dental"] = {
-                    "docs": docs,
-                    "source_count": result.get("source_count", len(docs)),
-                }
-                if docs:
-                    retrieved_docs = docs
-
-            elif tool_name == "search_app_faq":
-                agent_results["app_faq"] = {
-                    "docs": result.get("docs", []),
-                    "source_count": result.get("source_count", 0),
-                }
-
-            elif tool_name == "get_brushing_stats":
-                agent_results["rapot_peri"] = result
-
-            elif tool_name == "get_cerita_progress":
-                agent_results["cerita_peri"] = result
-
-            elif tool_name == "get_scan_history":
-                agent_results["mata_peri"] = result
-
-            elif tool_name == "analyze_chat_image":
-                # Special — clarification flow OR success OR failure
-                if result.get("needs_clarification"):
-                    needs_clarification = True
-                    clarification_data = result.get("clarification_data")
-                    # Also record in agent_results so generate has visibility
-                    agent_results["mata_peri"] = result
-                    logger.info(
-                        "[tool_bridge] analyze_chat_image needs_clarification — "
-                        "set state.needs_clarification=True"
-                    )
-                elif result.get("has_data"):
-                    # Success — extract image_analysis + scan_session_id
-                    image_analysis = result.get("image_analysis")
-                    scan_session_id = result.get("scan_session_id")
-                    agent_results["mata_peri"] = result
-                else:
-                    # Failure (mode=new_scan_failed) — preserve fallback_text in agent_results
-                    agent_results["mata_peri"] = result
-
-            elif tool_name == "get_user_profile":
-                agent_results["user_profile"] = result
+            # Bagian C: delegate ke spec.bridge_handler
+            try:
+                spec.bridge_handler(result, agent_results, ctx)
+            except Exception as e:
+                logger.error(
+                    f"[tool_bridge] Bridge handler for '{tool_name}' raised: {e}",
+                    exc_info=True,
+                )
+                # Don't fail the entire turn — log and continue with empty result
+                # Tool result effectively dropped, but at least main flow doesn't crash.
 
         # Build state update — only include fields that changed
         update: dict[str, Any] = {
             "agent_results": agent_results,
             "agents_selected": agents_selected_set,
         }
-        if retrieved_docs != list(state.retrieved_docs or []):
-            update["retrieved_docs"] = retrieved_docs
-        if image_analysis is not None and image_analysis != state.image_analysis:
-            update["image_analysis"] = image_analysis
-        if scan_session_id and scan_session_id != state.scan_session_id:
-            update["scan_session_id"] = scan_session_id
-        if needs_clarification != state.needs_clarification:
-            update["needs_clarification"] = needs_clarification
-        if clarification_data is not None and clarification_data != state.clarification_data:
-            update["clarification_data"] = clarification_data
+        if ctx.retrieved_docs != list(state.retrieved_docs or []):
+            update["retrieved_docs"] = ctx.retrieved_docs
+        if ctx.image_analysis is not None and ctx.image_analysis != state.image_analysis:
+            update["image_analysis"] = ctx.image_analysis
+        if ctx.scan_session_id and ctx.scan_session_id != state.scan_session_id:
+            update["scan_session_id"] = ctx.scan_session_id
+        if ctx.needs_clarification != state.needs_clarification:
+            update["needs_clarification"] = ctx.needs_clarification
+        if ctx.clarification_data is not None and ctx.clarification_data != state.clarification_data:
+            update["clarification_data"] = ctx.clarification_data
         if new_tool_call_records:
             update["tool_calls"] = [*state.tool_calls, *new_tool_call_records]
 
         logger.info(
             f"[tool_bridge] Bridged {len(tool_messages)} tool result(s) "
             f"→ agent_results keys: {list(agent_results.keys())}, "
-            f"needs_clarification={needs_clarification}"
+            f"needs_clarification={ctx.needs_clarification}"
+            + (f", UNKNOWN_TOOLS={unknown_tools}" if unknown_tools else "")
         )
-        # FIX (Langfuse audit Bagian B2): Capture bridging decisions for diagnostic.
+
+        # Capture span output for diagnostic (B2 fix preserved)
         if span:
             span.update(output={
                 "agent_results_keys": list(agent_results.keys()),
-                "retrieved_docs_count": len(retrieved_docs),
-                "needs_clarification": needs_clarification,
-                "image_analysis_present": image_analysis is not None,
-                "scan_session_id": scan_session_id,
+                "retrieved_docs_count": len(ctx.retrieved_docs),
+                "needs_clarification": ctx.needs_clarification,
+                "image_analysis_present": ctx.image_analysis is not None,
+                "scan_session_id": ctx.scan_session_id,
                 "tool_call_records_added": len(new_tool_call_records),
+                "unknown_tools": unknown_tools,  # diagnostic: surface bugs early
             })
 
         return update

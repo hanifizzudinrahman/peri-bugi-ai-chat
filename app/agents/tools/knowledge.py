@@ -209,3 +209,71 @@ def make_search_app_faq_tool(
             return {"docs": docs, "source_count": len(docs)}
 
     return search_app_faq
+
+
+# =============================================================================
+# ToolSpec registration — Bagian C: registry pattern
+# =============================================================================
+from app.agents.tools.registry import ToolSpec, register_tool, BridgeContext
+
+
+# ── search_dental_knowledge ─────────────────────────────────────────────────
+
+def _bridge_dental_kb(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: extract docs to agent_results['kb_dental'] + update retrieved_docs."""
+    docs = result.get("docs", []) or []
+    agent_results["kb_dental"] = {
+        "docs": docs,
+        "source_count": result.get("source_count", len(docs)),
+    }
+    if docs:
+        ctx.retrieved_docs = docs
+
+
+def _inject_dental_kb(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject KB dental docs to system prompt as 'Referensi dari knowledge base'."""
+    docs = (data or {}).get("docs", []) or []
+    if not docs:
+        return ""
+    # Take top 3, mirror existing generate.py behavior (lines 105-108 baseline)
+    docs_text = "\n\n".join(docs[:3])
+    return f"\n\nReferensi dari knowledge base:\n{docs_text}"
+
+
+register_tool(ToolSpec(
+    tool_name="search_dental_knowledge",
+    agent_key="kb_dental",
+    required_agent="kb_dental",
+    bridge_handler=_bridge_dental_kb,
+    prompt_injector=_inject_dental_kb,
+    thinking_label="Mencari info kesehatan gigi...",
+))
+
+
+# ── search_app_faq ──────────────────────────────────────────────────────────
+
+def _bridge_app_faq(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: extract FAQ docs to agent_results['app_faq']."""
+    agent_results["app_faq"] = {
+        "docs": result.get("docs", []),
+        "source_count": result.get("source_count", 0),
+    }
+
+
+def _inject_app_faq(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject FAQ docs to system prompt as 'Info aplikasi yang relevan'."""
+    docs = (data or {}).get("docs", []) or []
+    if not docs:
+        return ""
+    faq_text = "\n\n".join(docs[:3])
+    return f"\n\nInfo aplikasi yang relevan:\n{faq_text}"
+
+
+register_tool(ToolSpec(
+    tool_name="search_app_faq",
+    agent_key="app_faq",
+    required_agent="app_faq",
+    bridge_handler=_bridge_app_faq,
+    prompt_injector=_inject_app_faq,
+    thinking_label="Mencari info aplikasi...",
+))

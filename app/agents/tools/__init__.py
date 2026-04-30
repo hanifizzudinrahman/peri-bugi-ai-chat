@@ -194,3 +194,48 @@ def make_tools(state: AgentState) -> list[Any]:
 
 # Re-export for convenience
 __all__ = ["make_tools"]
+
+
+# =============================================================================
+# Bagian C: Registry validation at import time
+# =============================================================================
+# Setiap tool module (knowledge.py, brushing.py, dll) sudah call register_tool()
+# saat di-import di atas. Verify bahwa semua expected tools ter-register.
+# Kalau ada tool yang factory-nya ada tapi ToolSpec belum di-declare, fail fast
+# di startup instead of silent halusinasi at runtime.
+
+from app.agents.tools.registry import validate_registry, get_registered_tool_names
+
+# Expected tools — synced dengan factory imports + make_tools() di atas.
+# Kalau tambah tool baru, tambah ke list ini AND ke factory di make_tools().
+_EXPECTED_TOOL_NAMES = [
+    # KB / FAQ
+    "search_dental_knowledge",
+    "search_app_faq",
+    # Profile
+    "get_user_profile",
+    # Rapot Peri (brushing)
+    "get_brushing_stats",
+    "get_brushing_history",
+    "get_brushing_achievements",
+    "get_caries_risk_latest",  # piggyback rapot_peri permission
+    # Cerita Peri
+    "get_cerita_progress",
+    "get_cerita_module_detail",
+    # Mata Peri
+    "get_scan_history",
+    "analyze_chat_image",
+    "get_mata_peri_scan_detail",
+    # Tips
+    "get_parenting_tip_today",
+]
+
+try:
+    validate_registry(_EXPECTED_TOOL_NAMES)
+except RuntimeError as e:
+    # Loud — but don't crash app startup. Log critical so operator can see.
+    logger.critical(
+        f"[tools] Registry validation FAILED at startup: {e}\n"
+        f"Currently registered: {get_registered_tool_names()}\n"
+        f"Tools dengan missing ToolSpec akan halusinasi — fix sebelum production!"
+    )

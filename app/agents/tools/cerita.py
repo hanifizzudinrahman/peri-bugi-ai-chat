@@ -193,3 +193,135 @@ def make_get_cerita_module_detail_tool(user_id: Optional[str]):
             return data
 
     return get_cerita_module_detail
+
+
+# =============================================================================
+# ToolSpec registrations — Bagian C: registry pattern
+# =============================================================================
+from app.agents.tools.registry import ToolSpec, register_tool, BridgeContext
+
+
+# ── get_cerita_progress ─────────────────────────────────────────────────────
+
+def _bridge_cerita_progress(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: progress result → agent_results['cerita_peri']."""
+    agent_results["cerita_peri"] = result
+
+
+def _inject_cerita_progress(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject Cerita Peri progress (modul completed + current modul) to system prompt."""
+    if not data or not data.get("has_data"):
+        return ""
+    
+    completed = data.get("completed_modules", 0) or data.get("modules_completed", 0)
+    total = data.get("total_modules", 6)
+    current_modul = data.get("current_modul") or data.get("current_module") or {}
+    
+    text = (
+        f"\n\nData progress Cerita Peri {child_name} (dari tool call):"
+        f"\n- Modul selesai: {completed} dari {total}"
+    )
+    if current_modul:
+        text += (
+            f"\n- Modul saat ini: {current_modul.get('title', '-')} "
+            f"(status: {current_modul.get('user_status', '-')})"
+        )
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_cerita_progress",
+    agent_key="cerita_peri",
+    required_agent="cerita_peri",
+    bridge_handler=_bridge_cerita_progress,
+    prompt_injector=_inject_cerita_progress,
+    thinking_label="Mengecek progress Cerita Peri...",
+))
+
+
+# ── get_cerita_module_detail (THE BUG TOOL — was completely missing!) ───────
+
+def _bridge_cerita_module_detail(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: module detail result → agent_results['cerita_module_detail'].
+    
+    Pakai key terpisah dari 'cerita_peri' (progress) supaya bisa coexist.
+    """
+    agent_results["cerita_module_detail"] = result
+
+
+def _inject_cerita_module_detail(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject specific Cerita module detail to system prompt.
+    
+    CRITICAL: Sebelum fix, tool ini di-call tapi data dibuang. LLM halusinasi
+    karang title module. Sekarang inject data REAL ke prompt.
+    """
+    if not data or not data.get("has_data"):
+        return ""
+    
+    module = data.get("module") or {}
+    module_id = module.get("module_id")
+    title = module.get("title", "-")
+    subtitle = module.get("subtitle", "-")
+    is_locked = module.get("is_locked", False)
+    user_status = module.get("user_status", "unknown")
+    
+    text = (
+        f"\n\nDetail Modul Cerita Peri (dari tool call — DATA TEPAT, JANGAN KARANG):"
+        f"\n- Modul ID: {module_id}"
+        f"\n- Judul: \"{title}\""
+        f"\n- Subtitle: \"{subtitle}\""
+        f"\n- Status: {user_status}"
+    )
+    
+    if is_locked:
+        fallback_msg = module.get("fallback_message", "")
+        unlock_at = module.get("unlock_at")
+        text += (
+            f"\n\n⚠️ MODUL INI MASIH TERKUNCI."
+            f"\n- {fallback_msg}"
+        )
+        if unlock_at:
+            text += f"\n- Unlock pada: {unlock_at}"
+        text += (
+            f"\n\nINSTRUKSI: Beri tahu user bahwa modul masih terkunci. "
+            f"JANGAN spoiler isi modul. Sarankan selesaikan modul sebelumnya."
+        )
+    else:
+        # Unlocked — boleh include slides_summary kalau ada
+        slides_summary = module.get("slides_summary") or []
+        estimated_minutes = module.get("estimated_minutes")
+        best_score = module.get("best_score")
+        stars_earned = module.get("stars_earned")
+        
+        if estimated_minutes:
+            text += f"\n- Estimasi waktu baca: {estimated_minutes} menit"
+        if best_score is not None:
+            text += f"\n- Skor terbaik: {best_score}"
+        if stars_earned is not None:
+            text += f"\n- Bintang didapat: {stars_earned}"
+        
+        if slides_summary:
+            slides_text = "\n".join(
+                f"  Slide {s.get('slide_order')}: {s.get('headline', '-')} — "
+                f"{(s.get('body_text') or '')[:150]}"
+                for s in slides_summary[:5]  # cap di 5 slides untuk hemat token
+            )
+            text += f"\n- Ringkasan konten:\n{slides_text}"
+        
+        text += (
+            f"\n\nINSTRUKSI: Pakai data title + subtitle + ringkasan konten "
+            f"untuk jawab user. JANGAN karang isi modul yang tidak ada di list ini."
+        )
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_cerita_module_detail",
+    agent_key="cerita_module_detail",
+    required_agent="cerita_peri",
+    bridge_handler=_bridge_cerita_module_detail,
+    prompt_injector=_inject_cerita_module_detail,
+    thinking_label="Mengecek detail modul Cerita...",
+))

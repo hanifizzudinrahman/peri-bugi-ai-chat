@@ -168,22 +168,76 @@ def _build_system_prompt(state: AgentState) -> str:
         )
         system += f"\n\nYang kamu ketahui tentang user ini:\n{facts_text}"
 
-    # ── Agent results ─────────────────────────────────────────────────────────
+    # ── Agent results (Bagian C: registry-driven prompt injection) ────────────
     agent_results = state.get("agent_results", {})
 
-    # KB Dental docs
-    kb_result = agent_results.get("kb_dental", {})
-    kb_docs = kb_result.get("docs", []) or state.get("retrieved_docs", [])
-    if kb_docs:
-        docs_text = "\n\n".join(kb_docs[:3])
-        system += f"\n\nReferensi dari knowledge base:\n{docs_text}"
+    # FIX (Bagian C): Loop semua ToolSpec yang punya prompt_injector dan inject
+    # data dari agent_results ke system prompt. Ini fix CRITICAL BUG dimana
+    # tool result sebelumnya HILANG (di-bridge tapi tidak di-consume), bikin
+    # LLM halusinasi. Sekarang setiap tool inject data-nya sendiri.
+    #
+    # KENAPA pakai loop instead of inline if/elif:
+    # - Tambah tool baru = update 1 file (tool itu sendiri), tidak perlu sentuh generate.py
+    # - Impossible to forget — registry validate at startup
+    # - Pattern consistent untuk all tools
+    from app.agents.tools.registry import iter_tool_specs
 
-    # App FAQ docs
-    faq_result = agent_results.get("app_faq", {})
-    faq_docs = faq_result.get("docs", [])
-    if faq_docs:
-        faq_text = "\n\n".join(faq_docs[:3])
-        system += f"\n\nInfo aplikasi yang relevan:\n{faq_text}"
+    response_mode = state.get("response_mode", "simple")
+    
+    # SAFETY: ensure registry populated. iter_tool_specs() returns empty list
+    # kalau tools/__init__.py belum di-import (edge case in test/standalone). 
+    # Force-import to trigger registration.
+    _all_specs = iter_tool_specs()
+    if not _all_specs:
+        try:
+            import app.agents.tools  # noqa: F401 — trigger __init__ side effects
+            _all_specs = iter_tool_specs()
+            if not _all_specs:
+                logger.error(
+                    "[generate] Tool registry KOSONG setelah force-import. "
+                    "Tool injection skipped — LLM akan halusinasi tanpa data!"
+                )
+        except Exception as e:
+            logger.error(f"[generate] Failed to force-load tools registry: {e}")
+            _all_specs = []
+    
+    for spec in _all_specs:
+        if spec.prompt_injector is None:
+            # Tool tidak butuh prompt injection (e.g., analyze_chat_image
+            # pakai template terpisah di bawah)
+            continue
+
+        agent_data = agent_results.get(spec.agent_key)
+        if not agent_data:
+            # Tool tidak di-call this turn, atau result-nya empty
+            continue
+
+        try:
+            injection_text = spec.prompt_injector(
+                agent_data, child_name, prompts, response_mode
+            )
+        except Exception as e:
+            logger.error(
+                f"[generate] prompt_injector for '{spec.tool_name}' raised: {e}",
+                exc_info=True,
+            )
+            injection_text = ""
+
+        if injection_text:
+            system += injection_text
+
+    # NOTE: KB dental & FAQ docs inject lewat registry sekarang. Behavior 1:1
+    # preserved — _inject_dental_kb dan _inject_app_faq di knowledge.py mirror
+    # exact format string sebelumnya ("Referensi dari knowledge base:\n...").
+    # Backward compat untuk legacy retrieved_docs (pre-Phase 2) handled below.
+
+    # Backward compat — kalau ada retrieved_docs di state tapi tidak ke-inject
+    # via kb_dental (e.g., dari old retrieve_node yang masih ada), inject manual.
+    if not agent_results.get("kb_dental") and state.get("retrieved_docs"):
+        legacy_docs = state.get("retrieved_docs", [])[:3]
+        if legacy_docs:
+            docs_text = "\n\n".join(legacy_docs)
+            system += f"\n\nReferensi dari knowledge base:\n{docs_text}"
 
     # Image analysis (Mata Peri agent - Phase 2 / Tanya Peri image - Phase 4 Batch B)
     # Phase 6: prompts pindah ke DB — dipilih berdasarkan response_mode.

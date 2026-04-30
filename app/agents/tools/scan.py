@@ -544,3 +544,145 @@ def make_get_mata_peri_scan_detail_tool(user_id: Optional[str]):
             return data
 
     return get_mata_peri_scan_detail
+
+
+# =============================================================================
+# ToolSpec registrations — Bagian C: registry pattern
+# =============================================================================
+from app.agents.tools.registry import ToolSpec, register_tool, BridgeContext
+
+
+# ── get_scan_history ────────────────────────────────────────────────────────
+
+def _bridge_scan_history(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: scan history → agent_results['mata_peri']."""
+    agent_results["mata_peri"] = result
+
+
+def _inject_scan_history(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject scan history (list of recent scans) to system prompt."""
+    if not data or not data.get("has_data"):
+        return ""
+    
+    sessions = data.get("sessions") or []
+    if not sessions:
+        return ""
+    
+    text = f"\n\nData history scan Mata Peri {child_name} (dari tool call):"
+    text += f"\n- Total scan tersimpan: {len(sessions)}"
+    
+    # Show latest 5 sessions
+    for i, sess in enumerate(sessions[:5]):
+        date = sess.get("performed_at") or sess.get("completed_at", "-")
+        status = sess.get("summary_status", "-")
+        text += f"\n  {i+1}. {date} — Status: {status}"
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_scan_history",
+    agent_key="mata_peri",
+    required_agent="mata_peri",
+    bridge_handler=_bridge_scan_history,
+    prompt_injector=_inject_scan_history,
+    thinking_label="Mengecek riwayat scan...",
+))
+
+
+# ── analyze_chat_image (special — updates ctx fields) ───────────────────────
+
+def _bridge_analyze_chat_image(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: analyze_chat_image — special handling untuk clarification + success + failure.
+    
+    Mirror existing tool_bridge.py logic line 157-175.
+    """
+    if result.get("needs_clarification"):
+        # User butuh pilih view dulu
+        ctx.needs_clarification = True
+        ctx.clarification_data = result.get("clarification_data")
+        agent_results["mata_peri"] = result
+    elif result.get("has_data"):
+        # Success — extract image_analysis + scan_session_id
+        ctx.image_analysis = result.get("image_analysis")
+        ctx.scan_session_id = result.get("scan_session_id")
+        agent_results["mata_peri"] = result
+    else:
+        # Failure mode — preserve fallback_text
+        agent_results["mata_peri"] = result
+
+
+# NOTE: analyze_chat_image TIDAK punya prompt_injector — image_analysis di-inject
+# via separate logic di generate.py (template-based, lebih kompleks). Setting
+# prompt_injector=None disengaja.
+
+register_tool(ToolSpec(
+    tool_name="analyze_chat_image",
+    agent_key="mata_peri",
+    required_agent="mata_peri",
+    bridge_handler=_bridge_analyze_chat_image,
+    prompt_injector=None,  # image_analysis path di generate.py, bukan via injector
+    thinking_label="Menganalisis foto gigi...",
+))
+
+
+# ── get_mata_peri_scan_detail ───────────────────────────────────────────────
+
+def _bridge_scan_detail(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: scan detail → agent_results['mata_peri_scan_detail']."""
+    agent_results["mata_peri_scan_detail"] = result
+
+
+def _inject_scan_detail(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject specific scan detail to system prompt."""
+    if not data or not data.get("has_data"):
+        return ""
+    
+    session = data.get("session") or {}
+    is_processing = session.get("is_processing", False)
+    
+    text = f"\n\nDetail Scan Mata Peri {child_name} (dari tool call):"
+    text += f"\n- Session ID: {session.get('session_id', '-')}"
+    text += f"\n- Tanggal: {session.get('performed_at') or session.get('completed_at', '-')}"
+    
+    if is_processing:
+        text += (
+            f"\n- ⚠️ STATUS: Masih dalam proses analisis"
+            f"\n  Beri tahu user untuk tunggu sebentar."
+        )
+        return text
+    
+    summary_status = session.get("summary_status", "-")
+    summary_text = session.get("summary_text", "-")
+    rec_text = session.get("recommendation_text", "-")
+    requires_review = session.get("requires_dentist_review", False)
+    worst_severity = session.get("worst_view_severity", "-")
+    
+    text += f"\n- Status: {summary_status}"
+    text += f"\n- Severity terburuk: {worst_severity}"
+    text += f"\n- Ringkasan: {summary_text}"
+    text += f"\n- Rekomendasi: {rec_text}"
+    
+    if requires_review:
+        text += f"\n- 🚨 PERLU PEMERIKSAAN DOKTER GIGI"
+    
+    # Per-view findings (cap untuk hemat token)
+    views = session.get("views") or []
+    if views:
+        text += f"\n- Detail per view ({len(views)} views):"
+        for v in views[:5]:
+            view_label = v.get("view_label", v.get("view_type", "-"))
+            severity = v.get("severity_label") or v.get("severity", "-")
+            text += f"\n  • {view_label}: {severity}"
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_mata_peri_scan_detail",
+    agent_key="mata_peri_scan_detail",
+    required_agent="mata_peri",
+    bridge_handler=_bridge_scan_detail,
+    prompt_injector=_inject_scan_detail,
+    thinking_label="Membaca detail hasil scan...",
+))

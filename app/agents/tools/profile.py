@@ -102,3 +102,55 @@ def make_get_user_profile_tool(user_context: dict):
             return result
 
     return get_user_profile
+
+
+# =============================================================================
+# ToolSpec registration — Bagian C: registry pattern
+# =============================================================================
+from app.agents.tools.registry import ToolSpec, register_tool, BridgeContext
+
+
+def _bridge_user_profile(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: user_profile result → agent_results['user_profile']."""
+    agent_results["user_profile"] = result
+
+
+def _inject_user_profile(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject user profile to system prompt.
+    
+    NOTE: User profile sudah di-auto-inject via user_context di generate.py
+    (lines 55-83 baseline). prompt_injector di sini fungsi-nya redundant
+    untuk most cases, tapi kasih signal bahwa tool returned valid data.
+    """
+    if not data:
+        return ""
+    
+    # Don't duplicate — user_context udah di system prompt.
+    # Just confirm the LLM that profile was checked, kalau perlu inject specific
+    # data yang TIDAK ada di user_context (e.g., gender, full_name yang lengkap).
+    parent = data.get("parent") or {}
+    child = data.get("child") or {}
+    
+    # Hanya inject kalau ada data yang BELUM ada di system prompt
+    extras = []
+    if parent.get("gender"):
+        extras.append(f"Orang tua gender: {parent.get('gender')}")
+    if child.get("gender"):
+        extras.append(f"Anak gender: {child.get('gender')}")
+    if child.get("birth_date"):
+        extras.append(f"Tanggal lahir anak: {child.get('birth_date')}")
+    
+    if not extras:
+        return ""
+    
+    return f"\n\nData profil tambahan (dari tool):\n- " + "\n- ".join(extras)
+
+
+register_tool(ToolSpec(
+    tool_name="get_user_profile",
+    agent_key="user_profile",
+    required_agent="user_profile",
+    bridge_handler=_bridge_user_profile,
+    prompt_injector=_inject_user_profile,
+    thinking_label="Membaca profil...",
+))
