@@ -51,3 +51,7 @@ python-jose[cryptography]==3.3.0
 tenacity==9.0.0
 structlog==24.4.0
 python-multipart==0.0.20
+
+# Timezone data — required for Python `zoneinfo` stdlib module to work
+# inside slim/cuda Docker images yang tidak punya system tzdata.
+tzdata>=2024.1

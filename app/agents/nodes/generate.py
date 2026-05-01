@@ -16,7 +16,9 @@ Update v3 (Step 2b):
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator
+from zoneinfo import ZoneInfo
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -32,6 +34,203 @@ from app.schemas.chat import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Bagian C v6 — Phase 1: Foundation Blocks
+# ═════════════════════════════════════════════════════════════════════════════
+# Pattern: Foundation blocks di-inject paling ATAS system prompt (sebelum
+# persona) supaya LLM lihat aturan dasar duluan. Pattern ini mirror best practice
+# OpenAI Assistants & Anthropic Claude system prompts: time context + behavioral
+# rules → persona → data → instructions.
+#
+# Foundation 1 (TIME): KONTEKS WAKTU — generated per-turn, supaya LLM tau
+#   "hari ini", "kemarin", "besok" tanggal berapa. Anti-halu untuk pertanyaan
+#   tentang masa depan / past dates.
+#
+# Foundation 2 (ANTI-HALU): Aturan keras tentang JANGAN karang data. Hardcoded
+#   karena ini technical guardrail — kalau di-edit di admin prompt accidentally,
+#   LLM mulai halu.
+#
+# Foundation 3 (BAHASA): Bahasa ibu-friendly — anak SD/SMP/SMA. Hardcoded juga
+#   karena ini target audience character, bukan persona detail.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Bahasa Indonesia day & month names — for natural readable date format
+_HARI_INDO = {
+    0: "Senin",
+    1: "Selasa",
+    2: "Rabu",
+    3: "Kamis",
+    4: "Jumat",
+    5: "Sabtu",
+    6: "Minggu",
+}
+
+_BULAN_INDO = {
+    1: "Januari", 2: "Februari", 3: "Maret", 4: "April",
+    5: "Mei", 6: "Juni", 7: "Juli", 8: "Agustus",
+    9: "September", 10: "Oktober", 11: "November", 12: "Desember",
+}
+
+
+def _build_time_context_block(timezone_str: str = "Asia/Jakarta") -> str:
+    """Build KONTEKS WAKTU block — Foundation 1.
+    
+    Generated PER-TURN, supaya kalau conversation lintas hari (misal mulai jam
+    23:55 Selasa, lanjut jam 00:30 Rabu), "hari ini" tetap akurat.
+    
+    Resilience:
+    - Try ZoneInfo first (proper DST handling kalau timezone non-Indonesia).
+    - Kalau ZoneInfo fail (tzdata missing, etc.) → fallback ke fixed offset
+      (Indonesia tidak ada DST, jadi offset tetap aman).
+    - Kalau semua fail → final fallback pakai datetime.now() naive +
+      asumsi WIB (UTC+7).
+    Bulletproof: function ini TIDAK BOLEH raise exception — dipanggil setiap
+    request, kalau error = service down.
+    
+    Args:
+        timezone_str: Timezone IANA string. Default Asia/Jakarta (WIB).
+                     Future: bisa pass dari user_context kalau Hanif tambah
+                     field timezone di profile.
+    
+    Returns:
+        Multi-line string block ready to append to system prompt.
+    """
+    # Indonesia timezone offsets (Indonesia tidak punya DST, fixed forever)
+    _ID_OFFSETS = {
+        "Asia/Jakarta": (timedelta(hours=7), "WIB"),
+        "Asia/Pontianak": (timedelta(hours=7), "WIB"),
+        "Asia/Makassar": (timedelta(hours=8), "WITA"),
+        "Asia/Jayapura": (timedelta(hours=9), "WIT"),
+    }
+    
+    try:
+        now = None
+        tz_label = "WIB"
+        
+        # Layer 1: Try ZoneInfo (proper DST aware untuk multi-region future)
+        try:
+            tz = ZoneInfo(timezone_str)
+            now = datetime.now(tz)
+            # Determine label
+            if timezone_str in _ID_OFFSETS:
+                tz_label = _ID_OFFSETS[timezone_str][1]
+            else:
+                # Non-Indonesia timezone — fallback label dari abbreviation
+                tz_label = now.tzname() or "LOCAL"
+        except Exception:
+            # Layer 2: ZoneInfo failed (e.g., tzdata missing) — fallback fixed offset
+            try:
+                offset, label = _ID_OFFSETS.get(
+                    timezone_str, _ID_OFFSETS["Asia/Jakarta"]
+                )
+                tz = timezone(offset)
+                now = datetime.now(tz)
+                tz_label = label
+            except Exception:
+                # Layer 3: Even timezone() failed (very unlikely) — final fallback
+                # Pakai naive UTC + manual offset, tag sebagai WIB.
+                now = datetime.utcnow() + timedelta(hours=7)
+                tz_label = "WIB"
+        
+        today = now.date()
+        yesterday = today - timedelta(days=1)
+        tomorrow = today + timedelta(days=1)
+        
+        # Compute Senin (start) & Minggu (end) of current week (ISO week, Senin=0)
+        week_start = today - timedelta(days=today.weekday())
+        week_end = week_start + timedelta(days=6)
+        
+        # Last month
+        if today.month == 1:
+            last_month_year = today.year - 1
+            last_month_num = 12
+        else:
+            last_month_year = today.year
+            last_month_num = today.month - 1
+        
+        block = (
+            f"\n\nKONTEKS WAKTU SEKARANG:\n"
+            f"- Hari ini: {_HARI_INDO[today.weekday()]}, "
+            f"{today.day} {_BULAN_INDO[today.month]} {today.year}, "
+            f"jam {now.hour:02d}:{now.minute:02d} {tz_label}\n"
+            f"- Kemarin: {_HARI_INDO[yesterday.weekday()]}, "
+            f"{yesterday.day} {_BULAN_INDO[yesterday.month]} {yesterday.year}\n"
+            f"- Besok: {_HARI_INDO[tomorrow.weekday()]}, "
+            f"{tomorrow.day} {_BULAN_INDO[tomorrow.month]} {tomorrow.year}\n"
+            f"- Minggu ini: {week_start.day} {_BULAN_INDO[week_start.month]} – "
+            f"{week_end.day} {_BULAN_INDO[week_end.month]} {week_end.year}\n"
+            f"- Bulan ini: {_BULAN_INDO[today.month]} {today.year}\n"
+            f"- Bulan kemarin: {_BULAN_INDO[last_month_num]} {last_month_year}\n"
+            f"- Tahun ini: {today.year}. Tahun lalu: {today.year - 1}.\n"
+        )
+        return block
+    except Exception as e:
+        # Outer safety net: kalau ada bug di logic dalam, log + return empty.
+        # Service tetap jalan, cuma kehilangan TIME context untuk turn ini.
+        # Better than crash.
+        logger.error(
+            f"[_build_time_context_block] Unexpected failure: {e}. "
+            f"Returning empty block — service stays up."
+        )
+        return ""
+
+
+# Foundation 2 — Anti-halu rules (hardcoded, tidak editable di admin)
+_ANTI_HALU_RULES = (
+    "\n\nATURAN PENTING — JANGAN HALUSINASI:\n"
+    "1. JANGAN mengarang angka spesifik (skor, durasi, tanggal, jumlah hari, "
+    "persentase) yang tidak ada di tool result atau konteks. Kalau tidak punya "
+    "data, bilang \"saya belum punya datanya\" atau \"perlu cek lebih lanjut\".\n"
+    "2. Kalau user tanya tentang MASA DEPAN (besok, minggu depan, tahun depan), "
+    "bilang datanya belum ada — kejadian belum terjadi. JANGAN mengira-ira.\n"
+    "3. Kalau tool kasih `has_data: false` atau error, JANGAN guess — bilang "
+    "ke user bahwa datanya belum tersedia.\n"
+    "4. Kalau tool result punya data partial, jawab pakai yang ADA, dan secara "
+    "ramah acknowledge bagian yang TIDAK ADA. Contoh: \"Kalau soal sikat pagi "
+    "kemarin sudah Bunda centang, tapi soal malamnya belum ada catatan.\"\n"
+    "5. Memory dari ringkasan percakapan sebelumnya itu HANYA konteks topik. "
+    "JANGAN treat angka/status/data spesifik dari memory sebagai data current.\n"
+    "6. Kalau tidak yakin antara dua kemungkinan, lebih baik bilang \"saya kurang "
+    "yakin\" atau tanya balik ke user untuk konfirmasi — JANGAN asal pilih.\n"
+)
+
+
+# Foundation 3 — Bahasa & tone (hardcoded)
+_BAHASA_RULES = (
+    "\n\nATURAN BAHASA & TONE:\n"
+    "- User adalah orang tua Indonesia, kebanyakan ibu lulusan SD/SMP/SMA. "
+    "Pakai bahasa sehari-hari, sederhana, tidak formal kaku.\n"
+    "- HINDARI istilah teknis: \"score\", \"compliance percentage\", \"milestone\", "
+    "\"streak\" (boleh kalau user yang sebut duluan), \"cleanliness ratio\", \"risk weight\". "
+    "Ganti ke bahasa percakapan: \"nilai\", \"konsistensi\", \"target hari berikutnya\", "
+    "\"hari berturut-turut\", \"kebersihan\", \"tingkat risiko\".\n"
+    "- Sapaan: pakai \"Bunda\" atau \"Ayah\" (ikuti gender user kalau tahu) atau nama panggilan.\n"
+    "- Anak: sebut dengan nama panggilan anak. Ingat: yang menggunakan aplikasi "
+    "adalah ORANG TUA, bukan anak. Jadi \"Bunda yang ngerjain modul Cerita Peri\", "
+    "bukan \"anak ngerjain modul\".\n"
+    "- Emoji boleh, tapi seperlunya saja (1-2 per response). Hindari spam emoji.\n"
+    "- Panjang: 3-5 kalimat default. Kalau user minta detail baru lebih panjang.\n"
+)
+
+
+def _should_skip_foundation_blocks(state) -> bool:
+    """Apakah skip foundation blocks (TIME/ANTI-HALU/BAHASA) untuk turn ini?
+    
+    Skip kalau:
+    - is_smalltalk path (smalltalk pakai lean prompt sendiri, tidak butuh)
+    - _override_system aktif (RnD mode, full custom prompt)
+    
+    Returns:
+        True kalau harus skip, False kalau harus inject.
+    """
+    if state.get("is_smalltalk"):
+        return True
+    prompts = state.get("prompts", {}) or {}
+    if "_override_system" in prompts:
+        return True
+    return False
 
 
 def _build_smalltalk_system_prompt(state: AgentState, prompts: dict) -> str:
@@ -262,6 +461,31 @@ def _build_system_prompt(state: AgentState) -> str:
     # ─────────────────────────────────────────────────────────────────────────
     # NORMAL PATH (existing logic — UNCHANGED below)
     # ─────────────────────────────────────────────────────────────────────────
+    
+    # ═════════════════════════════════════════════════════════════════════════
+    # Bagian C v6 — Phase 1: Foundation Blocks (TIME, ANTI-HALU, BAHASA)
+    # ═════════════════════════════════════════════════════════════════════════
+    # Inject di paling ATAS prompt (sebelum persona). Pattern industri besar:
+    # behavioral rules + time context come FIRST, then persona/data follows.
+    # 
+    # Skip blocks ini untuk smalltalk path (sudah early-returned) dan RnD
+    # override mode. Untuk normal path, foundation blocks selalu di-inject.
+    # 
+    # Build foundation prefix (3 blocks combined):
+    foundation_prefix = ""
+    if not _should_skip_foundation_blocks(state):
+        # Try to extract user timezone from user_context (fallback Asia/Jakarta).
+        # Future enhancement: store user.timezone di profile, pass via state.
+        user_ctx_for_tz = state.get("user_context", {}) or {}
+        user_for_tz = user_ctx_for_tz.get("user") or {}
+        timezone_str = user_for_tz.get("timezone") or "Asia/Jakarta"
+        
+        foundation_prefix = (
+            _build_time_context_block(timezone_str)
+            + _ANTI_HALU_RULES
+            + _BAHASA_RULES
+        )
+    
     # Persona base
     persona = prompts.get(
         "persona_system",
@@ -280,7 +504,14 @@ def _build_system_prompt(state: AgentState) -> str:
     child_name = child.get("nickname") or child.get("full_name") or "si kecil"
     child_age = f"{child.get('age_years')} tahun" if child.get("age_years") else "?"
 
-    system = persona.replace("{user_name}", user_name)
+    # Bagian C v6 — Phase 1: Prepend foundation prefix (TIME + ANTI-HALU + BAHASA)
+    # Foundation blocks come BEFORE persona, supaya LLM pahami aturan dasar
+    # dulu sebelum mencerna persona/data. Empty kalau smalltalk/override mode.
+    # Separator: foundation_prefix sudah ada trailing \n, persona inline — ok.
+    if foundation_prefix:
+        system = foundation_prefix + "\n" + persona.replace("{user_name}", user_name)
+    else:
+        system = persona.replace("{user_name}", user_name)
     system = system.replace("{child_name}", child_name)
     system = system.replace("{child_age}", child_age)
 

@@ -48,6 +48,13 @@ tenacity==9.0.0
 structlog==24.4.0
 python-multipart==0.0.20
 
+# Timezone data — required for Python `zoneinfo` stdlib module to work
+# inside slim/cuda Docker images yang tidak punya system tzdata.
+# Used by Foundation 1 di generate.py untuk inject KONTEKS WAKTU
+# multi-timezone (WIB/WITA/WIT) dengan akurat (DST-aware kalau future
+# expand ke negara non-Indonesia).
+tzdata>=2024.1
+
 # Testing
 pytest==8.2.2
 pytest-asyncio==0.23.7
