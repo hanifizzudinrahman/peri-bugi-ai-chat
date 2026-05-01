@@ -218,58 +218,6 @@ def _get_unavailable_features(state: AgentState) -> list[str]:
         return []
 
 
-def _detect_features_in_user_message(user_message: str, unavailable_features: list[str]) -> list[str]:
-    """Detect which unavailable features user message references.
-    
-    Bagian C v3: Saat LLM tool_calls=[], kita perlu tau apakah user
-    actually tanya tentang feature OFF, atau pertanyaan generic.
-    
-    Logic: simple keyword match — kalau message mention nama feature
-    (atau keyword turunan), assume user tanya tentang itu.
-    
-    Args:
-        user_message: Last user message text
-        unavailable_features: Output dari _get_unavailable_features()
-    
-    Returns:
-        List of feature names yang ke-detect di message. Empty = generic question.
-    """
-    if not user_message or not unavailable_features:
-        return []
-    
-    msg_lower = user_message.lower()
-    
-    # Simple keyword matchers — derived dari feature names
-    # Pattern: kalau feature name "Cerita Peri" di-message, count as match
-    detected = []
-    
-    # Specific keyword groups (more reliable than direct name match)
-    feature_keywords = {
-        "Cerita Peri": ["cerita peri", "cerita-cerita peri", "modul peri", "modul cerita", "story peri"],
-        "Modul Cerita Peri": ["modul peri", "modul cerita", "modul ke-", "isi modul"],
-        "Mata Peri (Scan Gigi)": ["mata peri", "scan gigi", "foto gigi", "analisa gigi"],
-        "Detail Hasil Scan": ["scan terakhir", "hasil scan", "detail scan"],
-        "Rapot Sikat Gigi": ["rapot peri", "rapot sikat", "stats sikat"],
-        "Riwayat Sikat Gigi": ["riwayat sikat", "history sikat", "kapan sikat"],
-        "Badge Sikat Gigi": ["badge", "achievement", "milestone sikat"],
-        "Kuesioner Risiko Karies": ["kuesioner", "risiko karies", "caries risk"],
-        "Tips Parenting Harian": ["tips parenting", "tips hari ini"],
-        "Konsultasi Kesehatan Gigi": [],  # too generic, skip
-        "Bantuan Aplikasi": [],  # too generic, skip
-        "Profil Pengguna": [],  # too generic, skip
-    }
-    
-    for feature in unavailable_features:
-        keywords = feature_keywords.get(feature, [])
-        if not keywords:
-            continue
-        if any(kw in msg_lower for kw in keywords):
-            detected.append(feature)
-    
-    # Dedupe (some features overlap, e.g., "Cerita Peri" vs "Modul Cerita Peri")
-    return list(dict.fromkeys(detected))
-
-
 def _build_tool_guard(tools: Optional[list], state: AgentState) -> str:
     """Build strict tool name guard untuk prevent LLM hallucination.
     
@@ -624,31 +572,39 @@ async def agent_node(state: AgentState) -> dict[str, Any]:
             })
 
         # ────────────────────────────────────────────────────────────────────
-        # Bagian C v3 — Part C1: Decision signal untuk generate_node
+        # Bagian C v5 — Part C1: Decision signal untuk generate_node
         # ────────────────────────────────────────────────────────────────────
         # Saat LLM decide TIDAK panggil tool (tool_calls=[]), generate_node
         # butuh tahu KENAPA supaya bisa kasih answer yang appropriate:
-        # - "feature_unavailable": user tanya feature OFF → kasih honest answer
+        # - "feature_unavailable": ada agent OFF di allowed_agents (LLM mungkin
+        #    skip tool karena guard prompt; pass full list ke generate untuk
+        #    let LLM compose honest answer kalau user tanya soal itu)
         # - "stripped_no_tool": LLM kasih content tapi no tool_calls (rare)
-        # - "no_tool_needed": pertanyaan generic, LLM jawab langsung
+        # - "no_tool_needed": semua agent ON tapi LLM decide tidak butuh tool
+        #    (e.g., pertanyaan generic kesehatan gigi yang LLM bisa jawab via persona)
+        #
+        # CHANGED dari v4: hapus keyword-match per-feature. Sekarang pass FULL
+        # unavailable_all ke detected_unavailable_features. Reasoning: LLM in
+        # generate sudah punya context user message + full feature list, bisa
+        # decide sendiri without depending on brittle keyword matcher (yang miss
+        # banyak query natural seperti "streak anak berapa?").
         no_tools_reason: Optional[str] = None
         detected_unavailable_features: list[str] = []
 
         if not ai_msg.tool_calls:
             # LLM didn't call tools — figure out WHY
             unavailable_all = _get_unavailable_features(state)
-            detected_unavailable_features = _detect_features_in_user_message(
-                user_message, unavailable_all
-            )
 
-            if detected_unavailable_features:
-                # User tanya feature yang OFF — Layer 1 prompt guard berhasil
-                # prevent tool call. Tag ini supaya generate inject "honest answer"
-                # instruction.
+            if unavailable_all:
+                # Ada agent OFF — pass full list ke generate. Generate akan inject
+                # "INFO TOOLS TERSEDIA" block yang explicit list available + unavailable.
+                # LLM in generate decide whether to honor it (kalau user tanya OFF) atau
+                # respond normally (kalau user tanya generic / feature ON).
+                detected_unavailable_features = unavailable_all
                 no_tools_reason = "feature_unavailable"
                 logger.info(
-                    f"[agent_node] No tools called — user tanya unavailable features: "
-                    f"{detected_unavailable_features}. Generate akan kasih honest answer."
+                    f"[agent_node] No tools called — passing full unavailable list "
+                    f"to generate: {unavailable_all}"
                 )
             elif agent_content_stripped:
                 # LLM kasih content tapi tidak panggil tool. Rare bug.
@@ -658,7 +614,7 @@ async def agent_node(state: AgentState) -> dict[str, Any]:
                     f"Stripped content len={len(agent_content_stripped)}"
                 )
             else:
-                # Generic question, LLM decide tidak butuh tool
+                # Semua agent ON, LLM decide tidak butuh tool — generic question
                 no_tools_reason = "no_tool_needed"
 
         # Update span output dengan decision signals (Bagian C v3)

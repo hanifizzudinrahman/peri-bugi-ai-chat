@@ -143,6 +143,22 @@ def _build_legacy_dict_state(state: AgentState) -> dict:
         "llm_call_logs": [l.model_dump() for l in state.llm_call_logs],
         "final_response": state.final_response,
         "llm_metadata": dict(state.llm_metadata),
+        # ── Bagian C v2 + v3: feature-availability signals ─────────────────────
+        # Bagian C v2: tools yang LLM panggil tapi gated off via allowed_agents.
+        #   Set by tool_bridge_node saat detect "tool unavailable" result.
+        #   generate.py inject Layer 4 warning kalau ada.
+        # Bagian C v3: agent_node decision signal saat tool_calls=[].
+        #   - no_tools_reason: kenapa LLM tidak panggil tool
+        #     ("feature_unavailable" | "stripped_no_tool" | "no_tool_needed" | "smalltalk")
+        #   - detected_unavailable_features: list feature names yang user tanya
+        #     padahal agent-nya OFF (e.g., ["Cerita Peri"]).
+        # 
+        # WAJIB di-pass ke generate.py — kalau hilang, Layer B (warning fitur OFF)
+        # dan Layer C (sanitize summaries) tidak jalan, LLM halusinasi data dari
+        # memory summary lama.
+        "no_tools_reason": state.no_tools_reason,
+        "detected_unavailable_features": list(state.detected_unavailable_features),
+        "unavailable_tools": list(state.unavailable_tools),
         # RnD overrides
         "llm_provider_override": state.rnd.llm_provider,
         "llm_model_override": state.rnd.llm_model,
