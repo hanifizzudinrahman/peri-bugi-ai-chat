@@ -85,6 +85,94 @@ def _build_smalltalk_system_prompt(state: AgentState, prompts: dict) -> str:
     return rendered
 
 
+def _sanitize_session_summaries(
+    summaries: list,
+    state: AgentState,
+) -> tuple[list[str], bool]:
+    """Sanitize session summaries — detect entries yang reference feature OFF.
+    
+    Bagian C v3 — Part C2: Memory summaries dari background job kadang punya
+    detail data spesifik (e.g., "Modul 4 masih terkunci"). Kalau feature
+    sekarang OFF tapi summary bahas fitur itu, LLM bisa halusinasi data
+    "current" pakai detail dari summary lama.
+    
+    Strategy: detect summaries yang mention feature OFF via keyword match.
+    Kalau detected, kembalikan flag `has_stale=True` supaya generate.py
+    inject disclaimer.
+    
+    Args:
+        summaries: List of summary strings dari memory.
+        state: AgentState — used untuk derive features yang OFF.
+    
+    Returns:
+        Tuple (sanitized_summaries, has_stale_summary):
+        - sanitized_summaries: Same list (we don't filter — just flag)
+        - has_stale_summary: True kalau ada summary yang reference feature OFF
+    
+    Note:
+        We DON'T remove summaries — masih useful sebagai topical context.
+        Cuma flag has_stale supaya disclaimer di-inject.
+        Ada risk false-positive (keyword match), tapi disclaimer tone-nya
+        soft enough supaya LLM cuma extra hati-hati, bukan ignore total.
+    """
+    if not summaries:
+        return [], False
+    
+    # Get unavailable features (kalau ada)
+    try:
+        from app.agents.tools.registry import iter_tool_specs, AGENT_KEY_TO_FEATURE_NAME
+        all_specs = iter_tool_specs()
+        allowed_agents = set(state.control.allowed_agents or []) if hasattr(state, 'control') else set()
+        if not allowed_agents and hasattr(state, 'get'):
+            # Fallback: try state.get for dict-like access
+            user_ctx = state.get("user_context", {})
+            allowed_agents = set(user_ctx.get("allowed_agents") or [])
+        
+        unavailable_keywords: list[str] = []
+        for spec in all_specs:
+            if spec.required_agent and spec.required_agent not in allowed_agents:
+                # Add feature name + agent_key ke keyword list
+                feature = AGENT_KEY_TO_FEATURE_NAME.get(spec.agent_key, "")
+                if feature:
+                    unavailable_keywords.append(feature.lower())
+                # Also add common keyword variants per feature
+                if spec.agent_key == "cerita_peri" or spec.agent_key == "cerita_module_detail":
+                    unavailable_keywords.extend(["modul", "cerita peri"])
+                elif spec.agent_key == "mata_peri" or spec.agent_key == "mata_peri_scan_detail":
+                    unavailable_keywords.extend(["scan gigi", "mata peri", "foto gigi"])
+                elif spec.agent_key == "rapot_peri" or spec.agent_key.startswith("rapot_peri_"):
+                    unavailable_keywords.extend(["sikat gigi", "rapot peri", "streak", "badge"])
+                elif spec.agent_key == "caries_risk":
+                    unavailable_keywords.extend(["kuesioner", "risiko karies"])
+                elif spec.agent_key == "tips":
+                    unavailable_keywords.extend(["tips parenting", "tips harian"])
+        
+        unavailable_keywords = list(set(unavailable_keywords))
+    except Exception as e:
+        logger.warning(f"[_sanitize_session_summaries] Failed to derive keywords: {e}")
+        return list(summaries), False
+    
+    if not unavailable_keywords:
+        # All features ON — no sanitization needed
+        return list(summaries), False
+    
+    # Check each summary untuk reference ke feature OFF
+    has_stale = False
+    for summary in summaries:
+        if not isinstance(summary, str):
+            continue
+        summary_lower = summary.lower()
+        if any(kw in summary_lower for kw in unavailable_keywords):
+            has_stale = True
+            logger.info(
+                f"[_sanitize_session_summaries] Stale summary detected (references "
+                f"feature OFF): {summary[:80]!r}"
+            )
+            break  # one match enough — disclaimer will cover all
+    
+    return list(summaries), has_stale
+
+
 def _build_system_prompt(state: AgentState) -> str:
     """
     Build system prompt dengan:
@@ -158,8 +246,35 @@ def _build_system_prompt(state: AgentState) -> str:
 
     summaries = memory.get("session_summaries", [])
     if summaries:
-        summaries_text = "\n".join(f"- {s}" for s in summaries)
-        system += f"\n\nRingkasan percakapan sebelumnya:\n{summaries_text}"
+        # Bagian C v3 — Part C2: Sanitize summaries.
+        # Memory summaries dari background job. Kalau session lama bahas feature
+        # yang sekarang OFF, summary bisa leak info "modul terkunci" yang bikin
+        # LLM halusinasi data pas user tanya feature OFF.
+        # Strategy: detect summaries yang reference unavailable features, lalu
+        # PREPEND disclaimer ("info historis, fitur sekarang OFF").
+        sanitized_summaries, has_stale = _sanitize_session_summaries(
+            summaries, state
+        )
+
+        if sanitized_summaries:
+            summaries_text = "\n".join(f"- {s}" for s in sanitized_summaries)
+            system += f"\n\nRingkasan percakapan sebelumnya:\n{summaries_text}"
+
+            if has_stale:
+                # Loud disclaimer ke LLM bahwa summaries punya info dari feature OFF
+                system += (
+                    f"\n\n⚠️ DISCLAIMER untuk Ringkasan di atas:\n"
+                    f"Beberapa entry di ringkasan membahas feature yang SAAT INI TIDAK AKTIF "
+                    f"di akun user. Detail data spesifik (status modul, badge, scan, dll) "
+                    f"di ringkasan itu adalah info HISTORIS dari session lama.\n"
+                    f"\n"
+                    f"PERATURAN:\n"
+                    f"- Pakai ringkasan untuk konteks topik percakapan saja.\n"
+                    f"- JANGAN treat angka/status/data spesifik di ringkasan sebagai "
+                    f"data CURRENT user.\n"
+                    f"- Untuk data current, HANYA gunakan hasil tool call di session ini.\n"
+                    f"- Kalau tidak ada tool call, JANGAN karang data."
+                )
 
     facts = memory.get("user_facts", [])
     if facts:
@@ -230,34 +345,148 @@ def _build_system_prompt(state: AgentState) -> str:
     # Kalau LLM panggil tool yang tidak available (gated off via allowed_agents),
     # tool_bridge_node sudah mark di state.unavailable_tools. Inject penjelasan
     # ke LLM supaya kasih honest answer, bukan halusinasi data.
+    #
+    # Bagian C v3: Combine 2 sources untuk feature unavailable detection:
+    # 1. state.unavailable_tools — LLM HALUSINASI tool name (Layer 3 catch)
+    # 2. state.detected_unavailable_features — LLM CORRECTLY skip tool call,
+    #    tapi user message reference feature OFF (agent_node detect via
+    #    keyword match in user message)
     unavailable_tools = state.get("unavailable_tools", []) or []
+    detected_features = state.get("detected_unavailable_features", []) or []
+    no_tools_reason = state.get("no_tools_reason")
+
+    # Bagian C v3 RESILIENCY FIX: Fallback detection in generate_node.
+    # Kalau state.detected_unavailable_features empty (e.g., AgentState belum
+    # punya field karena state.py belum di-apply), do detection di sini juga.
+    # Pake field yang SUDAH ADA: state.messages (last user msg) + 
+    # state.control.allowed_agents + registry.
+    if not detected_features:
+        try:
+            from app.agents.tools.registry import iter_tool_specs, AGENT_KEY_TO_FEATURE_NAME
+            
+            # Get last user message
+            last_user_msg = ""
+            messages = state.get("messages", [])
+            for msg in reversed(messages):
+                msg_type = getattr(msg, "type", None) or (msg.get("type") if isinstance(msg, dict) else None)
+                if msg_type == "human":
+                    content = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else "")
+                    if isinstance(content, str):
+                        last_user_msg = content
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                last_user_msg = part.get("text", "")
+                                break
+                    break
+            
+            # Get unavailable features
+            allowed = set()
+            ctrl = state.get("control", None)
+            if ctrl and hasattr(ctrl, "allowed_agents"):
+                allowed = set(ctrl.allowed_agents or [])
+            elif ctrl and isinstance(ctrl, dict):
+                allowed = set(ctrl.get("allowed_agents", []) or [])
+            
+            unavailable_features_set = set()
+            for spec in iter_tool_specs():
+                if spec.required_agent and spec.required_agent not in allowed:
+                    feature = AGENT_KEY_TO_FEATURE_NAME.get(
+                        spec.agent_key, spec.agent_key.replace("_", " ").title()
+                    )
+                    unavailable_features_set.add(feature)
+            
+            # Keyword matching (mirror agent_node logic)
+            feature_keywords = {
+                "Cerita Peri": ["cerita peri", "cerita-cerita peri", "modul peri", "modul cerita", "story peri"],
+                "Modul Cerita Peri": ["modul peri", "modul cerita", "modul ke-", "isi modul"],
+                "Mata Peri (Scan Gigi)": ["mata peri", "scan gigi", "foto gigi", "analisa gigi"],
+                "Detail Hasil Scan": ["scan terakhir", "hasil scan", "detail scan"],
+                "Rapot Sikat Gigi": ["rapot peri", "rapot sikat", "stats sikat"],
+                "Riwayat Sikat Gigi": ["riwayat sikat", "history sikat", "kapan sikat"],
+                "Badge Sikat Gigi": ["badge", "achievement", "milestone sikat"],
+                "Kuesioner Risiko Karies": ["kuesioner", "risiko karies", "caries risk"],
+                "Tips Parenting Harian": ["tips parenting", "tips hari ini"],
+            }
+            
+            msg_lower = (last_user_msg or "").lower()
+            detected_fallback: list[str] = []
+            seen_fallback = set()
+            for feature in sorted(unavailable_features_set):
+                keywords = feature_keywords.get(feature, [])
+                if not keywords:
+                    continue
+                if any(kw in msg_lower for kw in keywords):
+                    if feature not in seen_fallback:
+                        detected_fallback.append(feature)
+                        seen_fallback.add(feature)
+            
+            if detected_fallback:
+                logger.info(
+                    f"[generate] Fallback detection of unavailable features: "
+                    f"{detected_fallback} (state field was empty, possibly state.py "
+                    f"not deployed)"
+                )
+                detected_features = detected_fallback
+                # Also infer no_tools_reason kalau LLM tidak panggil tool
+                if not unavailable_tools and not no_tools_reason:
+                    # Check if tool_calls empty in last AI message
+                    no_tools_reason = "feature_unavailable"
+        except Exception as e:
+            logger.warning(f"[generate] Fallback detection failed: {e}")
+
+    # Combine kedua sources jadi 1 list features (deduped)
+    all_unavailable_features: list[str] = []
+    seen_features = set()
+
+    # Source 1: dari unavailable_tools (Layer 3) — convert tool_name to feature
     if unavailable_tools:
         from app.agents.tools.registry import get_friendly_feature_name
-
-        # Group by friendly feature name (deduplicate)
-        unavailable_features = []
-        seen_features = set()
         for tool_name in unavailable_tools:
             feature = get_friendly_feature_name(tool_name)
-            if feature not in seen_features:
-                unavailable_features.append(feature)
+            if feature and feature not in seen_features:
+                all_unavailable_features.append(feature)
                 seen_features.add(feature)
 
-        features_text = ", ".join(unavailable_features)
+    # Source 2: dari detected_unavailable_features (agent_node detect)
+    for feature in detected_features:
+        if feature and feature not in seen_features:
+            all_unavailable_features.append(feature)
+            seen_features.add(feature)
+
+    if all_unavailable_features:
+        features_text = ", ".join(all_unavailable_features)
+
+        # Determine context based on signal source
+        if no_tools_reason == "feature_unavailable":
+            context_intro = (
+                f"User bertanya tentang fitur yang TIDAK AKTIF di akun mereka: "
+                f"**{features_text}**.\n"
+                f"\nLLM CORRECT TIDAK panggil tool (karena tool tidak ada di list available)."
+            )
+        else:
+            context_intro = (
+                f"User mencoba mengakses fitur berikut yang TIDAK AKTIF di akun mereka: "
+                f"**{features_text}**.\n"
+                f"\nTool yang dipanggil: {unavailable_tools or '(none)'}."
+            )
+
         system += (
             f"\n\n⚠️ INSTRUKSI PENTING — FITUR TIDAK AKTIF:\n"
-            f"User mencoba mengakses fitur berikut yang TIDAK AKTIF di akun mereka: "
-            f"**{features_text}**.\n"
+            f"{context_intro}\n"
             f"\n"
             f"WAJIB:\n"
-            f"1. JANGAN karang/halusinasi data (jumlah modul selesai, badge, hasil scan, dll). "
-            f"Kamu TIDAK PUNYA data tentang fitur tersebut.\n"
+            f"1. JANGAN karang/halusinasi data (jumlah modul selesai, badge, hasil scan, "
+            f"progress, dll). Kamu TIDAK PUNYA data tentang fitur tersebut.\n"
             f"2. Beri tahu user dengan ramah bahwa fitur '{features_text}' "
             f"belum tersedia untuk akun mereka saat ini.\n"
             f"3. Sarankan alternative: pertanyaan tentang kesehatan gigi umum, "
             f"tips sikat gigi, atau fitur lain yang tersedia.\n"
             f"4. JANGAN sebut alasan teknis (admin, allowed_agents, gated, dll) — "
             f"cukup bilang 'belum tersedia'.\n"
+            f"5. PENTING: Walaupun di 'Ringkasan percakapan sebelumnya' (di atas) "
+            f"ada info tentang fitur ini dari session lama, JANGAN gunakan info itu "
+            f"sebagai DATA CURRENT. Itu cuma context historis, fitur sekarang OFF.\n"
             f"\n"
             f"Contoh respons baik:\n"
             f"\"Maaf Hanif, saat ini fitur {features_text} belum tersedia di akun "

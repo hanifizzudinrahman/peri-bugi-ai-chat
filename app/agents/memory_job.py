@@ -51,9 +51,25 @@ async def generate_session_summary(
             break
 
     prompt = (
-        "Buat ringkasan singkat (3-4 kalimat) dari percakapan ini dalam Bahasa Indonesia. "
-        "Fokus pada: topik utama yang dibahas, pertanyaan user, dan saran yang diberikan. "
-        "Jangan tambahkan penilaian atau komentar. Langsung tulis ringkasannya.\n\n"
+        "Buat ringkasan singkat (3-4 kalimat) dari percakapan ini dalam Bahasa Indonesia.\n\n"
+        "PRINSIP RINGKASAN (PENTING):\n"
+        "1. Fokus pada TOPIK PERCAKAPAN, bukan detail data spesifik.\n"
+        "2. JANGAN sebut angka atau status spesifik (e.g., 'streak 3 hari', "
+        "'modul terkunci', 'badge unlocked', 'skor risiko 7'). Data ini akan "
+        "berubah di session berikutnya — kalau kamu sebut, ringkasan bakal STALE.\n"
+        "3. Pakai bahasa GENERIC tentang topik:\n"
+        "   ❌ BAD: 'User menanyakan isi Modul 4. Modul 4 masih terkunci.'\n"
+        "   ✅ GOOD: 'User membahas modul edukasi Cerita Peri.'\n"
+        "   ❌ BAD: 'Anak sikat tanggal 15 belum tercatat. Streak 0 hari.'\n"
+        "   ✅ GOOD: 'User menanyakan riwayat pencatatan sikat gigi anak.'\n"
+        "4. Kalau ada saran/tips dari Tanya Peri, sebut saja KATEGORI saran "
+        "(e.g., 'saran rutin sikat gigi') — bukan transkrip lengkap saran.\n"
+        "5. Boleh sebut feature yang dibahas (e.g., 'fitur Cerita Peri', "
+        "'fitur Mata Peri') — itu konteks topik, OK.\n"
+        "6. JANGAN tambahkan penilaian, komentar, atau opini.\n"
+        "7. Langsung tulis ringkasannya, tanpa preamble.\n\n"
+        "Tujuan ringkasan: kasih CONTEXT TOPIK ke session berikutnya, BUKAN kasih "
+        "DATA. Data spesifik akan di-fetch fresh via tool call di session itu.\n\n"
         f"Percakapan:\n{conv_text}\n\nRingkasan:"
     )
 

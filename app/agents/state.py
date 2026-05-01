@@ -263,6 +263,22 @@ class AgentState(BaseModel):
     # Pattern: ["get_cerita_progress", "get_brushing_stats", ...]
     unavailable_tools: list[str] = Field(default_factory=list)
 
+    # ── Bagian C v3: Agent decision signal ───────────────────────────────────
+    # no_tools_reason: set by agent_node saat LLM decide TIDAK panggil tool
+    # (tool_calls=[]). Possible values:
+    #   - None: LLM panggil tool (normal flow)
+    #   - "smalltalk": is_smalltalk=True path
+    #   - "feature_unavailable": user tanya feature yang OFF (Layer 1 prevent
+    #      tool call). Generate.py akan inject "honest answer" instruction.
+    #   - "no_tool_needed": LLM kira pertanyaan generic, tidak butuh tool
+    #   - "stripped_no_tool": LLM kasih content tanpa tool_calls (rare bug)
+    no_tools_reason: Optional[str] = None
+
+    # detected_unavailable_features: list of feature names (friendly) yang
+    # user-message reference tapi feature-nya OFF di allowed_agents.
+    # Contoh: ["Cerita Peri"]. Generate.py pakai untuk compose honest answer.
+    detected_unavailable_features: list[str] = Field(default_factory=list)
+
     # ── Audit & metrics ───────────────────────────────────────────────────────
     thinking_steps: list[ThinkingStep] = Field(default_factory=list)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)

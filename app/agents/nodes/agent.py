@@ -188,6 +188,88 @@ def _build_system_prompt(state: AgentState, tools: Optional[list] = None) -> str
     return result
 
 
+def _get_unavailable_features(state: AgentState) -> list[str]:
+    """Get list of feature names yang OFF di allowed_agents.
+    
+    Bagian C v3: Extract logic supaya bisa di-reuse oleh:
+    1. _build_tool_guard (Layer 1 prompt injection)
+    2. agent_node return state (set detected_unavailable_features)
+    
+    Returns:
+        Sorted list of friendly feature names. Empty kalau semua agent ON
+        atau registry tidak loaded.
+    """
+    try:
+        from app.agents.tools.registry import iter_tool_specs, AGENT_KEY_TO_FEATURE_NAME
+        
+        all_specs = iter_tool_specs()
+        allowed_agents = set(state.control.allowed_agents or [])
+        
+        unavailable_features = set()
+        for spec in all_specs:
+            if spec.required_agent and spec.required_agent not in allowed_agents:
+                feature = AGENT_KEY_TO_FEATURE_NAME.get(
+                    spec.agent_key, spec.agent_key.replace("_", " ").title()
+                )
+                unavailable_features.add(feature)
+        return sorted(unavailable_features)
+    except Exception as e:
+        logger.warning(f"[_get_unavailable_features] Failed: {e}")
+        return []
+
+
+def _detect_features_in_user_message(user_message: str, unavailable_features: list[str]) -> list[str]:
+    """Detect which unavailable features user message references.
+    
+    Bagian C v3: Saat LLM tool_calls=[], kita perlu tau apakah user
+    actually tanya tentang feature OFF, atau pertanyaan generic.
+    
+    Logic: simple keyword match — kalau message mention nama feature
+    (atau keyword turunan), assume user tanya tentang itu.
+    
+    Args:
+        user_message: Last user message text
+        unavailable_features: Output dari _get_unavailable_features()
+    
+    Returns:
+        List of feature names yang ke-detect di message. Empty = generic question.
+    """
+    if not user_message or not unavailable_features:
+        return []
+    
+    msg_lower = user_message.lower()
+    
+    # Simple keyword matchers — derived dari feature names
+    # Pattern: kalau feature name "Cerita Peri" di-message, count as match
+    detected = []
+    
+    # Specific keyword groups (more reliable than direct name match)
+    feature_keywords = {
+        "Cerita Peri": ["cerita peri", "cerita-cerita peri", "modul peri", "modul cerita", "story peri"],
+        "Modul Cerita Peri": ["modul peri", "modul cerita", "modul ke-", "isi modul"],
+        "Mata Peri (Scan Gigi)": ["mata peri", "scan gigi", "foto gigi", "analisa gigi"],
+        "Detail Hasil Scan": ["scan terakhir", "hasil scan", "detail scan"],
+        "Rapot Sikat Gigi": ["rapot peri", "rapot sikat", "stats sikat"],
+        "Riwayat Sikat Gigi": ["riwayat sikat", "history sikat", "kapan sikat"],
+        "Badge Sikat Gigi": ["badge", "achievement", "milestone sikat"],
+        "Kuesioner Risiko Karies": ["kuesioner", "risiko karies", "caries risk"],
+        "Tips Parenting Harian": ["tips parenting", "tips hari ini"],
+        "Konsultasi Kesehatan Gigi": [],  # too generic, skip
+        "Bantuan Aplikasi": [],  # too generic, skip
+        "Profil Pengguna": [],  # too generic, skip
+    }
+    
+    for feature in unavailable_features:
+        keywords = feature_keywords.get(feature, [])
+        if not keywords:
+            continue
+        if any(kw in msg_lower for kw in keywords):
+            detected.append(feature)
+    
+    # Dedupe (some features overlap, e.g., "Cerita Peri" vs "Modul Cerita Peri")
+    return list(dict.fromkeys(detected))
+
+
 def _build_tool_guard(tools: Optional[list], state: AgentState) -> str:
     """Build strict tool name guard untuk prevent LLM hallucination.
     
@@ -209,24 +291,9 @@ def _build_tool_guard(tools: Optional[list], state: AgentState) -> str:
     available_tool_names = [getattr(t, "name", "") for t in tools]
     available_tool_names = [n for n in available_tool_names if n]
     
-    # Derive features yang OFF dari registry × allowed_agents
-    try:
-        from app.agents.tools.registry import iter_tool_specs, AGENT_KEY_TO_FEATURE_NAME
-        
-        all_specs = iter_tool_specs()
-        allowed_agents = set(state.control.allowed_agents or [])
-        
-        # Tools registered tapi required_agent TIDAK in allowed → OFF
-        unavailable_features = set()
-        for spec in all_specs:
-            if spec.required_agent and spec.required_agent not in allowed_agents:
-                feature = AGENT_KEY_TO_FEATURE_NAME.get(
-                    spec.agent_key, spec.agent_key.replace("_", " ").title()
-                )
-                unavailable_features.add(feature)
-    except Exception as e:
-        logger.warning(f"[_build_tool_guard] Failed to derive unavailable features: {e}")
-        unavailable_features = set()
+    # Bagian C v3: reuse shared helper instead of duplicating logic
+    unavailable_features_list = _get_unavailable_features(state)
+    unavailable_features = set(unavailable_features_list)
     
     guard = (
         "\n\n=== ATURAN STRICT TOOL CALLING (WAJIB DIIKUTI) ===\n"
@@ -556,8 +623,70 @@ async def agent_node(state: AgentState) -> dict[str, Any]:
                 "content_was_stripped": bool(agent_content_stripped),
             })
 
+        # ────────────────────────────────────────────────────────────────────
+        # Bagian C v3 — Part C1: Decision signal untuk generate_node
+        # ────────────────────────────────────────────────────────────────────
+        # Saat LLM decide TIDAK panggil tool (tool_calls=[]), generate_node
+        # butuh tahu KENAPA supaya bisa kasih answer yang appropriate:
+        # - "feature_unavailable": user tanya feature OFF → kasih honest answer
+        # - "stripped_no_tool": LLM kasih content tapi no tool_calls (rare)
+        # - "no_tool_needed": pertanyaan generic, LLM jawab langsung
+        no_tools_reason: Optional[str] = None
+        detected_unavailable_features: list[str] = []
+
+        if not ai_msg.tool_calls:
+            # LLM didn't call tools — figure out WHY
+            unavailable_all = _get_unavailable_features(state)
+            detected_unavailable_features = _detect_features_in_user_message(
+                user_message, unavailable_all
+            )
+
+            if detected_unavailable_features:
+                # User tanya feature yang OFF — Layer 1 prompt guard berhasil
+                # prevent tool call. Tag ini supaya generate inject "honest answer"
+                # instruction.
+                no_tools_reason = "feature_unavailable"
+                logger.info(
+                    f"[agent_node] No tools called — user tanya unavailable features: "
+                    f"{detected_unavailable_features}. Generate akan kasih honest answer."
+                )
+            elif agent_content_stripped:
+                # LLM kasih content tapi tidak panggil tool. Rare bug.
+                no_tools_reason = "stripped_no_tool"
+                logger.warning(
+                    f"[agent_node] No tools but content stripped (rare). "
+                    f"Stripped content len={len(agent_content_stripped)}"
+                )
+            else:
+                # Generic question, LLM decide tidak butuh tool
+                no_tools_reason = "no_tool_needed"
+
+        # Update span output dengan decision signals (Bagian C v3)
+        if span and (no_tools_reason or detected_unavailable_features):
+            try:
+                span.update(output={
+                    "decision_path": "llm",
+                    "tool_calls": [tc.get("name") for tc in (ai_msg.tool_calls or [])],
+                    "tool_calls_count": len(ai_msg.tool_calls or []),
+                    "latency_ms": latency_ms,
+                    "success": success,
+                    "tool_args": [tc.get("args") for tc in (ai_msg.tool_calls or [])],
+                    "tools_available_count": len(tools),
+                    "tools_available_names": [getattr(t, "name", "") for t in tools],
+                    "stripped_content": (agent_content_stripped[:500] if agent_content_stripped else None),
+                    "content_was_stripped": bool(agent_content_stripped),
+                    # Bagian C v3 NEW
+                    "no_tools_reason": no_tools_reason,
+                    "detected_unavailable_features": detected_unavailable_features,
+                })
+            except Exception:
+                pass  # defensive
+
         return {
             "messages": [ai_msg],
             "thinking_steps": [*state.thinking_steps, thinking_done],
             "llm_call_logs": [*state.llm_call_logs, log],
+            # Bagian C v3: signal ke generate_node
+            "no_tools_reason": no_tools_reason,
+            "detected_unavailable_features": detected_unavailable_features,
         }
