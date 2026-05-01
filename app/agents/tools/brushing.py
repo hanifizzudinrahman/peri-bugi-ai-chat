@@ -42,24 +42,48 @@ def make_get_brushing_stats_tool(
 
     @tool
     async def get_brushing_stats() -> dict[str, Any]:
-        """Get the child's tooth brushing statistics, including current streak, best streak, achievements, and weekly summary.
+        """Get the child's tooth brushing statistics, including current streak, best streak, today's status, and progress towards next milestone badge.
 
-        Use this tool when the user asks about:
-        - Brushing progress or streak ("streak anak saya berapa hari?")
-        - Achievements or milestones ("rapot anak saya apa aja?")
-        - Whether the child has been brushing consistently
-        - Weekly or monthly brushing patterns
+        ✅ USE THIS TOOL when user asks:
+        - "streak anak berapa hari?" → check streak.current_streak
+        - "rekor terbaik anak?" → check streak.best_streak
+        - "kapan terakhir anak sikat?" → check streak.last_brushing_date (any slot)
+          ATAU streak.last_complete_date (sikat pagi+malam dalam 1 hari)
+        - "anak udah sikat hari ini belum?" → check today_status.morning + evening
+        - "pagi tadi udah sikat?" → check today_status.morning.is_checked + is_window_open
+        - "malam ini udah sikat?" → check today_status.evening.is_checked + is_window_open
+        - "berapa hari lagi menuju badge baru?" → check streak.days_to_next_milestone
+        - "target streak berikutnya berapa?" → check streak.next_milestone
 
-        Returns a dict with keys:
-        - has_data: bool — true if brushing data available
-        - streak: dict with current_streak, best_streak, etc
-        - child_name: name of the child for personalized response
+        ❌ DO NOT use this tool for:
+        - Riwayat sikat tanggal spesifik / minggu / bulan (use get_brushing_history)
+        - List badge yang sudah didapat (use get_brushing_achievements)
+        - Pertanyaan WHY brushing matters (use search_dental_knowledge)
+        - Setting reminder (no tool — arahkan user ke aplikasi)
+
+        Returns dict dengan keys:
+        - has_data: bool — true kalau brushing data tersedia
+        - streak: dict (current_streak, best_streak, last_complete_date,
+                  last_brushing_date, last_brushing_slots,
+                  next_milestone, days_to_next_milestone, progress_percentage)
+        - today_status: dict (date, morning{is_checked,is_window_open},
+                        evening{is_checked,is_window_open}, is_complete) — atau null
+        - child_name: nama anak untuk personalisasi response
         - source: "api" | "user_context" | "user_context_fallback"
-        - error: str (only if has_data=False)
 
-        Do NOT use this tool for:
-        - Questions about WHY brushing matters (use search_dental_knowledge)
-        - Setting up reminders (not supported in chat — direct user to app)
+        ANTI-HALU:
+        - Bedakan dua field tanggal:
+          • last_brushing_date = terakhir ada catatan sikat (slot apapun)
+          • last_complete_date = terakhir sikat pagi+malam dalam 1 hari yang sama
+        - Kalau user nanya "kapan terakhir sikat" tanpa qualifier, jawab pakai
+          last_brushing_date (lebih general). Sebut juga slot mana yang sikat
+          (last_brushing_slots: ["morning"], ["evening"], atau dua-duanya).
+        - Kalau today_status null, JANGAN guess "anak sudah sikat hari ini" — bilang
+          "datanya belum tersedia".
+        - Kalau next_milestone null, artinya streak sudah max — bilang sudah 
+          capai semua target, bukan "tidak ada milestone".
+        - Kalau is_window_open false dan is_checked false, slot itu sudah lewat /
+          belum buka — sebut konteks waktu, bukan langsung "belum sikat".
         """
         from app.config.observability import trace_node, _safe_dict_for_trace
 
@@ -136,31 +160,42 @@ def make_get_brushing_history_tool(user_id: Optional[str]):
 
     @tool
     async def get_brushing_history(month: Optional[str] = None) -> dict[str, Any]:
-        """Get the child's BRUSHING HISTORY — monthly calendar + this week's stats.
+        """Get the child's BRUSHING HISTORY — monthly calendar + this week's stats + slot compliance.
 
         ✅ USE THIS TOOL when the user asks about:
-        - "anak kemarin sikat ga?" (yesterday)
-        - "minggu ini anak sikat berapa hari?" (this week)
-        - "tanggal 15 anak sikat?" (specific date)
-        - "bulan ini progressnya gimana?" (monthly overview)
-        - "anak sikat di hari Senin Selasa Rabu kemarin?"
+        - "anak kemarin sikat ga?" (yesterday — filter calendar.days by date)
+        - "minggu ini anak sikat berapa hari?" → check this_week.completed_sessions
+        - "tanggal 15 anak sikat?" → filter calendar.days[date='YYYY-MM-15']
+        - "bulan ini progressnya gimana?" → calendar overview
+        - "bulan kemarin gimana?" → call dengan month="YYYY-MM" (bulan kemarin)
+        - "pagi atau malam yang lebih sering kelewat?" → check slot_compliance.morning_percentage vs evening_percentage
+        - "konsistensi anak gimana?" → check slot_compliance overview
 
         ❌ DO NOT use this tool when:
         - User only asks about today's status / current streak → use get_brushing_stats (lighter)
         - User asks about achievements/badges → use get_brushing_achievements
         - User asks how to log brushing → use search_app_faq
+        - User asks tren multi-bulan / tahun → tool tidak support multi-month aggregation, just bulan tertentu
 
         Args:
-            month: format "YYYY-MM" (optional, default current month)
+            month: format "YYYY-MM" (optional, default current month).
+                   Untuk "bulan kemarin", compute dari KONTEKS WAKTU di system prompt.
 
         Returns a dict with keys:
         - has_data: bool
         - child_name: str
         - month: "YYYY-MM" string
-        - calendar: dict with year, month, days (list of {date, morning, evening, complete})
-        - this_week: dict with week_start, week_end, completed_sessions, total_sessions,
-                     compliance_percentage, current_streak
-        - reason / fallback_message: only when has_data=False
+        - calendar: dict (year, month, days[{date, morning, evening, complete}])
+        - this_week: dict (week_start, week_end, completed_sessions, total_sessions,
+                     compliance_percentage, current_streak)
+        - slot_compliance: dict (total_days, morning_count, evening_count,
+                          morning_percentage, evening_percentage) — atau null
+        - reason / fallback_message: kalau has_data=False
+
+        ANTI-HALU:
+        - Kalau tanggal yang ditanya tidak ada di calendar.days, artinya BELUM ADA DATA,
+          BUKAN belum sikat. Bilang "datanya belum tersedia di tanggal itu".
+        - Kalau slot_compliance null atau total_days=0, JANGAN compare pagi vs malam.
         """
         # FIX (Langfuse audit Bagian B1): Add trace_node wrapper for consistency.
         from app.config.observability import trace_node, _safe_dict_for_trace
@@ -312,6 +347,17 @@ def _inject_brushing_stats(data: dict, child_name: str, prompts: dict, response_
     
     CRITICAL — sebelumnya tool result HILANG (di-bridge tapi tidak di-consume).
     Fix Bagian C: inject ke system prompt supaya LLM bisa jawab dengan data tepat.
+    
+    Phase 2 enrichment:
+    - last_complete_date — kapan terakhir sikat LENGKAP (pagi+malam)
+    - last_brushing_date — kapan terakhir ada catatan sikat (slot apapun) [Phase 2.1]
+    - next_milestone, days_to_next_milestone — untuk "berapa lagi sampai badge"
+    - today_status — pagi/malam udah sikat hari ini, plus is_window_open
+    
+    Phase 2.1 hotfix: bedakan "terakhir sikat lengkap" (last_complete_date) vs
+    "terakhir ada catatan sikat slot apapun" (last_brushing_date). Kalau user
+    nanya "kapan terakhir sikat?" tanpa qualifier, ini ambigu — display kedua
+    field supaya LLM bisa pilih yang relevan dengan context user.
     """
     if not data or not data.get("has_data"):
         return ""
@@ -319,14 +365,79 @@ def _inject_brushing_stats(data: dict, child_name: str, prompts: dict, response_
     streak = data.get("streak") or {}
     current_streak = streak.get("current_streak", 0)
     best_streak = streak.get("best_streak", 0)
+    last_complete_date = streak.get("last_complete_date")
+    last_brushing_date = streak.get("last_brushing_date")  # Phase 2.1
+    last_brushing_slots = streak.get("last_brushing_slots")  # Phase 2.1
+    next_milestone = streak.get("next_milestone")
+    days_to_next_milestone = streak.get("days_to_next_milestone")
+    
     weekly = data.get("weekly_summary") or {}
     achievements = data.get("achievements") or []
+    today_status = data.get("today_status")
     
     text = (
         f"\n\nData rapot sikat gigi {child_name} (LATEST dari tool call):"
         f"\n- Streak saat ini: {current_streak} hari"
         f"\n- Rekor terbaik: {best_streak} hari"
     )
+    
+    # Phase 2.1: Bedakan complete vs any-slot
+    # Definisi:
+    #   - last_complete_date: tanggal terakhir aaa sikat LENGKAP (pagi+malam dua-duanya)
+    #   - last_brushing_date: tanggal terakhir aaa ada catatan sikat (slot apapun)
+    
+    # Display last_brushing_date dulu (any-slot, lebih general)
+    if last_brushing_date:
+        slots_text = ""
+        if last_brushing_slots:
+            slot_id_to_label = {"morning": "pagi", "evening": "malam"}
+            slot_labels = [slot_id_to_label.get(s, s) for s in last_brushing_slots]
+            if len(slot_labels) == 2:
+                slots_text = " (sikat pagi + malam — lengkap)"
+            elif len(slot_labels) == 1:
+                slots_text = f" (sikat {slot_labels[0]} saja)"
+        text += f"\n- Terakhir ada catatan sikat: {last_brushing_date}{slots_text}"
+    else:
+        text += f"\n- Belum pernah ada catatan sikat sama sekali"
+    
+    # Display last_complete_date — explicit info untuk LLM
+    if last_complete_date:
+        text += f"\n- Terakhir sikat lengkap (pagi+malam dalam 1 hari): {last_complete_date}"
+    elif last_brushing_date:
+        # Ada catatan sikat tapi belum pernah complete day
+        text += f"\n- Belum pernah ada hari yang sikat lengkap (pagi+malam) di 1 hari yang sama"
+    # Kalau dua-duanya null, sudah ke-handle di "Belum pernah ada catatan sikat" di atas
+    
+    # Phase 2: berapa lagi menuju milestone berikutnya
+    if next_milestone is not None and days_to_next_milestone is not None:
+        text += (
+            f"\n- Menuju target {next_milestone} hari berturut-turut: "
+            f"butuh {days_to_next_milestone} hari lagi"
+        )
+    elif next_milestone is None and current_streak > 0:
+        text += "\n- Sudah capai semua target streak (max milestone tercapai)"
+    
+    # Phase 2: status hari ini (pagi vs malam, dengan window awareness)
+    if today_status:
+        morning = today_status.get("morning") or {}
+        evening = today_status.get("evening") or {}
+        m_check = "✓ sudah" if morning.get("is_checked") else "✗ belum"
+        e_check = "✓ sudah" if evening.get("is_checked") else "✗ belum"
+        m_window = morning.get("is_window_open")
+        e_window = evening.get("is_window_open")
+        
+        text += f"\n- Hari ini ({today_status.get('date', 'today')}):"
+        text += f"\n  • Sikat pagi: {m_check}"
+        if not morning.get("is_checked") and not m_window:
+            text += " (slot pagi sudah lewat — tidak bisa centang lagi)"
+        elif not morning.get("is_checked") and m_window:
+            text += " (slot pagi masih aktif, bisa centang sekarang)"
+        text += f"\n  • Sikat malam: {e_check}"
+        if not evening.get("is_checked") and not e_window:
+            text += " (slot malam belum buka)"
+        elif not evening.get("is_checked") and e_window:
+            text += " (slot malam aktif sekarang)"
+    
     if weekly:
         text += (
             f"\n- Minggu ini: {weekly.get('completed_sessions', 0)} dari "
@@ -360,7 +471,10 @@ def _bridge_brushing_history(result: dict, agent_results: dict, ctx: BridgeConte
 
 
 def _inject_brushing_history(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
-    """Inject brushing history (calendar + weekly) to system prompt."""
+    """Inject brushing history (calendar + weekly + slot_compliance) to system prompt.
+    
+    Phase 2: tambah slot_compliance — pagi vs malam mana yang lebih sering kelewat.
+    """
     if not data or not data.get("has_data"):
         # Loud signal ke LLM bahwa tool returned empty/error
         if data and data.get("reason"):
@@ -375,6 +489,7 @@ def _inject_brushing_history(data: dict, child_name: str, prompts: dict, respons
     calendar = data.get("calendar") or {}
     days = calendar.get("days") or []
     this_week = data.get("this_week") or {}
+    slot_compliance = data.get("slot_compliance") or {}  # Phase 2
     
     # Hitung total hari dengan brushing tercatat di bulan tersebut
     days_with_brushing = sum(
@@ -387,6 +502,30 @@ def _inject_brushing_history(data: dict, child_name: str, prompts: dict, respons
         f"\n- Minggu ini: {this_week.get('completed_sessions', 0)} sesi tercatat "
         f"(streak: {this_week.get('current_streak', 0)} hari)"
     )
+    
+    # Phase 2: Slot compliance — pagi vs malam comparison
+    if slot_compliance and slot_compliance.get("total_days", 0) > 0:
+        m_pct = slot_compliance.get("morning_percentage")
+        e_pct = slot_compliance.get("evening_percentage")
+        m_count = slot_compliance.get("morning_count", 0)
+        e_count = slot_compliance.get("evening_count", 0)
+        total = slot_compliance.get("total_days", 0)
+        
+        text += (
+            f"\n- Konsistensi pagi: {m_count}/{total} hari "
+            f"({m_pct}%)" if m_pct is not None else f"\n- Konsistensi pagi: {m_count}/{total} hari"
+        )
+        text += (
+            f"\n- Konsistensi malam: {e_count}/{total} hari "
+            f"({e_pct}%)" if e_pct is not None else f"\n- Konsistensi malam: {e_count}/{total} hari"
+        )
+        # Hint untuk LLM: pagi atau malam yang lebih sering kelewat?
+        if m_pct is not None and e_pct is not None:
+            if m_pct < e_pct - 5:
+                text += "\n  (Slot pagi lebih sering kelewat dibanding malam)"
+            elif e_pct < m_pct - 5:
+                text += "\n  (Slot malam lebih sering kelewat dibanding pagi)"
+            # else: kira-kira sama, no hint
     
     # Detail per-hari (cap di 10 hari terakhir untuk avoid prompt bloat)
     if days:

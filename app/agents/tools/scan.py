@@ -447,17 +447,20 @@ def make_get_mata_peri_scan_detail_tool(user_id: Optional[str]):
 
     @tool
     async def get_mata_peri_scan_detail(session_id: Optional[str] = None) -> dict[str, Any]:
-        """Get DETAIL of a Mata Peri scan session — per-view findings (5 views).
+        """Get DETAIL of a Mata Peri scan session — per-view findings (5 views) + overall cleanliness score.
 
         Mata Peri scans 5 views: front (depan), upper (rahang atas), lower (rahang bawah),
         left (kiri), right (kanan). Each view analyzed by AI for caries severity.
 
         ✅ USE THIS TOOL when the user asks about:
         - "hasil scan terakhir gimana?" (latest scan)
-        - "scan rahang atas anak saya gimana?" (specific view)
-        - "tanggal X scannya hasilnya apa?" (specific session)
-        - "rekomendasi dari scan terakhir apa?"
-        - "scan tadi pagi gimana hasilnya?"
+        - "scan rahang atas anak saya gimana?" → check views[view_type='upper']
+        - "tanggal X scannya hasilnya apa?" (specific session, panggil get_scan_history dulu untuk dapat session_id)
+        - "rekomendasi dari scan terakhir apa?" → check recommendation_text
+        - "score bersihnya berapa persen?" → check overall_clean_ratio (Phase 2)
+        - "kebersihan rahang atas berapa?" → check views[].clean_ratio per view (Phase 2)
+        - "ada cavity ga di scan terakhir?" → check views[].caries_detected_count
+        - "bagian gigi mana yang ada masalah?" → filter views[] by severity != 'clean'
 
         ❌ DO NOT use this tool when:
         - User just asks how many scans done → use get_scan_history (lighter, summary)
@@ -473,25 +476,30 @@ def make_get_mata_peri_scan_detail_tool(user_id: Optional[str]):
         - session: dict with:
           - session_id, child_name, performed_at, completed_at
           - is_processing: bool — True kalau scan masih dianalisis
-          - is_failed: bool — True kalau scan gagal dianalisis (kalau ada)
           - summary_status: "ok" | "perlu_perhatian" | "segera_ke_dokter"
           - summary_text, recommendation_text (already user-friendly Indonesian)
           - confidence_overall: 0.0-1.0
           - requires_dentist_review: bool (CRITICAL flag)
           - worst_view_severity: "clean" | "moderate" | "severe" | "unknown"
+          - overall_clean_ratio: float 0.0-1.0 | null — average dari valid views (Phase 2)
           - views: list of {
               view_type ("front"|"upper"|"lower"|"left"|"right"),
               view_label ("Tampak Depan", etc),
               is_valid: bool,
               severity ("clean"|"moderate"|"severe"|"unknown"),
               severity_label (Indonesian),
-              clean_ratio (0.0-1.0, rounded 2 decimal),
+              clean_ratio (0.0-1.0, rounded 2 decimal) | null,
               teeth_detected_count, caries_detected_count,
               invalid_reason (only if !is_valid)
             }
 
-        IMPORTANT: When is_processing=True, tell user scan masih dianalisis.
-        When requires_dentist_review=True, include this critical info in response.
+        ANTI-HALU:
+        - Kalau is_processing=True, bilang scan masih dianalisis. JANGAN halu hasil.
+        - Kalau requires_dentist_review=True, sebut critical info ini.
+        - Kalau overall_clean_ratio null, JANGAN sebut angka kebersihan — bilang 
+          "AI belum bisa hitung rata-rata kebersihan untuk scan ini".
+        - Kalau view.is_valid=False, sebut "AI tidak bisa analisis bagian itu, 
+          mungkin foto kurang jelas". JANGAN guess severity.
         """
         # FIX (Langfuse audit Bagian B1): Add trace_node wrapper for consistency.
         from app.config.observability import trace_node, _safe_dict_for_trace
@@ -634,7 +642,11 @@ def _bridge_scan_detail(result: dict, agent_results: dict, ctx: BridgeContext) -
 
 
 def _inject_scan_detail(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
-    """Inject specific scan detail to system prompt."""
+    """Inject specific scan detail to system prompt.
+    
+    Phase 2: tambah overall_clean_ratio (rata-rata clean_ratio dari valid views)
+    dan clean_ratio per-view supaya LLM bisa jawab "score bersihnya berapa persen".
+    """
     if not data or not data.get("has_data"):
         return ""
     
@@ -657,23 +669,45 @@ def _inject_scan_detail(data: dict, child_name: str, prompts: dict, response_mod
     rec_text = session.get("recommendation_text", "-")
     requires_review = session.get("requires_dentist_review", False)
     worst_severity = session.get("worst_view_severity", "-")
+    overall_clean_ratio = session.get("overall_clean_ratio")  # Phase 2
     
     text += f"\n- Status: {summary_status}"
     text += f"\n- Severity terburuk: {worst_severity}"
     text += f"\n- Ringkasan: {summary_text}"
     text += f"\n- Rekomendasi: {rec_text}"
     
+    # Phase 2: Overall clean ratio sebagai single number (untuk pertanyaan
+    # "score bersih berapa persen?")
+    if overall_clean_ratio is not None:
+        clean_pct = round(overall_clean_ratio * 100)
+        text += f"\n- Rata-rata kebersihan dari semua view: {clean_pct}% (clean_ratio: {overall_clean_ratio})"
+    
     if requires_review:
         text += f"\n- 🚨 PERLU PEMERIKSAAN DOKTER GIGI"
     
-    # Per-view findings (cap untuk hemat token)
+    # Per-view findings dengan clean_ratio (Phase 2: tambah clean_ratio per view)
     views = session.get("views") or []
     if views:
         text += f"\n- Detail per view ({len(views)} views):"
         for v in views[:5]:
             view_label = v.get("view_label", v.get("view_type", "-"))
             severity = v.get("severity_label") or v.get("severity", "-")
-            text += f"\n  • {view_label}: {severity}"
+            cr = v.get("clean_ratio")
+            cr_text = f", kebersihan {round(cr * 100)}%" if cr is not None else ""
+            invalid_reason = v.get("invalid_reason")
+            if invalid_reason:
+                text += f"\n  • {view_label}: TIDAK BISA DIANALISA ({invalid_reason})"
+            else:
+                text += f"\n  • {view_label}: {severity}{cr_text}"
+    
+    text += (
+        f"\n\nINSTRUKSI: "
+        f"Kalau user tanya 'score bersih berapa persen', pakai overall_clean_ratio "
+        f"(sudah dikonversi ke %). "
+        f"Kalau view tidak valid (invalid_reason), JANGAN halu — bilang 'AI tidak bisa "
+        f"analisis bagian itu, mungkin foto kurang jelas'. "
+        f"Kalau ada bagian dengan severity selain 'clean', sebut bagian mana yang affected."
+    )
     
     return text
 

@@ -33,24 +33,41 @@ def make_get_cerita_progress_tool(user_id: Optional[str]):
     async def get_cerita_progress() -> dict[str, Any]:
         """Get the child's progress through Cerita Peri (interactive dental education stories).
 
-        Use this tool when the user asks about:
-        - Cerita Peri progress ("anak saya udah belajar apa aja di Cerita Peri?")
-        - Completed modules or stars earned
-        - Which module to do next ("anak saya harus lanjut modul apa?")
-        - Whether the child has finished a specific topic
+        Cerita Peri = 6 modul edukasi gigi yang dikerjakan oleh ORANG TUA (bukan anak).
+        Tiap modul punya slides + quiz. Skor quiz nentuin stars_earned (1-3 bintang).
+
+        ✅ USE THIS TOOL when the user asks about:
+        - "anak saya udah belajar apa aja di Cerita Peri?" → list modules dengan status
+        - "modul apa aja yang udah selesai?" → filter modules by status='completed'
+        - "total bintang berapa?" → check total_stars
+        - "modul mana yang anak paling jago?" → check best_module (Phase 2)
+        - "skor terbaik di modul mana?" → check best_module.best_score (Phase 2)
+        - "modul apa yang harus dikerjain selanjutnya?" → check current_module_id
+        - "berapa modul yang udah dikerjain?" → check completed_count
+
+        ❌ DO NOT use this tool when:
+        - User asks isi modul tertentu → use get_cerita_module_detail (lock-aware)
+        - General education content questions (use search_dental_knowledge instead)
+        - User asks for certificate / sertifikat → fitur belum ada, bilang jujur
 
         Returns a dict with keys:
         - has_data: bool
-        - total_modules: int — total modules available
-        - completed_count: int — modules completed
-        - current_module_id: str — next module to do
-        - total_stars: int — stars earned across all modules
-        - modules: list — per-module progress detail
+        - total_modules: int — total modul available (saat ini 6)
+        - completed_count: int — modul yang completed
+        - total_stars: int — total bintang dari semua modul
+        - current_module_id: int | null — modul yang sedang aktif / berikutnya
+        - current_module_status: str — status modul current
+        - modules: list of {module_id, status, stars_earned, best_score, completed_at}
+        - best_module: {module_id, title, subtitle, stars_earned, best_score} | null (Phase 2)
         - error: str (only if has_data=False)
 
-        Do NOT use this tool for:
-        - General education content questions (use search_dental_knowledge instead)
-        - Asking the user to start a module (just suggest in your response)
+        ANTI-HALU:
+        - YANG NGERJAIN MODUL ADALAH ORANG TUA, bukan anak. Pakai bahasa
+          "Bunda sudah selesaikan modul X", BUKAN "anak sudah selesaikan".
+        - Kalau best_module null, artinya belum ada modul completed — JANGAN
+          karang "modul X paling jago".
+        - Kalau modul status='locked', JANGAN spoiler isi modul. Kasih tahu user
+          modul belum unlock + saran selesaikan modul sebelumnya.
         """
         from app.config.observability import trace_node, _safe_dict_for_trace
 
@@ -69,11 +86,14 @@ def make_get_cerita_progress_tool(user_id: Optional[str]):
             )
 
             if span:
+                best_mod = data.get("best_module") or {}
                 span.update(output={
                     "has_data": data.get("has_data", False),
                     "completed_count": data.get("completed_count", 0),
                     "total_stars": data.get("total_stars", 0),
                     "current_module_id": data.get("current_module_id"),
+                    "best_module_id": best_mod.get("module_id"),
+                    "best_module_stars": best_mod.get("stars_earned"),
                     "data": _safe_dict_for_trace(data),
                 })
 
@@ -209,23 +229,64 @@ def _bridge_cerita_progress(result: dict, agent_results: dict, ctx: BridgeContex
 
 
 def _inject_cerita_progress(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
-    """Inject Cerita Peri progress (modul completed + current modul) to system prompt."""
+    """Inject Cerita Peri progress (modul completed + current modul + best_module) to system prompt.
+    
+    Phase 2: tambah best_module — modul yang skornya paling baik.
+    Bug fix: sebelumnya pakai key wrong (completed_modules vs API completed_count).
+    Sekarang sinkron dengan response shape internal endpoint.
+    """
     if not data or not data.get("has_data"):
         return ""
     
-    completed = data.get("completed_modules", 0) or data.get("modules_completed", 0)
+    # Sinkron dengan response /agent/cerita-progress/{user_id}
+    completed = data.get("completed_count", 0)
     total = data.get("total_modules", 6)
-    current_modul = data.get("current_modul") or data.get("current_module") or {}
+    total_stars = data.get("total_stars", 0)
+    current_module_id = data.get("current_module_id")
+    current_module_status = data.get("current_module_status")
+    modules = data.get("modules") or []
+    best_module = data.get("best_module")  # Phase 2
     
     text = (
         f"\n\nData progress Cerita Peri {child_name} (dari tool call):"
         f"\n- Modul selesai: {completed} dari {total}"
+        f"\n- Total bintang: {total_stars}"
     )
-    if current_modul:
+    
+    if current_module_id is not None:
         text += (
-            f"\n- Modul saat ini: {current_modul.get('title', '-')} "
-            f"(status: {current_modul.get('user_status', '-')})"
+            f"\n- Modul yang sedang aktif: Modul {current_module_id} "
+            f"(status: {current_module_status or '-'})"
         )
+    
+    # Phase 2: Best module — yang skornya paling baik
+    if best_module:
+        bm_title = best_module.get("title", f"Modul {best_module.get('module_id', '?')}")
+        bm_stars = best_module.get("stars_earned", 0)
+        bm_score = best_module.get("best_score")
+        text += f"\n- Modul yang Bunda paling jago: \"{bm_title}\" — {bm_stars} bintang"
+        if bm_score is not None:
+            text += f" (skor: {bm_score})"
+    
+    # Per-module status snapshot (cap untuk hemat token, max 6 modul)
+    if modules:
+        text += f"\n- Detail per modul:"
+        for m in modules[:6]:
+            mid = m.get("module_id")
+            st = m.get("status", "-")
+            stars = m.get("stars_earned", 0)
+            score = m.get("best_score")
+            score_text = f", skor {score}" if score is not None else ""
+            text += f"\n  • Modul {mid}: {st}, {stars} bintang{score_text}"
+    
+    text += (
+        f"\n\nINSTRUKSI: "
+        f"Yang ngerjain modul adalah ORANG TUA (Bunda), bukan anak. Pakai bahasa "
+        f"\"Bunda sudah selesaikan modul X\". "
+        f"Kalau best_module null, JANGAN karang modul mana yang paling jago — "
+        f"belum ada modul yang completed. "
+        f"Untuk detail isi modul tertentu, panggil tool get_cerita_module_detail."
+    )
     
     return text
 
