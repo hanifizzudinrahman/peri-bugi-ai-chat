@@ -569,12 +569,15 @@ async def get_collections(x_internal_secret: str | None = Header(default=None)):
 
 @app.get(
     "/knowledge/documents",
-    summary="List dokumen di collection (pagination)",
+    summary="List dokumen di collection (pagination + optional metadata filter)",
 )
 async def list_documents(
     collection: str = "dental",
     limit: int = 20,
     offset: int = 0,
+    filter_key: Optional[str] = None,
+    filter_value: Optional[str] = None,
+    is_active: Optional[bool] = None,
     x_internal_secret: str | None = Header(default=None),
 ):
     _verify_internal_secret(x_internal_secret)
@@ -589,32 +592,61 @@ async def list_documents(
         if col_name not in existing:
             return {"documents": [], "total": 0, "collection": col_name, "offset": offset, "limit": limit}
 
+        # Phase 4.1: build optional Qdrant filter
+        # filter_key + filter_value → metadata.{key} = value
+        # is_active → metadata.is_active = bool
+        scroll_filter = None
+        if filter_key and filter_value is not None:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            must_conditions = [
+                FieldCondition(key=f"metadata.{filter_key}", match=MatchValue(value=filter_value))
+            ]
+            if is_active is not None:
+                must_conditions.append(
+                    FieldCondition(key="metadata.is_active", match=MatchValue(value=is_active))
+                )
+            scroll_filter = Filter(must=must_conditions)
+        elif is_active is not None:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            scroll_filter = Filter(
+                must=[FieldCondition(key="metadata.is_active", match=MatchValue(value=is_active))]
+            )
+
         # Qdrant scroll untuk list semua points dengan pagination
-        scroll_result = client.scroll(
-            collection_name=col_name,
-            limit=limit,
-            offset=offset,
-            with_payload=True,
-            with_vectors=False,
-        )
+        scroll_kwargs = {
+            "collection_name": col_name,
+            "limit": limit,
+            "offset": offset,
+            "with_payload": True,
+            "with_vectors": False,
+        }
+        if scroll_filter is not None:
+            scroll_kwargs["scroll_filter"] = scroll_filter
+
+        scroll_result = client.scroll(**scroll_kwargs)
         points = scroll_result[0]
 
-        # Count total
+        # Count total — kalau ada filter, count masih global (Qdrant scroll tidak return total).
+        # Untuk simplicity tetap pakai global count + kasih flag filter applied.
         col_info = client.get_collection(col_name)
         total = col_info.points_count or 0
 
         documents = []
         for pt in points:
             payload = pt.payload or {}
+            metadata_dict = payload.get("metadata", {}) or {}
             documents.append({
                 "id": str(pt.id),
                 "content": payload.get("page_content", payload.get("content", ""))[:500],
                 "content_full": payload.get("page_content", payload.get("content", "")),
-                "source": payload.get("metadata", {}).get("source", payload.get("source", "unknown")),
-                "doc_type": payload.get("metadata", {}).get("doc_type", "-"),
-                "page": payload.get("metadata", {}).get("page"),
-                "chunk_idx": payload.get("metadata", {}).get("chunk_idx"),
-                "metadata": payload.get("metadata", {}),
+                "source": metadata_dict.get("source", payload.get("source", "unknown")),
+                "doc_type": metadata_dict.get("doc_type", "-"),
+                "page": metadata_dict.get("page"),
+                "chunk_idx": metadata_dict.get("chunk_idx"),
+                "is_active": metadata_dict.get("is_active", True),  # Default true (legacy chunks)
+                "feature": metadata_dict.get("feature"),
+                "category": metadata_dict.get("category"),
+                "metadata": metadata_dict,
             })
 
         return {
@@ -623,6 +655,11 @@ async def list_documents(
             "collection": col_name,
             "offset": offset,
             "limit": limit,
+            "filter_applied": {
+                "filter_key": filter_key,
+                "filter_value": filter_value,
+                "is_active": is_active,
+            } if (filter_key or is_active is not None) else None,
         }
 
     except Exception as e:
@@ -1083,3 +1120,179 @@ async def delete_by_source(
     except Exception as e:
         log.error("delete_by_source error", error=str(e))
         raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
+
+
+# =============================================================================
+# Phase 4.1 — Knowledge Base: Toggle is_active per chunk (or bulk per feature)
+# =============================================================================
+
+class UpdateMetadataRequest(BaseModel):
+    """Request body untuk PATCH /knowledge/documents/{point_id}."""
+    collection: str = Field(default="dental", description="'dental' atau 'faq'")
+    metadata_updates: dict = Field(..., description="Field metadata yang mau di-update, e.g. {'is_active': False}")
+
+
+class BulkToggleRequest(BaseModel):
+    """Request body untuk PATCH /knowledge/documents/bulk-toggle."""
+    collection: str = Field(default="faq", description="'dental' atau 'faq'")
+    filter_key: str = Field(..., description="Metadata key untuk filter, e.g. 'feature' atau 'category'")
+    filter_value: str = Field(..., description="Value untuk match, e.g. 'mata_peri' atau 'prevention'")
+    is_active: bool = Field(..., description="Set semua matching chunks ke active=true atau false")
+
+
+@app.patch(
+    "/knowledge/documents/{point_id}",
+    summary="Update metadata satu dokumen (Phase 4.1 — toggle is_active per chunk)",
+)
+async def update_document_metadata(
+    point_id: str,
+    request: UpdateMetadataRequest,
+    x_internal_secret: str | None = Header(default=None),
+):
+    """
+    Update field di metadata dokumen tertentu.
+    Tipikal use case: toggle is_active=true/false untuk enable/disable
+    chunk dari retrieval AI.
+
+    metadata_updates di-merge ke metadata existing, tidak replace.
+    Field yang tidak ada di request tetap utuh.
+    """
+    _verify_internal_secret(x_internal_secret)
+
+    col_name = settings.QDRANT_COLLECTION if request.collection == "dental" else settings.QDRANT_FAQ_COLLECTION
+
+    try:
+        client = _get_kb_qdrant_client()
+
+        # Parse point_id (Qdrant supports int or UUID)
+        try:
+            parsed_id = int(point_id)
+        except ValueError:
+            parsed_id = point_id
+
+        # Get current point untuk verifikasi exists
+        existing_points = client.retrieve(
+            collection_name=col_name,
+            ids=[parsed_id],
+            with_payload=True,
+        )
+        if not existing_points:
+            raise HTTPException(status_code=404, detail=f"Document '{point_id}' not found in '{col_name}'.")
+
+        existing_payload = existing_points[0].payload or {}
+        existing_metadata = existing_payload.get("metadata", {}) or {}
+
+        # Merge updates ke metadata existing
+        new_metadata = {**existing_metadata, **request.metadata_updates}
+
+        # set_payload merge update — pakai set_payload dengan key path "metadata"
+        client.set_payload(
+            collection_name=col_name,
+            payload={"metadata": new_metadata},
+            points=[parsed_id],
+        )
+
+        return {
+            "status": "ok",
+            "message": f"Metadata dokumen '{point_id}' berhasil di-update.",
+            "point_id": point_id,
+            "collection": col_name,
+            "updated_metadata": new_metadata,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("update_document_metadata error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Update error: {str(e)}")
+
+
+@app.patch(
+    "/knowledge/documents/bulk-toggle",
+    summary="Bulk toggle is_active untuk semua chunks dengan metadata key/value tertentu",
+)
+async def bulk_toggle_active(
+    request: BulkToggleRequest,
+    x_internal_secret: str | None = Header(default=None),
+):
+    """
+    Bulk update field is_active untuk semua chunks yang match.
+
+    Contoh use case:
+    - Disable semua FAQ Janji Peri sekaligus:
+        {"collection": "faq", "filter_key": "feature", "filter_value": "janji_peri", "is_active": false}
+    - Enable semua dental KB kategori prevention:
+        {"collection": "dental", "filter_key": "category", "filter_value": "prevention", "is_active": true}
+
+    Note: filter_key adalah nama field di metadata (tanpa prefix "metadata.").
+    Internal akan compose ke "metadata.{filter_key}".
+    """
+    _verify_internal_secret(x_internal_secret)
+
+    col_name = settings.QDRANT_COLLECTION if request.collection == "dental" else settings.QDRANT_FAQ_COLLECTION
+
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        client = _get_kb_qdrant_client()
+
+        existing = {c.name for c in client.get_collections().collections}
+        if col_name not in existing:
+            return {
+                "status": "ok",
+                "message": f"Collection '{col_name}' tidak ada.",
+                "updated_count": 0,
+            }
+
+        # Scroll semua matching points untuk hitung dulu + dapat ID-nya
+        # Pakai filter metadata.{key} = value
+        metadata_key = f"metadata.{request.filter_key}"
+        match_filter = Filter(
+            must=[
+                FieldCondition(key=metadata_key, match=MatchValue(value=request.filter_value))
+            ]
+        )
+
+        # Scroll dengan pagination — ambil semua IDs
+        all_point_ids: list = []
+        next_offset = None
+        while True:
+            scroll_result = client.scroll(
+                collection_name=col_name,
+                scroll_filter=match_filter,
+                limit=200,
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            points, next_offset = scroll_result
+            for pt in points:
+                # Update metadata: merge is_active ke metadata
+                payload = pt.payload or {}
+                existing_meta = payload.get("metadata", {}) or {}
+                new_meta = {**existing_meta, "is_active": request.is_active}
+                client.set_payload(
+                    collection_name=col_name,
+                    payload={"metadata": new_meta},
+                    points=[pt.id],
+                )
+                all_point_ids.append(pt.id)
+
+            if next_offset is None:
+                break
+
+        return {
+            "status": "ok",
+            "message": (
+                f"{len(all_point_ids)} chunks di '{col_name}' ter-update "
+                f"{request.filter_key}={request.filter_value} → is_active={request.is_active}."
+            ),
+            "updated_count": len(all_point_ids),
+            "collection": col_name,
+            "filter": f"{request.filter_key}={request.filter_value}",
+            "is_active": request.is_active,
+        }
+
+    except Exception as e:
+        log.error("bulk_toggle_active error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Bulk toggle error: {str(e)}")
