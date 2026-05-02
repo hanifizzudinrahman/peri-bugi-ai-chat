@@ -1157,12 +1157,41 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
         # FE detail screen pakai ini untuk render foto dengan annotation.
         # NOTE: URL ini signed dengan TTL 1 jam. Untuk akses ulang setelah expired,
         # FE harus fetch detail dari /mata-peri/sessions/{id} yang regenerate URL fresh.
+        #
+        # Phase 4.1.2 fix (Bug B2+B3): Skip emit image_artifacts kalau result tidak valid.
+        # Reasoning:
+        #   - is_valid=False: ai-cv tidak detect mulut sama sekali (mis. foto buah,
+        #     dokumen, dll). Render overlay = misleading user.
+        #   - teeth.detected_count=0: mulut detected tapi tidak ada gigi visible
+        #     (mulut tertutup, atau model gagal segment gigi). Render overlay
+        #     hijau di area kosong = confuse user.
+        # Dalam kedua case, ai-cv sudah set summary_status='gagal' atau text
+        # yang appropriate (lihat orchestrator.py:600-614 di ai-cv) — jadi
+        # AI tetap kasih response empati ke user untuk ambil ulang foto.
+        # Yang kita skip cuma overlay-nya saja.
+        # Plus surface flag image_unreadable supaya FE bisa render hint card
+        # "Foto belum bisa terbaca jelas" tanpa overlay yang menyesatkan.
+        any_skipped = False
+        skip_count = 0
         image_results = image_analysis_state.get("results", []) or []
         if image_results and isinstance(image_results, list):
             artifacts_list = []
             for ir in image_results:
                 if not isinstance(ir, dict):
                     continue
+
+                # Phase 4.1.2: skip rendering kalau foto bermasalah
+                is_valid = ir.get("is_valid", True)
+                teeth = ir.get("teeth_result") or {}
+                teeth_count = (
+                    teeth.get("detected_count", 0)
+                    if isinstance(teeth, dict) else 0
+                )
+                if not is_valid or teeth_count == 0:
+                    any_skipped = True
+                    skip_count += 1
+                    continue  # skip — jangan render overlay menyesatkan
+
                 artifacts = ir.get("artifacts") or {}
                 if not isinstance(artifacts, dict):
                     continue
@@ -1177,6 +1206,14 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
                     })
             if artifacts_list:
                 metadata["image_artifacts"] = artifacts_list
+
+        # Phase 4.1.2 (Bug B3): Surface skip flag — FE bisa render hint card
+        # "Foto belum bisa terbaca jelas" tanpa overlay yang menyesatkan.
+        # Kunci 'image_unreadable' = boolean True kalau ALL views skipped (tidak
+        # ada artifacts list yang valid).
+        if any_skipped and not metadata.get("image_artifacts"):
+            metadata["image_unreadable"] = True
+            metadata["image_unreadable_count"] = skip_count
     state["llm_metadata"] = metadata
 
     log = LLMCallLogPayload(

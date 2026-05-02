@@ -553,6 +553,14 @@ async def _analyze_chat_image(state: AgentState, image_url: str) -> dict[str, An
         "view_hint": view_hint,
         "chat_message_id": chat_message_id,
         "trace_id": trace_id,
+        # Phase 4.1.2 fix (Bug B1): forward source ('web'|'mobile') supaya
+        # MataPeriScanSession.source label benar di Rapot Peri / Mata Peri list.
+        # Sebelum fix: ai-chat tidak forward state['source'] → service fallback
+        # ke 'mobile' (lihat chat_image_analysis_service.py:266) → semua web
+        # session ke-tag 'mobile'.
+        # state['source'] sudah di-set oleh API (chat.py:688) saat /chat/message,
+        # jadi kita tinggal forward.
+        "source": state.get("source"),
     }
 
     headers = {}
