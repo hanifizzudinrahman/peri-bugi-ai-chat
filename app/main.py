@@ -1140,73 +1140,9 @@ class BulkToggleRequest(BaseModel):
     is_active: bool = Field(..., description="Set semua matching chunks ke active=true atau false")
 
 
-@app.patch(
-    "/knowledge/documents/{point_id}",
-    summary="Update metadata satu dokumen (Phase 4.1 — toggle is_active per chunk)",
-)
-async def update_document_metadata(
-    point_id: str,
-    request: UpdateMetadataRequest,
-    x_internal_secret: str | None = Header(default=None),
-):
-    """
-    Update field di metadata dokumen tertentu.
-    Tipikal use case: toggle is_active=true/false untuk enable/disable
-    chunk dari retrieval AI.
-
-    metadata_updates di-merge ke metadata existing, tidak replace.
-    Field yang tidak ada di request tetap utuh.
-    """
-    _verify_internal_secret(x_internal_secret)
-
-    col_name = settings.QDRANT_COLLECTION if request.collection == "dental" else settings.QDRANT_FAQ_COLLECTION
-
-    try:
-        client = _get_kb_qdrant_client()
-
-        # Parse point_id (Qdrant supports int or UUID)
-        try:
-            parsed_id = int(point_id)
-        except ValueError:
-            parsed_id = point_id
-
-        # Get current point untuk verifikasi exists
-        existing_points = client.retrieve(
-            collection_name=col_name,
-            ids=[parsed_id],
-            with_payload=True,
-        )
-        if not existing_points:
-            raise HTTPException(status_code=404, detail=f"Document '{point_id}' not found in '{col_name}'.")
-
-        existing_payload = existing_points[0].payload or {}
-        existing_metadata = existing_payload.get("metadata", {}) or {}
-
-        # Merge updates ke metadata existing
-        new_metadata = {**existing_metadata, **request.metadata_updates}
-
-        # set_payload merge update — pakai set_payload dengan key path "metadata"
-        client.set_payload(
-            collection_name=col_name,
-            payload={"metadata": new_metadata},
-            points=[parsed_id],
-        )
-
-        return {
-            "status": "ok",
-            "message": f"Metadata dokumen '{point_id}' berhasil di-update.",
-            "point_id": point_id,
-            "collection": col_name,
-            "updated_metadata": new_metadata,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error("update_document_metadata error", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Update error: {str(e)}")
-
-
+# NOTE Phase 4.1: bulk-toggle endpoint MUST be defined BEFORE /{point_id}
+# Otherwise FastAPI matches "bulk-toggle" as point_id (anything matches dynamic param).
+# Route registration order matters in FastAPI — first match wins.
 @app.patch(
     "/knowledge/documents/bulk-toggle",
     summary="Bulk toggle is_active untuk semua chunks dengan metadata key/value tertentu",
@@ -1296,3 +1232,70 @@ async def bulk_toggle_active(
     except Exception as e:
         log.error("bulk_toggle_active error", error=str(e))
         raise HTTPException(status_code=500, detail=f"Bulk toggle error: {str(e)}")
+
+
+@app.patch(
+    "/knowledge/documents/{point_id}",
+    summary="Update metadata satu dokumen (Phase 4.1 — toggle is_active per chunk)",
+)
+async def update_document_metadata(
+    point_id: str,
+    request: UpdateMetadataRequest,
+    x_internal_secret: str | None = Header(default=None),
+):
+    """
+    Update field di metadata dokumen tertentu.
+    Tipikal use case: toggle is_active=true/false untuk enable/disable
+    chunk dari retrieval AI.
+
+    metadata_updates di-merge ke metadata existing, tidak replace.
+    Field yang tidak ada di request tetap utuh.
+    """
+    _verify_internal_secret(x_internal_secret)
+
+    col_name = settings.QDRANT_COLLECTION if request.collection == "dental" else settings.QDRANT_FAQ_COLLECTION
+
+    try:
+        client = _get_kb_qdrant_client()
+
+        # Parse point_id (Qdrant supports int or UUID)
+        try:
+            parsed_id = int(point_id)
+        except ValueError:
+            parsed_id = point_id
+
+        # Get current point untuk verifikasi exists
+        existing_points = client.retrieve(
+            collection_name=col_name,
+            ids=[parsed_id],
+            with_payload=True,
+        )
+        if not existing_points:
+            raise HTTPException(status_code=404, detail=f"Document '{point_id}' not found in '{col_name}'.")
+
+        existing_payload = existing_points[0].payload or {}
+        existing_metadata = existing_payload.get("metadata", {}) or {}
+
+        # Merge updates ke metadata existing
+        new_metadata = {**existing_metadata, **request.metadata_updates}
+
+        # set_payload merge update — pakai set_payload dengan key path "metadata"
+        client.set_payload(
+            collection_name=col_name,
+            payload={"metadata": new_metadata},
+            points=[parsed_id],
+        )
+
+        return {
+            "status": "ok",
+            "message": f"Metadata dokumen '{point_id}' berhasil di-update.",
+            "point_id": point_id,
+            "collection": col_name,
+            "updated_metadata": new_metadata,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("update_document_metadata error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Update error: {str(e)}")
