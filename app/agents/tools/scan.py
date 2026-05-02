@@ -72,17 +72,26 @@ def make_get_scan_history_tool(
     mata_peri_ctx = ctx.get("mata_peri_last_result")
 
     @tool
-    async def get_scan_history(since: str = "all") -> dict[str, Any]:
-        """Get the child's Mata Peri (dental scan) history, optionally filtered by period.
+    async def get_scan_history(
+        since: str = "all",
+        scan_type: str = "all",
+    ) -> dict[str, Any]:
+        """Get the child's Mata Peri (dental scan) history, with optional period + source filtering.
+
+        ⚠️ TWO TYPES OF SCANS in Peri Bugi:
+        1. **Scan Lengkap (Mata Peri)** = 5 view foto resmi (depan, atas, bawah, kiri, kanan).
+           Dilakukan via menu Mata Peri di aplikasi. `feature_source = "mata_peri"`.
+        2. **Scan via Chat (Tanya Peri)** = 1 foto cepat di-upload via chat ke Tanya Peri.
+           Quick analysis, bukan scan lengkap. `feature_source = "tanya_peri"`.
 
         ✅ USE THIS TOOL when user asks about:
-        - "hasil scan terakhir gimana?" → since="all", check latest_scan
-        - "scan minggu lalu pernah gak?" → since="last_week"
-        - "scan bulan ini ada berapa?" → since="last_month"
-        - "scan 3 bulan terakhir gimana?" → since="last_3_months"
-        - "scan 6 bulan terakhir, ada warning gak?" → since="last_6_months"
-        - "tahun ini scan berapa kali?" → since="last_year"
-        - "tren scan gigi anak makin baik gak?" → since="last_3_months", lihat scan_count + summary_status pattern
+        - "hasil scan terakhir gimana?" → since="all", scan_type="all" — show latest dari source apapun
+        - "scan minggu lalu pernah?" → since="last_week", scan_type="all"
+        - "Mata Peri terakhir kapan?" → scan_type="full_scan" (cuma scan lengkap)
+        - "scan lengkap berapa kali?" → scan_type="full_scan"
+        - "tadi foto chat hasilnya gimana?" → scan_type="chat_scan"
+        - "berapa kali scan lengkap bulan ini?" → since="last_month", scan_type="full_scan"
+        - "tahun ini scan total berapa?" → since="last_year", scan_type="all"
 
         ❌ DO NOT use this tool when:
         - User minta detail 1 scan tertentu → use get_mata_peri_scan_detail
@@ -97,22 +106,40 @@ def make_get_scan_history_tool(
                 - "last_6_months" — 6 bulan terakhir
                 - "last_year" — 1 tahun terakhir
 
+            scan_type: Source filter. Valid values:
+                - "all" (DEFAULT) — Mata Peri + Tanya Peri (semua sumber)
+                - "full_scan" — hanya Mata Peri 5-view (scan resmi/lengkap)
+                - "chat_scan" — hanya Tanya Peri 1-view (foto via chat)
+
+                INSTRUKSI MEMILIH:
+                - User sebut "Mata Peri" / "scan lengkap" / "5 angle" → "full_scan"
+                - User sebut "foto chat" / "tadi kirim foto" / "Tanya Peri" → "chat_scan"
+                - Ambigu / "scan apapun" / general → "all"
+
         Returns a dict with keys:
         - has_data: bool
-        - period: str (echo of since)
-        - period_label: str — Indonesian label
-        - scan_count: int — total scan dalam period
+        - period: str | period_label: str
+        - scan_type: str (echo) | scan_type_label: str
+        - scan_count: int — total scan setelah filter
+        - count_full_scan: int — breakdown: jumlah Mata Peri 5-view
+        - count_chat_scan: int — breakdown: jumlah Tanya Peri 1-view
         - latest_scan: dict | null
         - scans: list of {scan_date, session_id, summary_status, summary_text,
-                  recommendation_text, requires_dentist_review}
+                  recommendation_text, requires_dentist_review,
+                  feature_source ("mata_peri"|"tanya_peri"),
+                  view_count_expected (5 | 1),
+                  source_label (Indonesian)}
         - source: "user_context" | "api"
 
-        ANTI-HALU:
-        - Kalau scan_count=0 dengan period spesifik, bilang "tidak ada scan dalam X bulan terakhir".
-        - Kalau user nanya tren ("makin baik gak"), pakai sequence summary_status di scans[]
-          (urutan latest-first), JANGAN halu kalau data sedikit.
-        - source="user_context" cuma return 1 scan terakhir — kalau user minta period specific,
-          tetap pakai source="api" untuk dapat data lebih lengkap.
+        ANTI-HALU & DIFFERENTIATION:
+        - SETIAP scan punya field `feature_source` — pakai ini untuk label di response.
+          Mata Peri = "Scan Lengkap (5-view)", Tanya Peri = "Scan via Chat (1-view)".
+        - Kalau user tanya "scan berapa kali" tanpa specify type, sebut breakdown:
+          "X scan total — Y scan lengkap + Z dari foto chat".
+        - Kalau scan_count=0 dengan filter spesifik, sebut filter explicitly:
+          "Tidak ada scan lengkap dalam 1 bulan terakhir" (jangan generic "tidak ada scan").
+        - Kalau user nanya tren, perhatikan: scan lengkap (5-view) lebih comprehensive
+          daripada scan dari chat (1-view). Untuk tren proper, sebut limitation kalau perlu.
         """
         from app.config.observability import trace_node, _safe_dict_for_trace
 
@@ -123,17 +150,22 @@ def make_get_scan_history_tool(
                 "has_user_id": bool(user_id),
                 "has_context_snapshot": mata_peri_ctx is not None,
                 "since": since,
+                "scan_type": scan_type,
             },
         ) as span:
-            # Fast path: user_context sudah punya snapshot
-            # HANYA dipakai kalau since='all' (default) — kalau filter spesifik,
-            # harus call API untuk dapat data lengkap.
-            if mata_peri_ctx and since == "all":
+            # Fast path: user_context sudah punya snapshot.
+            # HANYA dipakai kalau since='all' DAN scan_type='all' — kalau ada filter,
+            # harus call API untuk dapat data lengkap dengan breakdown.
+            if mata_peri_ctx and since == "all" and scan_type == "all":
                 result = {
                     "has_data": True,
                     "period": "all",
                     "period_label": "scan terakhir",
+                    "scan_type": "all",
+                    "scan_type_label": "(scan apapun)",
                     "scan_count": 1,
+                    "count_full_scan": 0,  # tidak tahu dari snapshot
+                    "count_chat_scan": 0,  # tidak tahu dari snapshot
                     "latest_scan": mata_peri_ctx,
                     "scans": [mata_peri_ctx],
                     "source": "user_context",
@@ -144,6 +176,7 @@ def make_get_scan_history_tool(
                         "has_data": True,
                         "source": "user_context",
                         "since": since,
+                        "scan_type": scan_type,
                         "latest_scan": _safe_dict_for_trace(mata_peri_ctx),
                     })
                 return result
@@ -157,7 +190,8 @@ def make_get_scan_history_tool(
                 return {"has_data": False, "error": "user_id tidak tersedia"}
 
             data = await call_internal_get(
-                f"/api/v1/internal/agent/mata-peri-history/{user_id}?since={since}"
+                f"/api/v1/internal/agent/mata-peri-history/{user_id}"
+                f"?since={since}&scan_type={scan_type}"
             )
 
             if span:
@@ -165,7 +199,10 @@ def make_get_scan_history_tool(
                     "mode": "history",
                     "has_data": data.get("has_data", False),
                     "scan_count": data.get("scan_count", 0),
+                    "count_full_scan": data.get("count_full_scan", 0),
+                    "count_chat_scan": data.get("count_chat_scan", 0),
                     "period": data.get("period"),
+                    "scan_type": data.get("scan_type"),
                     "source": "api",
                     "data": _safe_dict_for_trace(data),
                 })
@@ -602,46 +639,79 @@ def _inject_scan_history(data: dict, child_name: str, prompts: dict, response_mo
     """Inject scan history (list of recent scans) to system prompt.
     
     Phase 3: tambah period info kalau user filter by `since`.
+    Phase 3.1: tambah source differentiation (Mata Peri full vs Tanya Peri chat).
     """
     if not data or not data.get("has_data"):
-        # Loud signal kalau tool return empty for specific period
-        if data and data.get("period") and data.get("period") != "all":
-            period_label = data.get("period_label", data.get("period"))
-            return (
-                f"\n\nData history scan Mata Peri {child_name}: "
-                f"TIDAK ADA scan dalam {period_label}. "
-                f"Bilang user dengan jujur."
-            )
+        # Loud signal kalau tool return empty for specific filter
+        if data:
+            period = data.get("period", "all")
+            scan_type = data.get("scan_type", "all")
+            if period != "all" or scan_type != "all":
+                period_label = data.get("period_label", period)
+                scan_type_label = data.get("scan_type_label", "")
+                return (
+                    f"\n\nData history scan {child_name}: "
+                    f"TIDAK ADA scan {scan_type_label} dalam {period_label}. "
+                    f"Bilang user dengan jujur."
+                )
         return ""
     
-    # API return field "scans" (atau "sessions" untuk legacy compat)
     scans = data.get("scans") or data.get("sessions") or []
     if not scans:
         return ""
     
     period = data.get("period", "all")
     period_label = data.get("period_label", "scan terakhir")
+    scan_type = data.get("scan_type", "all")
+    scan_type_label = data.get("scan_type_label", "")
     scan_count = data.get("scan_count", len(scans))
+    count_full_scan = data.get("count_full_scan", 0)
+    count_chat_scan = data.get("count_chat_scan", 0)
     
-    text = f"\n\nData history scan Mata Peri {child_name} (dari tool call):"
+    text = f"\n\nData history scan {child_name} (dari tool call):"
+    
+    # Period info
     if period != "all":
         text += f"\n- Period: {period_label}"
-    text += f"\n- Total scan: {scan_count}"
     
-    # Show latest scans (cap di 8 supaya tidak boros token kalau period besar)
+    # Scan type filter info
+    if scan_type != "all":
+        text += f"\n- Filter: {scan_type_label}"
+    
+    # Total + breakdown
+    text += f"\n- Total scan: {scan_count}"
+    if scan_type == "all" and (count_full_scan > 0 or count_chat_scan > 0):
+        # Show breakdown supaya LLM bisa context-aware response
+        breakdown_parts = []
+        if count_full_scan > 0:
+            breakdown_parts.append(f"{count_full_scan} Scan Lengkap (5-view via Mata Peri)")
+        if count_chat_scan > 0:
+            breakdown_parts.append(f"{count_chat_scan} Scan Chat (1-view via Tanya Peri)")
+        text += f"\n  Breakdown: {' + '.join(breakdown_parts)}"
+    
+    # Show scans (cap di 8)
     for i, sess in enumerate(scans[:8]):
         scan_date = sess.get("scan_date") or sess.get("performed_at") or sess.get("completed_at", "-")
         status = sess.get("summary_status", "-")
+        source_label = sess.get("source_label", "")
+        feature_source = sess.get("feature_source", "")
         requires_review = sess.get("requires_dentist_review")
         warning = " 🚨 PERLU DOKTER" if requires_review else ""
-        text += f"\n  {i+1}. {scan_date} — Status: {status}{warning}"
+        
+        # Format: "1. 2026-05-01 — Status: ok [Scan Lengkap (5-view)]"
+        source_suffix = f" [{source_label}]" if source_label else ""
+        text += f"\n  {i+1}. {scan_date} — Status: {status}{source_suffix}{warning}"
     
     if len(scans) > 8:
         text += f"\n  (dan {len(scans) - 8} scan lainnya tidak ditampilkan)"
     
     text += (
-        f"\n\nINSTRUKSI: Pakai data ini untuk jawab pertanyaan tentang riwayat / tren. "
-        f"Kalau user nanya kapan scan terakhir di period spesifik, ambil scan_date pertama. "
+        f"\n\nINSTRUKSI: "
+        f"Pakai data ini untuk jawab pertanyaan tentang riwayat / tren. "
+        f"Setiap scan punya source label — sebut explicit kalau user tanya specific "
+        f"(\"scan lengkap berapa kali\" → count_full_scan; \"foto chat berapa\" → count_chat_scan). "
+        f"Untuk pertanyaan generic \"scan berapa\", sebut breakdown: "
+        f"\"Total X scan, terdiri dari Y scan lengkap dan Z dari foto chat\". "
         f"Kalau ada requires_dentist_review=True, sebut info itu."
     )
     
@@ -706,6 +776,7 @@ def _inject_scan_detail(data: dict, child_name: str, prompts: dict, response_mod
     
     Phase 2: tambah overall_clean_ratio (rata-rata clean_ratio dari valid views)
     dan clean_ratio per-view supaya LLM bisa jawab "score bersihnya berapa persen".
+    Phase 3.1: tambah source_label (Mata Peri 5-view vs Tanya Peri 1-view).
     """
     if not data or not data.get("has_data"):
         return ""
@@ -713,7 +784,14 @@ def _inject_scan_detail(data: dict, child_name: str, prompts: dict, response_mod
     session = data.get("session") or {}
     is_processing = session.get("is_processing", False)
     
-    text = f"\n\nDetail Scan Mata Peri {child_name} (dari tool call):"
+    # Phase 3.1: source label
+    source_label = session.get("source_label")
+    feature_source = session.get("feature_source")
+    view_count_expected = session.get("view_count_expected", 5)
+    
+    text = f"\n\nDetail Scan {child_name} (dari tool call):"
+    if source_label:
+        text += f"\n- Tipe scan: {source_label}"
     text += f"\n- Session ID: {session.get('session_id', '-')}"
     text += f"\n- Tanggal: {session.get('performed_at') or session.get('completed_at', '-')}"
     
@@ -729,15 +807,13 @@ def _inject_scan_detail(data: dict, child_name: str, prompts: dict, response_mod
     rec_text = session.get("recommendation_text", "-")
     requires_review = session.get("requires_dentist_review", False)
     worst_severity = session.get("worst_view_severity", "-")
-    overall_clean_ratio = session.get("overall_clean_ratio")  # Phase 2
+    overall_clean_ratio = session.get("overall_clean_ratio")
     
     text += f"\n- Status: {summary_status}"
     text += f"\n- Severity terburuk: {worst_severity}"
     text += f"\n- Ringkasan: {summary_text}"
     text += f"\n- Rekomendasi: {rec_text}"
     
-    # Phase 2: Overall clean ratio sebagai single number (untuk pertanyaan
-    # "score bersih berapa persen?")
     if overall_clean_ratio is not None:
         clean_pct = round(overall_clean_ratio * 100)
         text += f"\n- Rata-rata kebersihan dari semua view: {clean_pct}% (clean_ratio: {overall_clean_ratio})"
@@ -745,7 +821,6 @@ def _inject_scan_detail(data: dict, child_name: str, prompts: dict, response_mod
     if requires_review:
         text += f"\n- 🚨 PERLU PEMERIKSAAN DOKTER GIGI"
     
-    # Per-view findings dengan clean_ratio (Phase 2: tambah clean_ratio per view)
     views = session.get("views") or []
     if views:
         text += f"\n- Detail per view ({len(views)} views):"
@@ -760,10 +835,19 @@ def _inject_scan_detail(data: dict, child_name: str, prompts: dict, response_mod
             else:
                 text += f"\n  • {view_label}: {severity}{cr_text}"
     
+    # Phase 3.1: Context-aware instruction berdasarkan source
+    text += "\n\nINSTRUKSI: "
+    if feature_source == "tanya_peri":
+        text += (
+            "Ini adalah analisis dari foto chat (1-view, bukan scan lengkap), "
+            "jadi cuma cover bagian yang ke-foto. "
+            "Sarankan user untuk Mata Peri (5-view scan resmi) untuk hasil lebih lengkap. "
+        )
+    elif feature_source == "mata_peri":
+        text += "Ini adalah scan lengkap 5-view dari Mata Peri — cover semua sisi gigi. "
+    
     text += (
-        f"\n\nINSTRUKSI: "
-        f"Kalau user tanya 'score bersih berapa persen', pakai overall_clean_ratio "
-        f"(sudah dikonversi ke %). "
+        f"Kalau user tanya 'score bersih berapa persen', pakai overall_clean_ratio. "
         f"Kalau view tidak valid (invalid_reason), JANGAN halu — bilang 'AI tidak bisa "
         f"analisis bagian itu, mungkin foto kurang jelas'. "
         f"Kalau ada bagian dengan severity selain 'clean', sebut bagian mana yang affected."
