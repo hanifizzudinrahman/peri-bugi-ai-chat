@@ -205,3 +205,149 @@ register_tool(ToolSpec(
     prompt_injector=_inject_caries_risk,
     thinking_label="Mengecek hasil kuesioner risiko karies...",
 ))
+
+
+# =============================================================================
+# Phase 3 — Tool: get_caries_questionnaire_preview
+# =============================================================================
+
+def make_get_caries_questionnaire_preview_tool():
+    """Factory: build get_caries_questionnaire_preview tool.
+    
+    Note: TIDAK butuh user_id — questionnaire active sama untuk semua user.
+    """
+
+    @tool
+    async def get_caries_questionnaire_preview(mode: str = "summary") -> dict[str, Any]:
+        """Preview pertanyaan kuesioner risiko karies (untuk user yang mau tau dulu sebelum isi).
+
+        ✅ USE THIS TOOL when user asks about:
+        - "kuesionernya tanya apa aja?"
+        - "pertanyaannya gimana sih kuesionernya?"
+        - "mau tau dulu sebelum isi"
+        - "kategori pertanyaannya apa?"
+        - "berapa pertanyaan total kuesionernya?"
+
+        ❌ DO NOT use this tool when:
+        - User minta hasil kuesioner mereka → use get_caries_risk_latest
+        - User minta general info caries → use search_dental_knowledge
+        - User minta cara isi kuesioner → use search_app_faq
+
+        Args:
+            mode: "summary" (default) or "full".
+                - summary: 4 kategori dengan 2 contoh pertanyaan per kategori
+                          Cocok untuk user general yang minta gambaran singkat.
+                - full: semua pertanyaan + opsi jawaban.
+                       Pakai HANYA kalau user explicit minta detail / list semua.
+
+        Returns dict with keys:
+        - has_data: bool
+        - mode: str — echo of input
+        - questionnaire_title: str
+        - total_questions: int — total active questions
+        - total_categories: int
+        - categories: list of {code, label, description, question_count, ...}
+          - summary mode: each category has 'example_questions' (max 2)
+          - full mode: each category has 'questions' list with options
+
+        ANTI-HALU:
+        - Default to "summary" mode untuk hindari overwhelm user.
+        - Kalau user minta detail / "lengkap" / "semua" → mode="full".
+        - JANGAN halu pertanyaan yang tidak ada di list — pakai data tool.
+        - Note: kuesioner ini diisi oleh ORANG TUA tentang anak, bukan anak.
+        """
+        from app.config.observability import trace_node, _safe_dict_for_trace
+
+        async with trace_node(
+            name="tool:get_caries_questionnaire_preview",
+            state=None,
+            input_data={"mode": mode},
+        ) as span:
+            data = await call_internal_get(
+                f"/api/v1/internal/agent/caries-questionnaire-preview?mode={mode}"
+            )
+
+            if span:
+                span.update(output={
+                    "has_data": data.get("has_data", False),
+                    "mode": data.get("mode"),
+                    "total_questions": data.get("total_questions"),
+                    "total_categories": data.get("total_categories"),
+                    "data": _safe_dict_for_trace(data),
+                })
+
+            return data
+
+    return get_caries_questionnaire_preview
+
+
+def _bridge_caries_questionnaire_preview(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: preview → agent_results['caries_questionnaire_preview']."""
+    agent_results["caries_questionnaire_preview"] = result
+
+
+def _inject_caries_questionnaire_preview(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject caries questionnaire preview to system prompt."""
+    if not data or not data.get("has_data"):
+        if data and data.get("reason"):
+            return (
+                f"\n\nPreview kuesioner karies: BELUM TERSEDIA "
+                f"(reason: {data.get('reason')}). Bilang user dengan jujur."
+            )
+        return ""
+    
+    mode = data.get("mode", "summary")
+    title = data.get("questionnaire_title", "Kuesioner Risiko Karies")
+    total_questions = data.get("total_questions", 0)
+    total_categories = data.get("total_categories", 0)
+    categories = data.get("categories") or []
+    
+    text = (
+        f"\n\nPreview Kuesioner Risiko Karies (mode={mode}, dari tool call):"
+        f"\n- Judul: {title}"
+        f"\n- Total: {total_questions} pertanyaan dalam {total_categories} kategori"
+    )
+    
+    for cat in categories:
+        label = cat.get("label", "-")
+        count = cat.get("question_count", 0)
+        text += f"\n\n**{label}** ({count} pertanyaan):"
+        
+        if cat.get("description"):
+            text += f"\n  _{cat['description']}_"
+        
+        if mode == "summary":
+            examples = cat.get("example_questions") or []
+            if examples:
+                text += f"\n  Contoh pertanyaan:"
+                for q in examples:
+                    text += f"\n  • {q}"
+        else:  # full
+            questions = cat.get("questions") or []
+            for i, q in enumerate(questions, 1):
+                text += f"\n  {i}. {q.get('question_text', '-')}"
+                if q.get("help_text"):
+                    text += f"\n     _Bantuan: {q['help_text']}_"
+                opts = q.get("options") or []
+                if opts:
+                    opt_labels = [o.get("option_text", "?") for o in opts]
+                    text += f"\n     Opsi: {' / '.join(opt_labels)}"
+    
+    text += (
+        f"\n\nINSTRUKSI: "
+        f"Kalau user minta lebih detail dari summary, panggil tool lagi dengan mode='full'. "
+        f"Inget: kuesioner ini diisi oleh ORANG TUA tentang kondisi anak. "
+        f"Bahasa ibu-friendly, JANGAN dump semua pertanyaan kalau user cuma minta gambaran."
+    )
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_caries_questionnaire_preview",
+    agent_key="caries_questionnaire_preview",
+    required_agent="rapot_peri",
+    bridge_handler=_bridge_caries_questionnaire_preview,
+    prompt_injector=_inject_caries_questionnaire_preview,
+    thinking_label="Mengambil preview kuesioner...",
+))

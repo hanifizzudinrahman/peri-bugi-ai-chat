@@ -72,24 +72,47 @@ def make_get_scan_history_tool(
     mata_peri_ctx = ctx.get("mata_peri_last_result")
 
     @tool
-    async def get_scan_history() -> dict[str, Any]:
-        """Get the child's Mata Peri (dental scan) history, including the latest scan result.
+    async def get_scan_history(since: str = "all") -> dict[str, Any]:
+        """Get the child's Mata Peri (dental scan) history, optionally filtered by period.
 
-        Use this tool when the user asks about:
-        - Past scan results ("hasil scan terakhir gimana?")
-        - Whether a previous scan detected anything
-        - Trends over time ("gigi anak saya makin baik gak?")
+        ✅ USE THIS TOOL when user asks about:
+        - "hasil scan terakhir gimana?" → since="all", check latest_scan
+        - "scan minggu lalu pernah gak?" → since="last_week"
+        - "scan bulan ini ada berapa?" → since="last_month"
+        - "scan 3 bulan terakhir gimana?" → since="last_3_months"
+        - "scan 6 bulan terakhir, ada warning gak?" → since="last_6_months"
+        - "tahun ini scan berapa kali?" → since="last_year"
+        - "tren scan gigi anak makin baik gak?" → since="last_3_months", lihat scan_count + summary_status pattern
+
+        ❌ DO NOT use this tool when:
+        - User minta detail 1 scan tertentu → use get_mata_peri_scan_detail
+        - User mau analisis foto BARU → analyze_chat_image (auto-routed)
+
+        Args:
+            since: Period filter. Valid values:
+                - "all" (DEFAULT) — 5 scan terakhir
+                - "last_week" — 1 minggu terakhir
+                - "last_month" — 1 bulan terakhir
+                - "last_3_months" — 3 bulan terakhir
+                - "last_6_months" — 6 bulan terakhir
+                - "last_year" — 1 tahun terakhir
 
         Returns a dict with keys:
         - has_data: bool
-        - latest_scan: dict with scan summary (or null)
-        - scans: list of recent scans
+        - period: str (echo of since)
+        - period_label: str — Indonesian label
+        - scan_count: int — total scan dalam period
+        - latest_scan: dict | null
+        - scans: list of {scan_date, session_id, summary_status, summary_text,
+                  recommendation_text, requires_dentist_review}
         - source: "user_context" | "api"
-        - error: str (only on failure)
 
-        IMPORTANT: This tool is for history queries ONLY.
-        For analyzing a NEW photo uploaded in the current turn, use analyze_chat_image instead.
-        The image flow is auto-routed by the system — you typically don't need to call analyze_chat_image manually.
+        ANTI-HALU:
+        - Kalau scan_count=0 dengan period spesifik, bilang "tidak ada scan dalam X bulan terakhir".
+        - Kalau user nanya tren ("makin baik gak"), pakai sequence summary_status di scans[]
+          (urutan latest-first), JANGAN halu kalau data sedikit.
+        - source="user_context" cuma return 1 scan terakhir — kalau user minta period specific,
+          tetap pakai source="api" untuk dapat data lebih lengkap.
         """
         from app.config.observability import trace_node, _safe_dict_for_trace
 
@@ -99,12 +122,18 @@ def make_get_scan_history_tool(
             input_data={
                 "has_user_id": bool(user_id),
                 "has_context_snapshot": mata_peri_ctx is not None,
+                "since": since,
             },
         ) as span:
             # Fast path: user_context sudah punya snapshot
-            if mata_peri_ctx:
+            # HANYA dipakai kalau since='all' (default) — kalau filter spesifik,
+            # harus call API untuk dapat data lengkap.
+            if mata_peri_ctx and since == "all":
                 result = {
                     "has_data": True,
+                    "period": "all",
+                    "period_label": "scan terakhir",
+                    "scan_count": 1,
                     "latest_scan": mata_peri_ctx,
                     "scans": [mata_peri_ctx],
                     "source": "user_context",
@@ -114,6 +143,7 @@ def make_get_scan_history_tool(
                         "mode": "history",
                         "has_data": True,
                         "source": "user_context",
+                        "since": since,
                         "latest_scan": _safe_dict_for_trace(mata_peri_ctx),
                     })
                 return result
@@ -127,7 +157,7 @@ def make_get_scan_history_tool(
                 return {"has_data": False, "error": "user_id tidak tersedia"}
 
             data = await call_internal_get(
-                f"/api/v1/internal/agent/mata-peri-history/{user_id}"
+                f"/api/v1/internal/agent/mata-peri-history/{user_id}?since={since}"
             )
 
             if span:
@@ -135,6 +165,7 @@ def make_get_scan_history_tool(
                     "mode": "history",
                     "has_data": data.get("has_data", False),
                     "scan_count": data.get("scan_count", 0),
+                    "period": data.get("period"),
                     "source": "api",
                     "data": _safe_dict_for_trace(data),
                 })
@@ -568,22 +599,51 @@ def _bridge_scan_history(result: dict, agent_results: dict, ctx: BridgeContext) 
 
 
 def _inject_scan_history(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
-    """Inject scan history (list of recent scans) to system prompt."""
+    """Inject scan history (list of recent scans) to system prompt.
+    
+    Phase 3: tambah period info kalau user filter by `since`.
+    """
     if not data or not data.get("has_data"):
+        # Loud signal kalau tool return empty for specific period
+        if data and data.get("period") and data.get("period") != "all":
+            period_label = data.get("period_label", data.get("period"))
+            return (
+                f"\n\nData history scan Mata Peri {child_name}: "
+                f"TIDAK ADA scan dalam {period_label}. "
+                f"Bilang user dengan jujur."
+            )
         return ""
     
-    sessions = data.get("sessions") or []
-    if not sessions:
+    # API return field "scans" (atau "sessions" untuk legacy compat)
+    scans = data.get("scans") or data.get("sessions") or []
+    if not scans:
         return ""
+    
+    period = data.get("period", "all")
+    period_label = data.get("period_label", "scan terakhir")
+    scan_count = data.get("scan_count", len(scans))
     
     text = f"\n\nData history scan Mata Peri {child_name} (dari tool call):"
-    text += f"\n- Total scan tersimpan: {len(sessions)}"
+    if period != "all":
+        text += f"\n- Period: {period_label}"
+    text += f"\n- Total scan: {scan_count}"
     
-    # Show latest 5 sessions
-    for i, sess in enumerate(sessions[:5]):
-        date = sess.get("performed_at") or sess.get("completed_at", "-")
+    # Show latest scans (cap di 8 supaya tidak boros token kalau period besar)
+    for i, sess in enumerate(scans[:8]):
+        scan_date = sess.get("scan_date") or sess.get("performed_at") or sess.get("completed_at", "-")
         status = sess.get("summary_status", "-")
-        text += f"\n  {i+1}. {date} — Status: {status}"
+        requires_review = sess.get("requires_dentist_review")
+        warning = " 🚨 PERLU DOKTER" if requires_review else ""
+        text += f"\n  {i+1}. {scan_date} — Status: {status}{warning}"
+    
+    if len(scans) > 8:
+        text += f"\n  (dan {len(scans) - 8} scan lainnya tidak ditampilkan)"
+    
+    text += (
+        f"\n\nINSTRUKSI: Pakai data ini untuk jawab pertanyaan tentang riwayat / tren. "
+        f"Kalau user nanya kapan scan terakhir di period spesifik, ambil scan_date pertama. "
+        f"Kalau ada requires_dentist_review=True, sebut info itu."
+    )
     
     return text
 

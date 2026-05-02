@@ -386,3 +386,132 @@ register_tool(ToolSpec(
     prompt_injector=_inject_cerita_module_detail,
     thinking_label="Mengecek detail modul Cerita...",
 ))
+
+
+# =============================================================================
+# Phase 3 — Tool: get_cerita_modules_summary
+# =============================================================================
+
+def make_get_cerita_modules_summary_tool(user_id: Optional[str]):
+    """Factory: build get_cerita_modules_summary tool."""
+
+    @tool
+    async def get_cerita_modules_summary() -> dict[str, Any]:
+        """Get summary of COMPLETED Cerita Peri modules (rekap singkat untuk parent).
+
+        ✅ USE THIS TOOL when user asks about:
+        - "rekap modul yang udah dibaca dong"
+        - "udah belajar apa aja dari Cerita Peri?"
+        - "ringkasan modul yang udah selesai"
+        - "key takeaway tiap modul yang dah selesai"
+        - "modul apa aja yang udah saya selesaikan?"
+
+        ❌ DO NOT use this tool when:
+        - User minta progress umum (semua modul) → use get_cerita_progress
+        - User minta detail isi modul tertentu → use get_cerita_module_detail
+        - User minta best/jago module → use get_cerita_progress (best_module field)
+        - User minta materi modul yang BELUM selesai → ANTI-SPOILER, jangan kasih
+
+        Returns dict with keys:
+        - has_data: bool
+        - completed_count: int
+        - total_count: int (saat ini 6)
+        - completed_modules: list of {
+            module_id, title, key_takeaway (= subtitle dari MODULE_METADATA),
+            estimated_minutes, stars_earned, best_score, completed_at
+          }
+        - fallback_message: kalau belum ada modul completed
+
+        ANTI-SPOILER & ANTI-HALU:
+        - Tool HANYA return modul yang sudah completed. Modul locked / available
+          tidak include — supaya user yang minta "rekap" tidak ke-spoiler.
+        - Kalau completed_modules empty, bilang user "belum ada modul yang Bunda
+          selesaikan", JANGAN halu rekap modul yang belum selesai.
+        - Yang ngerjain adalah ORANG TUA, bukan anak. Pakai bahasa "Bunda sudah
+          selesaikan modul X", BUKAN "anak sudah belajar".
+        """
+        from app.config.observability import trace_node, _safe_dict_for_trace
+
+        async with trace_node(
+            name="tool:get_cerita_modules_summary",
+            state=None,
+            input_data={"has_user_id": bool(user_id)},
+        ) as span:
+            if not user_id:
+                if span:
+                    span.update(output={"has_data": False, "error": "user_id_missing"})
+                return {"has_data": False, "error": "user_id tidak tersedia"}
+
+            data = await call_internal_get(
+                f"/api/v1/internal/agent/cerita-modules-summary/{user_id}"
+            )
+
+            if span:
+                span.update(output={
+                    "has_data": data.get("has_data", False),
+                    "completed_count": data.get("completed_count", 0),
+                    "total_count": data.get("total_count", 0),
+                    "data": _safe_dict_for_trace(data),
+                })
+
+            return data
+
+    return get_cerita_modules_summary
+
+
+def _bridge_cerita_modules_summary(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: summary → agent_results['cerita_modules_summary']."""
+    agent_results["cerita_modules_summary"] = result
+
+
+def _inject_cerita_modules_summary(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject cerita completed modules summary to system prompt."""
+    if not data or not data.get("has_data"):
+        return ""
+    
+    completed_count = data.get("completed_count", 0)
+    total_count = data.get("total_count", 6)
+    completed_modules = data.get("completed_modules") or []
+    
+    if completed_count == 0:
+        return (
+            f"\n\nRekap modul Cerita Peri yang sudah Bunda selesaikan:"
+            f"\n- BELUM ADA modul yang completed dari {total_count} modul total."
+            f"\nBilang user dengan ramah: \"Belum ada modul yang Bunda selesaikan, "
+            f"yuk mulai dari modul 1!\""
+        )
+    
+    text = (
+        f"\n\nRekap modul Cerita Peri yang sudah Bunda selesaikan "
+        f"({completed_count} dari {total_count} modul):"
+    )
+    
+    for m in completed_modules:
+        title = m.get("title", f"Modul {m.get('module_id', '?')}")
+        takeaway = m.get("key_takeaway", "")
+        stars = m.get("stars_earned", 0)
+        score = m.get("best_score")
+        
+        text += f"\n\n**{title}** — {stars} bintang"
+        if score is not None:
+            text += f" (skor: {score})"
+        if takeaway:
+            text += f"\n  _Inti: {takeaway}_"
+    
+    text += (
+        f"\n\nINSTRUKSI: Pakai data ini untuk rekap natural ke user. "
+        f"YANG MENYELESAIKAN MODUL ADALAH ORANG TUA (Bunda), bukan anak. "
+        f"JANGAN bocorkan modul yang belum selesai."
+    )
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_cerita_modules_summary",
+    agent_key="cerita_modules_summary",
+    required_agent="cerita_peri",
+    bridge_handler=_bridge_cerita_modules_summary,
+    prompt_injector=_inject_cerita_modules_summary,
+    thinking_label="Merangkum modul Cerita Peri...",
+))

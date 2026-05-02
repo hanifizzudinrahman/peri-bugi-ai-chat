@@ -44,11 +44,17 @@ from app.agents.tools.brushing import (
     make_get_brushing_stats_tool,
     make_get_brushing_history_tool,        # NEW Phase 2 expansion
     make_get_brushing_achievements_tool,   # NEW Phase 2 expansion
+    make_get_brushing_settings_tool,       # NEW Phase 3
+    make_get_brushing_trend_tool,          # NEW Phase 3
 )
-from app.agents.tools.caries_risk import make_get_caries_risk_tool  # NEW Phase 2 expansion
+from app.agents.tools.caries_risk import (
+    make_get_caries_risk_tool,
+    make_get_caries_questionnaire_preview_tool,  # NEW Phase 3
+)
 from app.agents.tools.cerita import (
     make_get_cerita_progress_tool,
     make_get_cerita_module_detail_tool,    # NEW Phase 2 expansion
+    make_get_cerita_modules_summary_tool,  # NEW Phase 3
 )
 from app.agents.tools.knowledge import (
     make_search_app_faq_tool,
@@ -148,12 +154,18 @@ def make_tools(state: AgentState) -> list[Any]:
         tools.append(make_get_brushing_history_tool(user_id=user_id))
         tools.append(make_get_brushing_achievements_tool(user_id=user_id))
         tools.append(make_get_caries_risk_tool(user_id=user_id))
+        # Phase 3 Tools (rapot_peri group)
+        tools.append(make_get_brushing_settings_tool(user_id=user_id))
+        tools.append(make_get_brushing_trend_tool(user_id=user_id))
+        tools.append(make_get_caries_questionnaire_preview_tool())  # no user_id needed
 
     # ── Cerita Peri tools (gated by cerita_peri) ─────────────────────────────
     if "cerita_peri" in allowed:
         tools.append(make_get_cerita_progress_tool(user_id=user_id))
         # Phase 2 Tools Expansion (lock-aware)
         tools.append(make_get_cerita_module_detail_tool(user_id=user_id))
+        # Phase 3
+        tools.append(make_get_cerita_modules_summary_tool(user_id=user_id))
 
     # ── Mata Peri tools (gated by mata_peri — history + analyze + scan_detail) ─
     if "mata_peri" in allowed:

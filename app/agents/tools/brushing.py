@@ -606,3 +606,317 @@ register_tool(ToolSpec(
     prompt_injector=_inject_brushing_achievements,
     thinking_label="Mengecek badge sikat gigi...",
 ))
+
+
+# =============================================================================
+# Phase 3 — New Tools
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Tool: get_brushing_settings (Phase 3)
+# -----------------------------------------------------------------------------
+
+def make_get_brushing_settings_tool(user_id: Optional[str]):
+    """Factory: build get_brushing_settings tool."""
+
+    @tool
+    async def get_brushing_settings() -> dict[str, Any]:
+        """Get the user's brushing reminder settings (read-only).
+
+        ✅ USE THIS TOOL when user asks about:
+        - "reminder sikat gigi gimana setting-nya?"
+        - "jam berapa anak diingatkan sikat?"
+        - "notif sikat gigi aktif gak?"
+        - "mode notifikasi apa? suara atau silent?"
+        - "berapa kali reminder sehari?"
+
+        ❌ DO NOT use this tool when:
+        - User minta UBAH setting (tidak bisa via chat — arahkan user ke menu Pengaturan di aplikasi)
+        - User tanya history sikat — use get_brushing_history
+        - User tanya status sikat hari ini — use get_brushing_stats
+
+        Returns dict with keys:
+        - has_data: bool
+        - is_notification_enabled: bool — apakah notif aktif
+        - morning_reminder_time: "HH:MM" | null — jam reminder pagi
+        - evening_reminder_time: "HH:MM" | null — jam reminder malam
+        - notification_mode: "sound" | "silent" | "voice"
+        - sound_type: str | null — kalau mode=sound, jenis suara
+
+        ANTI-HALU & READ-ONLY:
+        - Tool ini READ-ONLY. Kalau user minta ubah jam atau aktifkan/nonaktifkan,
+          arahkan ke menu "Pengaturan" di aplikasi (Profil > Pengaturan > Reminder).
+        - Kalau morning_reminder_time atau evening_reminder_time null, artinya
+          BELUM diatur user — bilang "belum diatur jam reminder", JANGAN guess jam default.
+        - Kalau is_notification_enabled false, sebut explisit notif sedang OFF.
+        """
+        from app.config.observability import trace_node, _safe_dict_for_trace
+
+        async with trace_node(
+            name="tool:get_brushing_settings",
+            state=None,
+            input_data={"has_user_id": bool(user_id)},
+        ) as span:
+            if not user_id:
+                result = {
+                    "has_data": False,
+                    "reason": "no_user_id",
+                    "fallback_message": "User ID tidak tersedia.",
+                }
+                if span:
+                    span.update(output={"has_data": False, "reason": "no_user_id"})
+                return result
+
+            data = await call_internal_get(
+                f"/api/v1/internal/agent/brushing-settings/{user_id}"
+            )
+
+            if span:
+                span.update(output={
+                    "has_data": data.get("has_data", False),
+                    "is_notification_enabled": data.get("is_notification_enabled"),
+                    "notification_mode": data.get("notification_mode"),
+                    "data": _safe_dict_for_trace(data),
+                })
+
+            return data
+
+    return get_brushing_settings
+
+
+def _bridge_brushing_settings(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: settings → agent_results['brushing_settings']."""
+    agent_results["brushing_settings"] = result
+
+
+def _inject_brushing_settings(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject brushing settings to system prompt."""
+    if not data or not data.get("has_data"):
+        if data and data.get("reason"):
+            return (
+                f"\n\nPengaturan reminder sikat gigi: TIDAK BISA DIBACA "
+                f"(reason: {data.get('reason')}). "
+                f"Bilang ke user untuk cek manual di menu Pengaturan."
+            )
+        return ""
+    
+    is_enabled = data.get("is_notification_enabled")
+    morning_time = data.get("morning_reminder_time")
+    evening_time = data.get("evening_reminder_time")
+    mode = data.get("notification_mode")
+    sound_type = data.get("sound_type")
+    
+    text = f"\n\nPengaturan reminder sikat gigi (dari tool call):"
+    text += f"\n- Notifikasi: {'AKTIF ✓' if is_enabled else 'NONAKTIF ✗'}"
+    
+    if morning_time:
+        text += f"\n- Reminder pagi: jam {morning_time}"
+    else:
+        text += f"\n- Reminder pagi: belum diatur jamnya"
+    
+    if evening_time:
+        text += f"\n- Reminder malam: jam {evening_time}"
+    else:
+        text += f"\n- Reminder malam: belum diatur jamnya"
+    
+    if mode:
+        mode_label = {"sound": "suara", "silent": "diam (no suara)", "voice": "suara"}
+        text += f"\n- Mode notifikasi: {mode_label.get(mode, mode)}"
+        if mode == "sound" and sound_type:
+            text += f" (jenis: {sound_type})"
+    
+    text += (
+        f"\n\nINSTRUKSI: Tool ini READ-ONLY. "
+        f"Kalau user minta UBAH setting, arahkan ke menu Pengaturan "
+        f"(Profil > Pengaturan > Reminder Sikat Gigi). "
+        f"JANGAN claim bisa ubah dari chat."
+    )
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_brushing_settings",
+    agent_key="brushing_settings",
+    required_agent="rapot_peri",
+    bridge_handler=_bridge_brushing_settings,
+    prompt_injector=_inject_brushing_settings,
+    thinking_label="Mengecek pengaturan reminder...",
+))
+
+
+# -----------------------------------------------------------------------------
+# Tool: get_brushing_trend (Phase 3)
+# -----------------------------------------------------------------------------
+
+def make_get_brushing_trend_tool(user_id: Optional[str]):
+    """Factory: build get_brushing_trend tool."""
+
+    @tool
+    async def get_brushing_trend(
+        period: str = "last_3_months",
+        custom_months: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Get brushing trend analysis across MULTIPLE MONTHS.
+
+        ✅ USE THIS TOOL when user asks about:
+        - "tren 3 bulan terakhir gimana?" → period="last_3_months"
+        - "tahun lalu progressnya?" → period="last_year"
+        - "minggu lalu konsistensi gimana?" → period="last_week"
+        - "tahun ini sejauh ini?" → period="this_year"
+        - "compare bulan ini vs bulan kemarin" → period="last_month" (lihat monthly_breakdown)
+        - "udah berapa lama anak konsisten?" → period="last_6_months"
+
+        ❌ DO NOT use this tool when:
+        - Pertanyaan untuk 1 bulan saja → use get_brushing_history (lebih detail per-day)
+        - Pertanyaan tentang status hari ini → use get_brushing_stats
+        - Pertanyaan tentang badge → use get_brushing_achievements
+
+        Args:
+            period: Period preset. Valid:
+                - "last_week" — 7 hari terakhir
+                - "last_month" — 1 bulan terakhir (default fallback)
+                - "last_3_months" — 3 bulan terakhir (DEFAULT)
+                - "last_6_months" — 6 bulan terakhir
+                - "last_year" — 12 bulan terakhir
+                - "this_year" — Januari tahun ini sampai sekarang
+            custom_months: Override preset, custom range 1-12 bulan.
+                          Example: custom_months=4 = 4 bulan terakhir.
+
+        Returns dict with keys:
+        - has_data: bool
+        - period: str (echo of input)
+        - period_label: str — label Indonesian friendly
+        - total_days_tracked: int
+        - days_complete: int (sikat pagi+malam)
+        - days_partial: int (sikat 1 slot saja)
+        - days_missed: int (gak sikat sama sekali)
+        - compliance_percentage: float — % hari complete dari total
+        - morning_compliance: float — % hari sikat pagi
+        - evening_compliance: float — % hari sikat malam
+        - best_streak_in_period: int — streak terpanjang di period
+        - monthly_breakdown: list of {month, total_days, days_complete,
+                            days_partial, days_missed, compliance_percentage,
+                            morning_count, evening_count}
+
+        ANTI-HALU:
+        - Kalau total_days_tracked=0, JANGAN compute persen — bilang
+          "belum ada data dalam period ini".
+        - Kalau monthly_breakdown punya bulan dengan compliance_percentage=null,
+          artinya bulan itu belum ada data — JANGAN halu angka.
+        - Hindari sebut "compliance percentage" ke user — pakai bahasa
+          "konsistensi" atau "sikat lengkap berapa hari".
+        """
+        from app.config.observability import trace_node, _safe_dict_for_trace
+
+        async with trace_node(
+            name="tool:get_brushing_trend",
+            state=None,
+            input_data={
+                "has_user_id": bool(user_id),
+                "period": period,
+                "custom_months": custom_months,
+            },
+        ) as span:
+            if not user_id:
+                result = {
+                    "has_data": False,
+                    "reason": "no_user_id",
+                    "fallback_message": "User ID tidak tersedia.",
+                }
+                if span:
+                    span.update(output={"has_data": False, "reason": "no_user_id"})
+                return result
+
+            params = f"?period={period}"
+            if custom_months is not None:
+                params += f"&custom_months={custom_months}"
+
+            data = await call_internal_get(
+                f"/api/v1/internal/agent/brushing-trend/{user_id}{params}"
+            )
+
+            if span:
+                span.update(output={
+                    "has_data": data.get("has_data", False),
+                    "period": data.get("period"),
+                    "total_days_tracked": data.get("total_days_tracked"),
+                    "compliance_percentage": data.get("compliance_percentage"),
+                    "data": _safe_dict_for_trace(data),
+                })
+
+            return data
+
+    return get_brushing_trend
+
+
+def _bridge_brushing_trend(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
+    """Bridge: trend → agent_results['brushing_trend']."""
+    agent_results["brushing_trend"] = result
+
+
+def _inject_brushing_trend(data: dict, child_name: str, prompts: dict, response_mode: str) -> str:
+    """Inject brushing trend to system prompt."""
+    if not data or not data.get("has_data"):
+        if data and data.get("reason"):
+            return (
+                f"\n\nTrend sikat gigi {child_name}: BELUM ADA DATA "
+                f"di period yang diminta (reason: {data.get('reason')}). "
+                f"Bilang user dengan jujur."
+            )
+        return ""
+    
+    period_label = data.get("period_label", "-")
+    total_days = data.get("total_days_tracked", 0)
+    days_complete = data.get("days_complete", 0)
+    days_partial = data.get("days_partial", 0)
+    days_missed = data.get("days_missed", 0)
+    compliance = data.get("compliance_percentage")
+    morning_compliance = data.get("morning_compliance")
+    evening_compliance = data.get("evening_compliance")
+    best_streak = data.get("best_streak_in_period", 0)
+    monthly_breakdown = data.get("monthly_breakdown") or []
+    
+    text = f"\n\nTrend sikat gigi {child_name} ({period_label}):"
+    text += f"\n- Total hari tercatat: {total_days}"
+    text += f"\n- Sikat lengkap (pagi+malam): {days_complete} hari"
+    text += f"\n- Sikat sebagian (1 slot): {days_partial} hari"
+    text += f"\n- Tidak sikat sama sekali: {days_missed} hari"
+    
+    if compliance is not None:
+        text += f"\n- Konsistensi keseluruhan: {compliance}% hari lengkap"
+    if morning_compliance is not None:
+        text += f"\n- Konsistensi pagi: {morning_compliance}%"
+    if evening_compliance is not None:
+        text += f"\n- Konsistensi malam: {evening_compliance}%"
+    
+    text += f"\n- Rekor streak di period ini: {best_streak} hari berturut-turut"
+    
+    if monthly_breakdown and len(monthly_breakdown) > 1:
+        text += f"\n- Breakdown per bulan:"
+        for m in monthly_breakdown[:12]:
+            month = m.get("month", "-")
+            m_complete = m.get("days_complete", 0)
+            m_total = m.get("total_days", 0)
+            m_pct = m.get("compliance_percentage")
+            pct_text = f" ({m_pct}%)" if m_pct is not None else ""
+            text += f"\n  • {month}: {m_complete}/{m_total} hari lengkap{pct_text}"
+    
+    text += (
+        f"\n\nINSTRUKSI: Pakai bahasa kualitatif untuk ibu — "
+        f"\"konsistensi\" bukan \"compliance percentage\", "
+        f"\"hari berturut-turut\" bukan \"streak\". "
+        f"Kalau ada perbedaan signifikan antar bulan, sebut secara natural."
+    )
+    
+    return text
+
+
+register_tool(ToolSpec(
+    tool_name="get_brushing_trend",
+    agent_key="brushing_trend",
+    required_agent="rapot_peri",
+    bridge_handler=_bridge_brushing_trend,
+    prompt_injector=_inject_brushing_trend,
+    thinking_label="Menghitung tren sikat gigi...",
+))

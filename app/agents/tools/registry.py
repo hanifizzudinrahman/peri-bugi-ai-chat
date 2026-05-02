@@ -123,6 +123,11 @@ AGENT_KEY_TO_FEATURE_NAME = {
     "mata_peri": "Mata Peri (Scan Gigi)",
     "mata_peri_scan_detail": "Detail Hasil Scan",
     "tips": "Tips Parenting Harian",
+    # Phase 3 — new tools
+    "brushing_settings": "Pengaturan Reminder Sikat Gigi",
+    "brushing_trend": "Tren Sikat Gigi (Multi Bulan)",
+    "caries_questionnaire_preview": "Preview Kuesioner Karies",
+    "cerita_modules_summary": "Rekap Modul Cerita Peri",
 }
 
 
