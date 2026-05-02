@@ -756,6 +756,18 @@ def _build_system_prompt(state: AgentState) -> str:
 
     # Image analysis (Mata Peri agent - Phase 2 / Tanya Peri image - Phase 4 Batch B)
     # Phase 6: prompts pindah ke DB — dipilih berdasarkan response_mode.
+    #
+    # Phase 4.1.2 Cluster 2 — Halusinasi guard (defense in depth):
+    # Layer 1a — ai-cv produces gagal-safe text (orchestrator.py:600-614):
+    #            saat foto invalid, summary_text & rec_text TIDAK mention gigi,
+    #            cuma instruksi ambil ulang foto. Aman untuk di-inject langsung.
+    # Layer 1b — Prompt branching: kalau sum_status='gagal', baik DB template
+    #            (seed_prompts.py simple/medium/detailed v2) maupun fallback
+    #            builder (_build_image_analysis_fallback_prompt) punya cabang
+    #            khusus yang melarang LLM bahas kondisi gigi.
+    # Catatan: DB template render pakai .format() tetap inject {summary_text} +
+    # {recommendation_text} dengan teks ai-cv yang sudah safe. LLM tinggal
+    # rephrase, bukan invent dari nol.
     image_analysis = state.get("image_analysis")
     if image_analysis:
         # AnalyzeResponse dari ai-cv punya struktur:
@@ -1264,7 +1276,43 @@ def _build_image_analysis_fallback_prompt(
 
     Catatan: setelah seeder jalan, function ini tidak akan ke-trigger.
     Sengaja simpan untuk safety net + dev tanpa DB seed.
+
+    Phase 4.1.2 Cluster 2 — halusinasi guard:
+    Kalau sum_status == 'gagal', branch ke template khusus yang TIDAK include
+    summary_text/rec_text ai-cv (defense layer 2: pre-LLM context cleaning),
+    plus instruksi explicit DILARANG bahas kondisi gigi. Tujuan: hindari LLM
+    halusinasi "gigi tampak sehat" saat foto invalid (mis. foto buah, dokumen,
+    mulut tertutup, dll). Lihat orchestrator.py:600-614 untuk source 'gagal'.
     """
+    # Cluster 2 — Halusinasi guard: foto invalid → branch khusus
+    if sum_status == "gagal":
+        return (
+            f"\n\n=== KONTEKS PENTING — FOTO INVALID ===\n"
+            f"USER SUDAH MENGIRIM FOTO, tapi sistem AI TIDAK BERHASIL menganalisa "
+            f"foto tersebut (kemungkinan: pencahayaan kurang, foto blur, mulut "
+            f"tidak terlihat, atau bukan foto gigi).\n\n"
+            f"📸 Status Analisis: {status_emoji} GAGAL\n\n"
+            f"=== INSTRUKSI WAJIB (FOTO GAGAL DIANALISA) ===\n"
+            f"WAJIB respond dengan template ini (3-4 kalimat saja):\n"
+            f"1. Sapa empati singkat — sebut nama '{child_name}'.\n"
+            f"2. Jelaskan foto belum bisa terbaca jelas — JANGAN sebutkan kondisi "
+            f"gigi apapun, karena kamu TIDAK PUNYA data valid.\n"
+            f"3. Sarankan ambil ulang dengan 1-2 tips: pencahayaan terang, mulut "
+            f"terbuka lebar, atau kamera lebih dekat ke mulut.\n"
+            f"4. Tutup dengan ajakan positif untuk coba lagi.\n\n"
+            f"DILARANG KERAS:\n"
+            f"- DILARANG mention 'gigi tampak sehat' / 'ada karies' / 'gigi bersih' / "
+            f"sejenisnya — kamu tidak tau kondisi gigi.\n"
+            f"- DILARANG sarankan konsultasi dokter gigi (tidak ada data untuk basis).\n"
+            f"- DILARANG fabrikasi atau tebak hasil analisis.\n"
+            f"- DILARANG minta upload foto lagi dengan kalimat '/upload' — cukup "
+            f"sarankan ambil ulang foto yang lebih jelas.\n"
+            f"\nTone: hangat, sabar, tidak menyalahkan user. Pakai bahasa "
+            f"orang tua ke orang tua.\n"
+            f"=== AKHIR KONTEKS ===\n"
+        )
+
+    # Status valid (ok / perlu_perhatian / segera_ke_dokter) — path normal
     return (
         f"\n\n=== KONTEKS PENTING ===\n"
         f"USER SUDAH MENGIRIM FOTO GIGI ANAK dan SUDAH dianalisis oleh sistem AI. "
