@@ -12,6 +12,13 @@ Update v3 (Step 2b):
 - Smalltalk path: jika state.is_smalltalk=True (set by pre_router), pakai
   lean prompt minimal (Q2B: keep nama anak doang). SKIP injection of
   brushing, mata_peri_last_result, memory_context, agent_results.
+
+Update Bahasan #3 (structured_report consumption):
+- ai-cv sekarang generate `structured_report` field di session_summary.
+- LLM jadi pure presenter — content dari structured_report, LLM tinggal rephrase.
+- Disclaimer "tetap perlu ke dokter" hardcoded di structured_report.
+- Fix bug emoji map: tambah 'segera_ke_dokter' (was missing → fallback ke 📋).
+- Backward compat: kalau structured_report missing (ai-cv lama), synthesize fallback.
 """
 import json
 import logging
@@ -791,16 +798,23 @@ def _build_system_prompt(state: AgentState) -> str:
     #            saat foto invalid, summary_text & rec_text TIDAK mention gigi,
     #            cuma instruksi ambil ulang foto. Aman untuk di-inject langsung.
     # Layer 1b — Prompt branching: kalau sum_status='gagal', baik DB template
-    #            (seed_prompts.py simple/medium/detailed v2) maupun fallback
+    #            (seed_prompts.py simple/medium/detailed v2/v3) maupun fallback
     #            builder (_build_image_analysis_fallback_prompt) punya cabang
     #            khusus yang melarang LLM bahas kondisi gigi.
-    # Catatan: DB template render pakai .format() tetap inject {summary_text} +
-    # {recommendation_text} dengan teks ai-cv yang sudah safe. LLM tinggal
-    # rephrase, bukan invent dari nol.
+    #
+    # Bahasan #3 — Structured Report consumption (LLM as Presenter):
+    # ai-cv sekarang generate `structured_report` field di session_summary —
+    # multi-section formatted text yang lebih kaya dari plain summary_text.
+    # LLM jadi pure presenter (rephrase from structured_report, gak generate
+    # content dari nol). Backward compat: kalau structured_report missing
+    # (ai-cv version lama), synthesize fallback dari summary_text + rec_text.
     image_analysis = state.get("image_analysis")
     if image_analysis:
         # AnalyzeResponse dari ai-cv punya struktur:
-        # { session_summary: { summary_status, summary_text, recommendation_text, ... }, results: [...] }
+        # { session_summary: { summary_status, summary_text, recommendation_text,
+        #                      structured_report (NEW Bahasan #3),
+        #                      worst_view_severity, ... },
+        #   results: [...] }
         # Backward compat: kalau dari _analyze_image lama (deprecated), fallback ke field 'summary'.
         session_summary = image_analysis.get("session_summary") if isinstance(image_analysis, dict) else None
 
@@ -810,24 +824,54 @@ def _build_system_prompt(state: AgentState) -> str:
             rec_text = session_summary.get("recommendation_text") or ""
             requires_review = session_summary.get("requires_dentist_review", False)
 
-            # Status emoji untuk visual reinforcement
+            # Bahasan #3: structured_report (multi-section text untuk LLM consumption)
+            # Kalau ai-cv version lama belum kirim field ini (backward compat),
+            # build minimal report dari summary_text + recommendation_text.
+            structured_report = session_summary.get("structured_report")
+            worst_view_severity = session_summary.get("worst_view_severity") or "unknown"
+
+            if not structured_report:
+                # Backward compat: ai-cv lama tidak kirim structured_report
+                # → synthesize fallback dari plain summary_text + rec_text + disclaimer
+                logger.warning(
+                    "[generate] structured_report tidak ada di session_summary "
+                    "(ai-cv version lama?). Synthesize fallback."
+                )
+                structured_report = _synthesize_fallback_structured_report(
+                    sum_status, sum_text, rec_text, requires_review,
+                )
+
+            # Status emoji — Bahasan #3 fix: tambah 'segera_ke_dokter' (was missing,
+            # caused fallback ke 📋 untuk severe/critical case → LLM bingung).
+            # Sumber-of-truth status values: ai-cv/orchestrator.py:_build_user_summary
+            # return ("ok"|"perlu_perhatian"|"segera_ke_dokter"|"gagal", ...)
             status_emoji = {
                 "ok": "✅",
                 "perlu_perhatian": "⚠️",
-                "perlu_dokter": "🚨",
+                "segera_ke_dokter": "🚨",   # FIX (was 'perlu_dokter' — never matched)
+                "perlu_dokter": "🚨",        # backward compat alias
                 "gagal": "❌",
             }.get(sum_status, "📋")
 
             # Pull prompt template dari DB berdasarkan response_mode aktif.
             # Key: tanya_peri_image_response_{simple|medium|detailed}
+            # Bahasan #3: v3 prompt expect placeholder structured_report + worst_view_severity.
             response_mode = state.get("response_mode", "simple")
             image_prompt_key = f"tanya_peri_image_response_{response_mode}"
             image_prompt_template = prompts.get(image_prompt_key)
 
             if image_prompt_template:
-                # Render template dengan placeholder
+                # Render template dengan placeholder.
+                # NEW Bahasan #3: pass structured_report + worst_view_severity.
+                # Backward compat: prompt v2 (legacy) gak punya placeholder structured_report,
+                # tapi .format() akan ignore kwargs yang gak match — selama prompt v2
+                # masih punya {summary_text} + {recommendation_text} tetap render OK.
                 try:
                     rendered = image_prompt_template.format(
+                        # NEW Bahasan #3 placeholders
+                        structured_report=structured_report,
+                        worst_view_severity=worst_view_severity,
+                        # Legacy placeholders (preserved for v2 backward compat)
                         summary_status=sum_status,
                         summary_text=sum_text,
                         recommendation_text=rec_text,
@@ -845,12 +889,16 @@ def _build_system_prompt(state: AgentState) -> str:
                     system += _build_image_analysis_fallback_prompt(
                         sum_status, sum_text, rec_text, child_name,
                         requires_review, status_emoji,
+                        structured_report=structured_report,
+                        worst_view_severity=worst_view_severity,
                     )
             else:
                 # DB tidak punya prompt (seeder belum jalan / disabled) → hardcoded fallback
                 system += _build_image_analysis_fallback_prompt(
                     sum_status, sum_text, rec_text, child_name,
                     requires_review, status_emoji,
+                    structured_report=structured_report,
+                    worst_view_severity=worst_view_severity,
                 )
         else:
             # Backward compat — old _analyze_image format (Phase 2)
@@ -1343,6 +1391,11 @@ def _build_image_analysis_fallback_prompt(
     child_name: str,
     requires_review: bool,
     status_emoji: str,
+    *,
+    # NEW Bahasan #3: structured_report (multi-section text dari ai-cv).
+    # Optional kwarg untuk backward compat dengan caller lama.
+    structured_report: str | None = None,
+    worst_view_severity: str = "unknown",
 ) -> str:
     """
     Hardcoded fallback prompt untuk image analysis kalau DB belum punya
@@ -1360,9 +1413,30 @@ def _build_image_analysis_fallback_prompt(
     plus instruksi explicit DILARANG bahas kondisi gigi. Tujuan: hindari LLM
     halusinasi "gigi tampak sehat" saat foto invalid (mis. foto buah, dokumen,
     mulut tertutup, dll). Lihat orchestrator.py:600-614 untuk source 'gagal'.
+
+    Bahasan #3:
+    Kalau structured_report di-pass, prefer pakai itu sebagai input utama
+    (LLM jadi pure presenter). Kalau None (backward compat dengan ai-cv lama),
+    fall back ke plain summary_text/rec_text format legacy.
     """
     # Cluster 2 — Halusinasi guard: foto invalid → branch khusus
     if sum_status == "gagal":
+        # Bahasan #3: kalau ada structured_report, pakai itu (sudah include
+        # KEMUNGKINAN PENYEBAB + INSTRUKSI UNTUK USER + DILARANG KERAS)
+        if structured_report:
+            return (
+                f"\n\n=== KONTEKS PENTING — FOTO INVALID ===\n"
+                f"USER SUDAH MENGIRIM FOTO, tapi sistem AI TIDAK BERHASIL menganalisa "
+                f"foto tersebut.\n\n"
+                f"📊 LAPORAN TERSTRUKTUR DARI SISTEM AI:\n{structured_report}\n\n"
+                f"=== INSTRUKSI WAJIB ===\n"
+                f"Ikuti seluruh instruction di laporan di atas (KEMUNGKINAN PENYEBAB, "
+                f"INSTRUKSI UNTUK USER, DILARANG KERAS). Sebut nama '{child_name}' di sapa.\n"
+                f"Format: 3-4 kalimat — sapa empati + jelaskan foto belum terbaca + "
+                f"saran ambil ulang dengan tips + ajakan positif + DISCLAIMER.\n"
+                f"=== AKHIR KONTEKS ===\n"
+            )
+        # Backward compat: structured_report None → format legacy
         return (
             f"\n\n=== KONTEKS PENTING — FOTO INVALID ===\n"
             f"USER SUDAH MENGIRIM FOTO, tapi sistem AI TIDAK BERHASIL menganalisa "
@@ -1390,6 +1464,35 @@ def _build_image_analysis_fallback_prompt(
         )
 
     # Status valid (ok / perlu_perhatian / segera_ke_dokter) — path normal
+    # Bahasan #3: prefer structured_report kalau ada
+    if structured_report:
+        return (
+            f"\n\n=== KONTEKS PENTING ===\n"
+            f"USER SUDAH MENGIRIM FOTO GIGI ANAK ({child_name}) dan SUDAH dianalisis. "
+            f"JANGAN minta user upload foto lagi.\n\n"
+            f"📊 LAPORAN TERSTRUKTUR DARI SISTEM AI:\n{structured_report}\n\n"
+            f"=== INSTRUKSI MERESPON ===\n"
+            f"PRINSIP UTAMA — KAMU PRESENTER, BUKAN CONTENT GENERATOR:\n"
+            f"- Content (angka, status, tingkat keparahan, jumlah gigi) WAJIB diambil "
+            f"PERSIS dari LAPORAN di atas.\n"
+            f"- DILARANG fabrikasi atau menebak.\n"
+            f"- BOLEH rephrase wording dengan tone empati parent-friendly.\n\n"
+            f"DISCLAIMER WAJIB:\n"
+            f"- Bagian DISCLAIMER WAJIB di laporan WAJIB di-include di response.\n"
+            f"- Boleh rephrase, tapi makna PERSIS sama: AI bukan diagnosis dokter, "
+            f"tetap perlu pemeriksaan dokter.\n\n"
+            f"FORMAT RESPONSE:\n"
+            f"1. Sapa singkat dengan nama anak ({child_name}).\n"
+            f"2. Hasil singkat (rephrase KONDISI UMUM + PERSENTASE GIGI BERSIH).\n"
+            f"3. Temuan (sebut angka dari TEMUAN PER GIGI di laporan).\n"
+            f"4. Saran (dari RECOMMEND ACTION di laporan).\n"
+            f"5. DISCLAIMER (rephrase dengan tone hangat).\n\n"
+            f"Tone untuk severity '{worst_view_severity}': "
+            f"{'firm tapi empati, sebut urgensi' if worst_view_severity in ('severe', 'critical') else 'tenang dan supportive'}.\n"
+            f"=== AKHIR KONTEKS ===\n"
+        )
+
+    # Backward compat: structured_report None → format legacy
     return (
         f"\n\n=== KONTEKS PENTING ===\n"
         f"USER SUDAH MENGIRIM FOTO GIGI ANAK dan SUDAH dianalisis oleh sistem AI. "
@@ -1406,3 +1509,51 @@ def _build_image_analysis_fallback_prompt(
         f"5. {'Anjurkan konsultasi dokter gigi.' if requires_review else 'Tetap pantau dan jaga kebiasaan sikat gigi.'}\n"
         f"=== AKHIR KONTEKS ===\n"
     )
+
+
+def _synthesize_fallback_structured_report(
+    sum_status: str,
+    sum_text: str,
+    rec_text: str,
+    requires_review: bool,
+) -> str:
+    """
+    Backward compat (Bahasan #3): ai-cv version lama yang belum kirim
+    structured_report → synthesize fallback dari summary_text + rec_text + disclaimer.
+
+    Bukan ideal (kurang kaya dibanding ai-cv structured_report yang baru),
+    tapi cukup untuk safety net selama proses migration ai-cv version.
+    """
+    if sum_status == "gagal":
+        return (
+            "KONDISI UMUM: Foto Tidak Bisa Dianalisa\n"
+            "\n"
+            "CATATAN: Foto belum bisa dianalisa dengan jelas oleh sistem AI.\n"
+            "\n"
+            "INSTRUKSI UNTUK USER:\n"
+            "  Sarankan ambil ulang dengan pencahayaan terang dan kamera dekat mulut.\n"
+            "\n"
+            "⚠️ DILARANG KERAS:\n"
+            "  - DILARANG mention kondisi gigi (tidak ada data).\n"
+            "  - DILARANG sarankan konsultasi dokter spesifik.\n"
+            "\n"
+            "DISCLAIMER WAJIB (HARUS DI-INCLUDE DI RESPONSE):\n"
+            "  Hasil ini adalah screening awal oleh AI, BUKAN diagnosis dokter.\n"
+            "  Tetap perlu pemeriksaan langsung oleh dokter gigi untuk memastikan."
+        )
+
+    parts = []
+    parts.append(f"KONDISI UMUM: {sum_status}")
+    parts.append("")
+    if sum_text:
+        parts.append(f"RINGKASAN: {sum_text}")
+    if rec_text:
+        parts.append(f"SARAN DARI SISTEM AI: {rec_text}")
+    parts.append("")
+    if requires_review:
+        parts.append("RECOMMEND ACTION: Disarankan konsultasi ke dokter gigi.")
+    parts.append("")
+    parts.append("DISCLAIMER WAJIB (HARUS DI-INCLUDE DI RESPONSE):")
+    parts.append("  Hasil ini adalah screening awal oleh AI, BUKAN diagnosis dokter.")
+    parts.append("  Tetap perlu pemeriksaan langsung oleh dokter gigi untuk memastikan kondisi gigi anak.")
+    return "\n".join(parts)
