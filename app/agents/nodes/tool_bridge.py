@@ -114,6 +114,10 @@ async def tool_bridge_node(state: AgentState) -> dict[str, Any]:
             scan_session_id=state.scan_session_id,
             needs_clarification=state.needs_clarification,
             clarification_data=state.clarification_data,
+            # Image-Failure-Guard: preserve existing flag (typically False at start
+            # of turn, but defensive — agent could re-process state)
+            image_analysis_failed=state.image_analysis_failed,
+            image_analysis_fallback_text=state.image_analysis_fallback_text,
         )
 
         unknown_tools: list[str] = []  # collect for end-of-loop loud error
@@ -213,6 +217,14 @@ async def tool_bridge_node(state: AgentState) -> dict[str, Any]:
         if ctx.unavailable_tools:
             update["unavailable_tools"] = ctx.unavailable_tools
 
+        # Image-Failure-Guard: propagate failure flag + fallback text supaya
+        # generate.py bisa SKIP cached scan/brushing data dan FORCE fallback
+        # answer. Critical untuk medical safety (lihat scan.py docstring
+        # _bridge_analyze_chat_image).
+        if ctx.image_analysis_failed:
+            update["image_analysis_failed"] = True
+            update["image_analysis_fallback_text"] = ctx.image_analysis_fallback_text
+
         logger.info(
             f"[tool_bridge] Bridged {len(tool_messages)} tool result(s) "
             f"→ agent_results keys: {list(agent_results.keys())}, "
@@ -233,6 +245,8 @@ async def tool_bridge_node(state: AgentState) -> dict[str, Any]:
                 "unknown_tools": unknown_tools,
                 # Bagian C v2: surface unavailable tools untuk debug
                 "unavailable_tools": ctx.unavailable_tools,
+                # Image-Failure-Guard: surface image failure untuk Langfuse trace
+                "image_analysis_failed": ctx.image_analysis_failed,
             })
 
         return update

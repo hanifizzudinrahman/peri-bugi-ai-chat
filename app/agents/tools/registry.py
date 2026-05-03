@@ -63,6 +63,19 @@ class BridgeContext:
     Bagian C v2: Added unavailable_tools — list tools yang LLM panggil
     tapi tidak available (gated off via allowed_agents). Generate.py akan
     inject warning ke system prompt supaya LLM kasih honest answer.
+
+    Image-Failure-Guard (medical safety, kritis):
+    Saat user kirim foto + analyze_chat_image gagal (mode='new_scan_failed'),
+    state["image_analysis"] tidak di-set (tetap None). Tanpa field tambahan
+    di sini, generate.py SKIP image branch — TAPI tetap inject
+    user_context.mata_peri_last_result (data scan kemarin) → LLM jawab seolah
+    foto sukses dan giginya bersih. Itu BAHAYA untuk medical context.
+
+    Solusi: bridge handler set image_analysis_failed=True kalau gagal, dan
+    simpan fallback_text-nya. Generate.py pakai flag ini untuk:
+    1. SKIP injection mata_peri_last_result + brushing (data lain tidak relevan)
+    2. INJECT hard guard: 'JANGAN bilang gigi bersih — kamu tidak punya datanya'
+    3. FORCE jawaban pakai fallback_text apa adanya
     """
     retrieved_docs: list = field(default_factory=list)
     image_analysis: Optional[dict] = None
@@ -71,6 +84,9 @@ class BridgeContext:
     clarification_data: Optional[dict] = None
     # Bagian C v2: track tools yang dipanggil tapi tidak available
     unavailable_tools: list = field(default_factory=list)
+    # Image-Failure-Guard: set saat analyze_chat_image return mode='new_scan_failed'
+    image_analysis_failed: bool = False
+    image_analysis_fallback_text: Optional[str] = None
 
 
 # =============================================================================

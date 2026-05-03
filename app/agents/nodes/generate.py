@@ -528,14 +528,29 @@ def _build_system_prompt(state: AgentState) -> str:
     # Tapi karena api side touch repo lain, kita defense-in-depth di sini.
     _allowed_agents_set = _get_allowed_agents_from_state(state)
 
+    # ── Image-Failure-Guard: skip cached data when image analysis failed ─────
+    # Saat user kirim foto + analyze gagal (mode='new_scan_failed'), kita
+    # WAJIB skip injection mata_peri_last_result + brushing dari user_context.
+    # Tanpa skip ini, LLM lihat data scan kemarin → jawab seolah foto sukses
+    # (lihat docstring _bridge_analyze_chat_image di scan.py untuk konteks).
+    # Hard guard text di-inject di akhir _build_system_prompt (lihat block
+    # "Image-Failure-Guard hard guard" di bawah).
+    image_analysis_failed = bool(state.get("image_analysis_failed"))
+
     # Brushing data dari user_context (juga bisa dari rapot_peri agent di Phase 2).
     # Skip kalau rapot_peri OFF — konsisten dengan tool gating.
+    # Skip juga kalau image gagal — data tidak relevan dengan foto baru yg failed.
     brushing = ctx.get("brushing")
-    if brushing and "rapot_peri" in _allowed_agents_set:
+    if brushing and "rapot_peri" in _allowed_agents_set and not image_analysis_failed:
         system += (
             f"\n\nData sikat gigi {child_name}: "
             f"streak {brushing.get('current_streak', 0)} hari, "
             f"rekor terbaik {brushing.get('best_streak', 0)} hari."
+        )
+    elif brushing and image_analysis_failed:
+        logger.debug(
+            f"[generate] Skip brushing inject — image_analysis_failed=True "
+            f"(user kirim foto, analisa gagal — data sikat gigi tidak relevan)"
         )
     elif brushing:
         logger.debug(
@@ -544,13 +559,27 @@ def _build_system_prompt(state: AgentState) -> str:
         )
 
     # Mata Peri scan result. Skip kalau mata_peri OFF.
+    # KRITIS — skip juga kalau image_analysis_failed=True. Tanpa skip ini, LLM
+    # akan jawab pakai data scan kemarin (mata_peri_last_result) seolah foto
+    # baru sukses. Itu BAHAYA medical: parent bisa salah ambil keputusan.
     mata_peri = ctx.get("mata_peri_last_result")
-    if mata_peri and mata_peri.get("summary_text") and "mata_peri" in _allowed_agents_set:
+    if (
+        mata_peri
+        and mata_peri.get("summary_text")
+        and "mata_peri" in _allowed_agents_set
+        and not image_analysis_failed
+    ):
         system += (
             f"\n\nHasil scan gigi terakhir {child_name} "
             f"({mata_peri.get('scan_date', 'tidak diketahui')}): "
             f"{mata_peri.get('summary_text')}. "
             f"Status: {mata_peri.get('summary_status', 'tidak diketahui')}."
+        )
+    elif mata_peri and mata_peri.get("summary_text") and image_analysis_failed:
+        logger.warning(
+            f"[generate] IMAGE-FAILURE-GUARD active — skip mata_peri_last_result "
+            f"injection (cached scan data tidak boleh dipakai untuk jawab foto baru "
+            f"yg gagal di-analisa). User: {state.get('session_id')}"
         )
     elif mata_peri and mata_peri.get("summary_text"):
         logger.debug(
@@ -829,6 +858,43 @@ def _build_system_prompt(state: AgentState) -> str:
                 f"\n\nHasil analisis gambar gigi: "
                 f"{image_analysis.get('summary', 'tidak tersedia')}."
             )
+
+    # ── Image-Failure-Guard: hard guard saat foto gagal di-analisa ───────────
+    # Critical safety untuk medical context. Tanpa block ini, LLM bisa jawab
+    # "100% bersih" pakai cached scan kemarin (mata_peri_last_result),
+    # padahal foto baru yang user kirim FAILED di-analisa.
+    #
+    # Tactical guard:
+    # 1. Beri konteks: foto gagal karena teknis, BUKAN karena fotonya jelek
+    # 2. Larangan eksplisit: jangan claim gigi bersih/bagus/dll
+    # 3. Force jawaban: pakai fallback_text apa adanya (sudah empati)
+    # 4. Larang tambahan info irrelevant (sikat gigi tips, dokter, dll)
+    #
+    # Block ini DI BAWAH image_analysis block supaya kalau both-conditions
+    # somehow active (defensive — shouldn't happen), guard tetap dominan.
+    if state.get("image_analysis_failed"):
+        fallback_text = state.get("image_analysis_fallback_text") or (
+            "Maaf, Peri belum bisa cek foto kamu sekarang. "
+            "Coba kirim ulang foto dengan pencahayaan terang dan mulut "
+            "terbuka lebar ya."
+        )
+        system += (
+            "\n\n⚠️ FOTO INI GAGAL DI-ANALISIS (technical error di server, "
+            "BUKAN karena foto jelek atau anak tidak kooperatif).\n"
+            "ATURAN PENTING — WAJIB DIIKUTI:\n"
+            f"1. JANGAN gunakan data scan/sikat gigi/streak {child_name} dari "
+            "konteks (kalau ada) untuk menjawab pertanyaan ini. Data itu "
+            "BUKAN dari foto yang baru saja dikirim.\n"
+            f"2. JANGAN bilang gigi {child_name} bersih/bagus/sehat/100%/persen "
+            "berapapun. Kamu TIDAK PUNYA datanya untuk foto ini.\n"
+            "3. JANGAN kasih saran sikat gigi, kunjungan dokter, atau tips "
+            "lain — fokus minta foto ulang dengan empati.\n"
+            f"4. Pesan WAJIB kamu sampaikan apa adanya: \"{fallback_text}\"\n"
+            "5. Boleh tambah 1 kalimat empati pendek di awal "
+            "(misal: 'Maaf ya Bunda, ada kendala di sistem Peri.'), tapi "
+            "JANGAN tambah info lain di luar pesan #4.\n"
+            "Panjang jawaban total: maksimal 2-3 kalimat."
+        )
 
     # ── Response mode instructions ────────────────────────────────────────────
     response_mode = state.get("response_mode", "simple")

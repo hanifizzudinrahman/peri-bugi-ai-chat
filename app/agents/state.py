@@ -279,6 +279,19 @@ class AgentState(BaseModel):
     # Contoh: ["Cerita Peri"]. Generate.py pakai untuk compose honest answer.
     detected_unavailable_features: list[str] = Field(default_factory=list)
 
+    # ── Image-Failure-Guard (medical safety) ─────────────────────────────────
+    # Saat user kirim foto + analyze_chat_image gagal (ai-cv error, dll),
+    # bridge handler set flag ini supaya generate.py:
+    #   1. SKIP injection mata_peri_last_result + brushing dari user_context
+    #      (data scan/sikat kemarin TIDAK RELEVAN dengan foto baru yg gagal).
+    #   2. INJECT hard guard: "kamu TIDAK punya hasil analisa, JANGAN
+    #      bilang gigi bersih/bagus, jawab fallback_text apa adanya".
+    # Tanpa flag ini, LLM bisa halusinasi "100% bersih" pakai cached data,
+    # which is dangerous untuk medical context — parent bisa salah ambil
+    # keputusan tindakan dental.
+    image_analysis_failed: bool = False
+    image_analysis_fallback_text: Optional[str] = None
+
     # ── Audit & metrics ───────────────────────────────────────────────────────
     thinking_steps: list[ThinkingStep] = Field(default_factory=list)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)

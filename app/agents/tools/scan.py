@@ -732,8 +732,22 @@ register_tool(ToolSpec(
 
 def _bridge_analyze_chat_image(result: dict, agent_results: dict, ctx: BridgeContext) -> None:
     """Bridge: analyze_chat_image — special handling untuk clarification + success + failure.
-    
-    Mirror existing tool_bridge.py logic line 157-175.
+
+    Mode result:
+    - needs_clarification=True → set ctx clarification + agent_results
+    - has_data=True (mode='new_scan_tanya_peri') → set ctx.image_analysis + scan_session_id
+    - has_data=False, mode='new_scan_failed' → SET ctx.image_analysis_failed=True
+      + simpan fallback_text (Image-Failure-Guard, see registry.py:BridgeContext docstring).
+
+    Image-Failure-Guard rationale (kritis, medical safety):
+    Sebelum patch ini, failure mode SILENTLY drop: agent_results di-set tapi
+    state.image_analysis tetap None → generate.py SKIP image branch → BUT tetap
+    inject mata_peri_last_result (data scan kemarin) → LLM jawab "100% bersih"
+    seolah foto sukses, padahal gagal. PARENT BISA SALAH AMBIL KEPUTUSAN
+    DENTAL TINDAKAN.
+
+    Setelah patch ini, generate.py baca ctx.image_analysis_failed → skip
+    cached scan/brushing data + force fallback text answer.
     """
     if result.get("needs_clarification"):
         # User butuh pilih view dulu
@@ -746,8 +760,20 @@ def _bridge_analyze_chat_image(result: dict, agent_results: dict, ctx: BridgeCon
         ctx.scan_session_id = result.get("scan_session_id")
         agent_results["mata_peri"] = result
     else:
-        # Failure mode — preserve fallback_text
+        # Failure mode — preserve fallback_text + set Image-Failure-Guard flag
+        # supaya generate.py bisa override behavior LLM (skip cached data,
+        # force fallback message).
         agent_results["mata_peri"] = result
+        if result.get("mode") == "new_scan_failed":
+            ctx.image_analysis_failed = True
+            ctx.image_analysis_fallback_text = result.get("fallback_text") or (
+                # Defensive fallback (sebenarnya _analyze_chat_image_impl
+                # selalu populate fallback_text, tapi just-in-case kalau
+                # ada code path baru yg lupa set).
+                "Maaf, Peri belum bisa cek foto kamu sekarang. "
+                "Coba kirim ulang foto dengan pencahayaan terang dan mulut "
+                "terbuka lebar ya."
+            )
 
 
 # NOTE: analyze_chat_image TIDAK punya prompt_injector — image_analysis di-inject
