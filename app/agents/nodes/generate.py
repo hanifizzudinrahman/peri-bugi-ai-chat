@@ -1210,11 +1210,22 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
                 view_type = ir.get("view_type")
                 crop_url = artifacts.get("crop_image_url")
                 overlay_url = artifacts.get("overlay_image_url")
-                if crop_url or overlay_url:
+                # Heatmap RnD: forward field tambahan jika ada. ai-cv mode
+                # 'mask' tetap return both fields = null → mobile/web FE
+                # kasih cek null sebelum render. Kalau mode 'both', web bisa
+                # toggle compare antara mask vs heatmap.
+                # NOTE: overlay_image_url adalah ALIAS — di mode 'mask' = mask URL,
+                # di mode 'heatmap' = heatmap URL. Mobile cukup baca alias.
+                mask_overlay_url = artifacts.get("mask_overlay_image_url")
+                heatmap_url = artifacts.get("heatmap_image_url")
+
+                if crop_url or overlay_url or mask_overlay_url or heatmap_url:
                     artifacts_list.append({
                         "view_type": view_type,
                         "crop_image_url": crop_url,
                         "overlay_image_url": overlay_url,
+                        "mask_overlay_image_url": mask_overlay_url,
+                        "heatmap_image_url": heatmap_url,
                     })
             if artifacts_list:
                 metadata["image_artifacts"] = artifacts_list
