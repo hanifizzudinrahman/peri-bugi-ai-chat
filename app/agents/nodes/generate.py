@@ -843,14 +843,16 @@ def _build_system_prompt(state: AgentState) -> str:
 
             # Status emoji — Bahasan #3 fix: tambah 'segera_ke_dokter' (was missing,
             # caused fallback ke 📋 untuk severe/critical case → LLM bingung).
+            # Bahasan #4: tambah 'tidak_ada_gigi' untuk no-teeth detection case.
             # Sumber-of-truth status values: ai-cv/orchestrator.py:_build_user_summary
-            # return ("ok"|"perlu_perhatian"|"segera_ke_dokter"|"gagal", ...)
+            # return ("ok"|"perlu_perhatian"|"segera_ke_dokter"|"gagal"|"tidak_ada_gigi", ...)
             status_emoji = {
                 "ok": "✅",
                 "perlu_perhatian": "⚠️",
                 "segera_ke_dokter": "🚨",   # FIX (was 'perlu_dokter' — never matched)
                 "perlu_dokter": "🚨",        # backward compat alias
                 "gagal": "❌",
+                "tidak_ada_gigi": "🔍",     # NEW: foto OK tapi gigi tidak terdeteksi
             }.get(sum_status, "📋")
 
             # Pull prompt template dari DB berdasarkan response_mode aktif.
@@ -1419,15 +1421,33 @@ def _build_image_analysis_fallback_prompt(
     (LLM jadi pure presenter). Kalau None (backward compat dengan ai-cv lama),
     fall back ke plain summary_text/rec_text format legacy.
     """
-    # Cluster 2 — Halusinasi guard: foto invalid → branch khusus
-    if sum_status == "gagal":
+    # Cluster 2 — Halusinasi guard: foto invalid → branch khusus.
+    # Extended Bahasan #4 (no-teeth detection):
+    # Status "tidak_ada_gigi" share treatment dengan "gagal" — keduanya
+    # require LLM SKIP semua claim kondisi gigi (DILARANG KERAS).
+    # Bedanya hanya semantik: "gagal" = pipeline tidak bisa proses foto;
+    # "tidak_ada_gigi" = pipeline berhasil tapi cross-validation antar model
+    # menolak (mouth detected ya, tapi teeth segmentor consistent: 0 teeth).
+    # Both → structured_report sudah include guard yang appropriate.
+    if sum_status in ("gagal", "tidak_ada_gigi"):
         # Bahasan #3: kalau ada structured_report, pakai itu (sudah include
         # KEMUNGKINAN PENYEBAB + INSTRUKSI UNTUK USER + DILARANG KERAS)
         if structured_report:
+            # Header context-aware — beda "tidak terbaca" vs "tidak ada gigi"
+            context_header = (
+                "FOTO TIDAK MENAMPILKAN GIGI"
+                if sum_status == "tidak_ada_gigi"
+                else "FOTO INVALID"
+            )
+            context_body = (
+                "USER SUDAH MENGIRIM FOTO, sistem berhasil membaca foto-nya "
+                "TAPI tidak menemukan gigi di foto tersebut."
+                if sum_status == "tidak_ada_gigi"
+                else "USER SUDAH MENGIRIM FOTO, tapi sistem AI TIDAK BERHASIL menganalisa foto tersebut."
+            )
             return (
-                f"\n\n=== KONTEKS PENTING — FOTO INVALID ===\n"
-                f"USER SUDAH MENGIRIM FOTO, tapi sistem AI TIDAK BERHASIL menganalisa "
-                f"foto tersebut.\n\n"
+                f"\n\n=== KONTEKS PENTING — {context_header} ===\n"
+                f"{context_body}\n\n"
                 f"📊 LAPORAN TERSTRUKTUR DARI SISTEM AI:\n{structured_report}\n\n"
                 f"=== INSTRUKSI WAJIB ===\n"
                 f"Ikuti seluruh instruction di laporan di atas (KEMUNGKINAN PENYEBAB, "
@@ -1436,7 +1456,10 @@ def _build_image_analysis_fallback_prompt(
                 f"saran ambil ulang dengan tips + ajakan positif + DISCLAIMER.\n"
                 f"=== AKHIR KONTEKS ===\n"
             )
-        # Backward compat: structured_report None → format legacy
+        # Backward compat: structured_report None → format legacy.
+        # Note: kalau ai-cv lama tidak kirim structured_report, no_teeth case
+        # akan tidak teridentifikasi di sisi LLM (sum_status="tidak_ada_gigi"
+        # masih unfamiliar). Treat sama dengan "gagal" — defensive approach.
         return (
             f"\n\n=== KONTEKS PENTING — FOTO INVALID ===\n"
             f"USER SUDAH MENGIRIM FOTO, tapi sistem AI TIDAK BERHASIL menganalisa "
@@ -1536,6 +1559,26 @@ def _synthesize_fallback_structured_report(
             "⚠️ DILARANG KERAS:\n"
             "  - DILARANG mention kondisi gigi (tidak ada data).\n"
             "  - DILARANG sarankan konsultasi dokter spesifik.\n"
+            "\n"
+            "DISCLAIMER WAJIB (HARUS DI-INCLUDE DI RESPONSE):\n"
+            "  Hasil ini adalah screening awal oleh AI, BUKAN diagnosis dokter.\n"
+            "  Tetap perlu pemeriksaan langsung oleh dokter gigi untuk memastikan."
+        )
+
+    # Bahasan #4: tidak_ada_gigi — pipeline OK tapi gigi tidak terdeteksi
+    if sum_status == "tidak_ada_gigi":
+        return (
+            "KONDISI UMUM: Foto Tidak Menampilkan Gigi\n"
+            "\n"
+            "CATATAN: Sistem AI tidak menemukan gigi di foto yang dikirim.\n"
+            "\n"
+            "INSTRUKSI UNTUK USER:\n"
+            "  Sarankan ambil ulang foto dengan mulut terbuka lebar dan gigi terlihat jelas.\n"
+            "\n"
+            "⚠️ DILARANG KERAS:\n"
+            "  - DILARANG mention kondisi gigi (tidak ada gigi yang ke-detect).\n"
+            "  - DILARANG claim persentase atau severity apapun.\n"
+            "  - DILARANG sarankan konsultasi dokter (belum ada temuan untuk dirujuk).\n"
             "\n"
             "DISCLAIMER WAJIB (HARUS DI-INCLUDE DI RESPONSE):\n"
             "  Hasil ini adalah screening awal oleh AI, BUKAN diagnosis dokter.\n"
