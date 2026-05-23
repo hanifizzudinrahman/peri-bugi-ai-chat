@@ -1355,12 +1355,28 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
             metadata["image_unreadable_count"] = skip_count
     state["llm_metadata"] = metadata
 
+    # FIX (Dashboard Cost — 23 Mei 2026): kirim input_tokens + output token AKURAT
+    # ke llm_call_logs. Sebelumnya cuma output_tokens (chunk count) → input selalu
+    # 0 di dashboard & cost under-counted. input_tokens_actual/output_tokens_actual
+    # sudah diambil dari Gemini usage_metadata di atas (line ~1185). Fallback ke
+    # chunk count untuk output kalau API tidak expose usage. Additive: tidak ubah
+    # logika streaming/metadata existing.
+    _log_input_tokens = input_tokens_actual if input_tokens_actual > 0 else None
+    _log_output_tokens = output_tokens_actual if output_tokens_actual > 0 else output_tokens
+    _log_total_tokens = (
+        (_log_input_tokens or 0) + (_log_output_tokens or 0)
+        if (_log_input_tokens is not None or _log_output_tokens is not None)
+        else None
+    )
+
     log = LLMCallLogPayload(
         prompt_key=f"generate_{state.get('response_mode', 'simple')}",
         model=get_model_name(provider=_provider, model=_model),
         provider=get_provider_name(provider=_provider),
         node="generate",
-        output_tokens=output_tokens,
+        input_tokens=_log_input_tokens,
+        output_tokens=_log_output_tokens,
+        total_tokens=_log_total_tokens,
         latency_ms=total_latency_ms,
         ttft_ms=ttft_ms,
         success=success,
@@ -1370,6 +1386,8 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
             "response_mode": state.get("response_mode", "simple"),
             "generation_ms": generation_ms,
             "tokens_per_second": tps,
+            # Simpan juga chunk count untuk debug akurasi token API vs streaming.
+            "output_chunks_yielded": output_tokens,
         },
     )
     state["llm_call_logs"].append(log.model_dump())
