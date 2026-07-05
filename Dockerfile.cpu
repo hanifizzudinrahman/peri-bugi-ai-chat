@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.4
+# =============================================================================
+# Dockerfile.cpu — peri-bugi-ai-chat (CPU build, TANPA torch)
+#
+# Untuk: Google Cloud Run (CPU tier). Cloud Run tidak mendukung GPU, jadi image
+# GPU (Dockerfile utama berbasis nvidia/cuda ~2.5 GB) TIDAK bisa di-deploy.
+#
+# STRATEGI:
+#   - Embedding pakai Gemini (EMBEDDING_PROVIDER=gemini) → torch & sentence-
+#     transformers TIDAK dibutuhkan → image turun dari ~3 GB ke ~300 MB.
+#   - requirements-base.txt sudah CPU-clean (tidak ada torch/sentence-transformers/
+#     langchain-huggingface). Semua dependency punya prebuilt wheel → tidak
+#     butuh gcc/libpq-dev.
+#   - `_get_embeddings()` di app/agents/sub_agents/__init__.py hanya import torch
+#     saat provider == "local", jadi image tanpa torch tetap jalan untuk gemini.
+#
+# STRATEGI LAYER CACHING (sama dengan Dockerfile ai-cv):
+#   Layer 1: requirements-base.txt → cache selama versi library tidak berubah
+#   Layer 2: app + scripts code    → rebuild cepat tiap code change
+# =============================================================================
+
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Jakarta \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# ── Layer 1: Install dependencies (semua prebuilt wheel, tidak butuh gcc) ────
+COPY requirements-base.txt /tmp/requirements-base.txt
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install -r /tmp/requirements-base.txt
+
+# ── Layer 2: Copy application code ────────────────────────────────────────────
+COPY app/ ./app/
+COPY scripts/ ./scripts/
+
+EXPOSE 8003
+
+# Honor env $PORT kalau ada (Cloud Run injeksikan PORT=8080), fallback 8003
+# untuk `docker run` lokal. `exec` menggantikan shell jadi PID 1 supaya
+# SIGTERM diteruskan ke uvicorn (graceful shutdown).
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8003}"]
