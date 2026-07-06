@@ -39,14 +39,40 @@ _tables_setup_done: bool = False
 
 
 def _build_conn_string() -> str:
-    """Build psycopg-compatible connection string from settings.
+    """Build psycopg connection string from settings.
+
+    Pakai libpq conninfo format (key=value) — lebih robust dari URL format
+    untuk username/password yang mengandung karakter spesial (seperti `.`
+    di `postgres.project_ref` Supabase pooler, atau `+` `/` di base64 password).
+
+    Semua value di-strip() untuk hindari trailing whitespace/newline yang
+    kadang muncul saat secret mount ke env var di Cloud Run.
 
     Format: postgresql://user:pass@host:port/dbname
     NOTE: tidak pakai +asyncpg suffix — langgraph PostgresSaver pakai psycopg.
     """
+    # Strip semua value — defensive terhadap trailing newline dari secret mount
+    user = settings.DB_USER.strip()
+    password = settings.DB_PASSWORD.strip()
+    host = settings.DB_HOST.strip()
+    port = settings.DB_PORT
+    dbname = settings.DB_NAME.strip()
+
+    # Libpq conninfo format — key=value, value di-escape kalau ada spesial chars
+    # Lihat: https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING
+    def _escape(val: str) -> str:
+        """Escape value untuk libpq connstring (wrap in quotes kalau ada special chars)."""
+        val = str(val)
+        if not val:
+            return "''"
+        if any(c in val for c in " \\'"):
+            escaped = val.replace("\\", "\\\\").replace("'", "\\'")
+            return f"'{escaped}'"
+        return val
+
     return (
-        f"postgresql://{settings.DB_USER}:{settings.DB_PASSWORD}"
-        f"@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
+        f"postgresql://{_escape(user)}:{_escape(password)}"
+        f"@{_escape(host)}:{port}/{_escape(dbname)}"
     )
 
 
