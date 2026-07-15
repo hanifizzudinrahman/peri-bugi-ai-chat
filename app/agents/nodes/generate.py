@@ -1176,7 +1176,7 @@ async def generate_node(state: AgentState) -> AsyncIterator[str]:
         },
     ) as gen_span:
         try:
-            async for chunk in llm.astream(lc_messages, config=trace_config):
+            async for chunk in llm.astream(lc_messages):
                 # FIX (Langfuse audit): Capture token counts dari API response.
                 # Gemini chunks may carry usage_metadata (terutama last chunk).
                 # Pakai max() supaya kalau muncul di multiple chunks, ambil yang terbesar.

@@ -37,7 +37,14 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 COPY app/ ./app/
 COPY scripts/ ./scripts/
 
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8003
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-8003}/health').read()" \
+    || exit 1
 
 # Honor env $PORT kalau ada (Cloud Run injeksikan PORT=8080), fallback 8003
 # untuk `docker run` lokal. `exec` menggantikan shell jadi PID 1 supaya

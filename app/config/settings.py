@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -81,6 +82,13 @@ class Settings(BaseSettings):
     LANGFUSE_PUBLIC_KEY: str = ""
     LANGFUSE_SECRET_KEY: str = ""
     LANGFUSE_HOST: str = "http://langfuse-web:3000"  # internal Docker network
+
+    @field_validator("INTERNAL_SECRET", "GEMINI_API_KEY", "OPENAI_API_KEY",
+                     "QDRANT_API_KEY", "DB_PASSWORD",
+                     "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST")
+    @classmethod
+    def strip_secrets(cls, v: str) -> str:
+        return v.strip() if isinstance(v, str) else v
 
     @property
     def is_production(self) -> bool:

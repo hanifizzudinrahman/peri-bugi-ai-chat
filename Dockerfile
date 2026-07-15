@@ -73,11 +73,17 @@ RUN pip install --no-cache-dir -r requirements-base.txt
 COPY app/ ./app/
 COPY scripts/ ./scripts/
 
-# ── Runtime config ────────────────────────────────────────────────────────────
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
 # Set CUDA visible devices — bisa di-override via docker-compose environment
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 EXPOSE 8003
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8003"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-8003}/health').read()" \
+    || exit 1
+
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8003}"]

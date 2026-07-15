@@ -98,13 +98,25 @@ def _get_gemini(temperature: float, max_tokens: int, streaming: bool,
     if not settings.GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY belum diset di .env")
     from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(
-        model=model_override or settings.GEMINI_MODEL,
+
+    model_name = model_override or settings.GEMINI_MODEL
+    kwargs: dict = dict(
+        model=model_name,
         google_api_key=settings.GEMINI_API_KEY,
         temperature=temperature,
         max_output_tokens=max_tokens,
         streaming=streaming,
+        timeout=settings.LLM_TIMEOUT_SECONDS,
     )
+
+    if "2.5" in model_name:
+        kwargs["model_kwargs"] = {
+            "generation_config": {
+                "thinking_config": {"thinking_budget": 0}
+            }
+        }
+
+    return ChatGoogleGenerativeAI(**kwargs)
 
 
 def _get_openai(temperature: float, max_tokens: int, streaming: bool,

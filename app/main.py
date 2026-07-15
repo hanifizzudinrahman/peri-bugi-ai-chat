@@ -47,7 +47,18 @@ app = FastAPI(
     docs_url="/docs" if not settings.is_production else None,
     redoc_url=None,
 )
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://app.peribugi.my.id",
+        "https://peri-bugi-web-nine.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:8081",
+    ],
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+)
 
 
 @app.middleware("http")
@@ -62,9 +73,12 @@ async def log_requests(request: Request, call_next):
 
 
 def _verify_internal_secret(x_internal_secret: str | None) -> None:
+    import hmac
     if not settings.INTERNAL_SECRET:
+        if settings.is_production:
+            raise HTTPException(status_code=503, detail="Internal secret not configured")
         return
-    if x_internal_secret != settings.INTERNAL_SECRET:
+    if not x_internal_secret or not hmac.compare_digest(x_internal_secret, settings.INTERNAL_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized: invalid internal secret")
 
 
@@ -210,7 +224,8 @@ async def chat_stream(request: ChatRequest, x_internal_secret: str | None = Head
 
 
 @app.post("/chat/rnd")
-async def chat_rnd(request: RnDChatRequest, _rl: None = Depends(check_rnd_rate_limit)):
+async def chat_rnd(request: RnDChatRequest, x_internal_secret: str | None = Header(default=None), _rl: None = Depends(check_rnd_rate_limit)):
+    _verify_internal_secret(x_internal_secret)
     _require_rnd_mode()
     initial_state = build_rnd_state(request)
     log.info("rnd_request", model=request.model or settings.llm_model_name,
@@ -234,7 +249,8 @@ class BenchmarkRequest(BaseModel):
 
 
 @app.post("/chat/rnd/benchmark")
-async def benchmark(request: BenchmarkRequest, _rl: None = Depends(check_benchmark_rate_limit)):
+async def benchmark(request: BenchmarkRequest, x_internal_secret: str | None = Header(default=None), _rl: None = Depends(check_benchmark_rate_limit)):
+    _verify_internal_secret(x_internal_secret)
     _require_rnd_mode()
     results = []
     for i in range(request.n):
