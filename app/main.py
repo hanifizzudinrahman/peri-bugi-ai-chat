@@ -131,17 +131,29 @@ async def _stream_with_logging(state) -> AsyncIterator[str]:
         asyncio.create_task(send_llm_call_logs(llm_call_logs, session_id))
 
 
+# =============================================================================
+# Health checks
+#
+# Endpoint ini SATU-SATUNYA yang boleh diakses tanpa X-Internal-Secret (lihat
+# PUBLIC_PATH_PREFIXES di app/core/security.py), jadi isinya harus liveness saja.
+#
+# Sebelum 2026-07-19 endpoint ini mengembalikan provider LLM, nama model, status
+# rnd_mode, seluruh daftar agent, versi torch/CUDA, nama GPU, model embedding,
+# dan string exception mentah — semuanya ke pemanggil anonim. Itu peta gratis
+# buat siapa pun yang mau menyerang.
+# =============================================================================
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "tanya-peri-ai-chat", "version": "2.0.0",
-            "provider": settings.LLM_PROVIDER, "model": settings.llm_model_name, "rnd_mode": settings.RND_MODE}
+    return {"status": "ok", "service": "tanya-peri-ai-chat"}
 
 
 @app.get("/health/agents")
 async def health_agents():
-    # Phase 1: _AGENT_REGISTRY moved from graph.py to nodes/agent_dispatcher.py
+    # Jumlah saja. Daftar nama agent tidak dibagikan ke pemanggil anonim.
     from app.agents.nodes.agent_dispatcher import _AGENT_REGISTRY
-    return {"status": "ok", "registered_agents": list(_AGENT_REGISTRY.keys()), "agent_count": len(_AGENT_REGISTRY)}
+    return {"status": "ok", "agent_count": len(_AGENT_REGISTRY)}
 
 
 # =============================================================================
@@ -211,46 +223,49 @@ async def health_checkpointer():
 
 @app.get("/health/gpu")
 async def health_gpu():
-    info: dict = {"embedding_device_setting": settings.EMBEDDING_DEVICE,
-                  "embedding_provider": settings.EMBEDDING_PROVIDER, "embedding_model": settings.EMBEDDING_MODEL}
+    # Cukup: torch terpasang, dan GPU terpakai atau tidak. Versi torch/CUDA,
+    # nama GPU, dan konfigurasi embedding TIDAK dibagikan ke pemanggil anonim.
+    info: dict = {"status": "ok", "torch_installed": False, "cuda_available": False}
     try:
         import torch
-        info["torch_version"] = torch.__version__
+        info["torch_installed"] = True
         info["cuda_available"] = torch.cuda.is_available()
-        if torch.cuda.is_available():
-            info["cuda_version"] = torch.version.cuda
-            info["gpu_name"] = torch.cuda.get_device_name(0)
     except ImportError:
-        info["torch_installed"] = False
+        pass
     return info
 
 
 @app.get("/health/llm")
 async def health_llm():
+    """
+    `provider` dan `model` SENGAJA dipertahankan — panel admin membacanya lewat
+    `peri-bugi-api/app/api/v1/admin_tanya_peri.py` untuk menampilkan konfigurasi
+    default. Jangan dihapus tanpa mengubah sisi itu juga.
+
+    Yang dibuang: daftar model yang tersedia, dan string exception mentah (berisi
+    hostname/port internal). Detailnya sekarang masuk log, bukan response.
+    """
     provider = settings.LLM_PROVIDER
     result: dict = {"provider": provider, "model": settings.llm_model_name}
+
     if provider == "ollama":
-        import urllib.request, json as _j
+        import urllib.request
         try:
-            with urllib.request.urlopen(f"{settings.OLLAMA_BASE_URL}/api/tags", timeout=5) as r:
-                data = _j.loads(r.read())
-                models = [m["name"] for m in data.get("models", [])]
-                result["ollama_status"] = "ok"
-                result["available_models"] = models
-                result["configured_model_available"] = any(
-                    settings.OLLAMA_MODEL in m or m.startswith(settings.OLLAMA_MODEL.split(":")[0]) for m in models)
+            with urllib.request.urlopen(f"{settings.OLLAMA_BASE_URL}/api/tags", timeout=5):
+                result["status"] = "ok"
         except Exception as e:
-            result["ollama_status"] = "error"
-            result["error"] = str(e)
-    elif provider == "gemini":
-        result["status"] = "ok" if settings.GEMINI_API_KEY else "error"
-        if not settings.GEMINI_API_KEY:
-            result["error"] = "GEMINI_API_KEY belum diset"
-    elif provider == "openai":
-        result["status"] = "ok" if settings.OPENAI_API_KEY else "error"
-        if not settings.OPENAI_API_KEY:
-            result["error"] = "OPENAI_API_KEY belum diset"
-    result["overall"] = "error" if result.get("status") == "error" or result.get("ollama_status") == "error" else "ok"
+            log.warning("health_llm_ollama_unreachable", error=str(e))
+            result["status"] = "error"
+    elif provider in ("gemini", "openai"):
+        key = settings.GEMINI_API_KEY if provider == "gemini" else settings.OPENAI_API_KEY
+        result["status"] = "ok" if key else "error"
+        if not key:
+            log.error("health_llm_api_key_missing", provider=provider)
+    else:
+        result["status"] = "error"
+        log.error("health_llm_unknown_provider", provider=provider)
+
+    result["overall"] = result["status"]
     return result
 
 
@@ -818,6 +833,80 @@ async def upload_pdf(
     )
 
 
+# CATATAN URUTAN: route ini HARUS didaftarkan SEBELUM
+# DELETE /knowledge/documents/{point_id}. Starlette mencocokkan sesuai urutan
+# pendaftaran, jadi kalau {point_id} lebih dulu, "/by-source" akan ditangkap
+# olehnya sebagai point_id="by-source" — endpoint ini jadi tak terjangkau dan
+# Qdrant menghapus id yang tidak ada (no-op) sambil mengembalikan pesan SUKSES
+# PALSU. Pola yang sama sudah diterapkan pada PATCH bulk-toggle.
+@app.delete(
+    "/knowledge/documents/by-source",
+    summary="Hapus semua chunk dari satu atau beberapa source",
+)
+async def delete_by_source(
+    request: DeleteBySourceRequest,
+    x_internal_secret: str | None = Header(default=None),
+):
+    """
+    Hapus semua chunk yang metadata.source-nya cocok dengan list yang diberikan.
+    Jauh lebih efisien daripada hapus satu per satu untuk PDF besar.
+    """
+    _verify_internal_secret(x_internal_secret)
+
+    col_name = settings.QDRANT_COLLECTION if request.collection == "dental" else settings.QDRANT_FAQ_COLLECTION
+
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchAny
+        client = _get_kb_qdrant_client()
+
+        existing = {c.name for c in client.get_collections().collections}
+        if col_name not in existing:
+            return {"status": "ok", "message": "Collection tidak ada.", "deleted_sources": []}
+
+        before_count = client.get_collection(col_name).points_count or 0
+
+        # Hapus dengan filter metadata.source
+        # Qdrant payload filter: key "metadata.source" untuk nested, atau "source" untuk flat
+        deleted_count = 0
+        for source in request.sources:
+            # Coba filter nested metadata.source dulu
+            try:
+                client.delete(
+                    collection_name=col_name,
+                    points_selector=Filter(
+                        must=[FieldCondition(key="metadata.source", match=MatchAny(any=[source]))]
+                    ),
+                )
+            except Exception:
+                pass
+            # Juga hapus dengan flat source (untuk dokumen lama)
+            try:
+                client.delete(
+                    collection_name=col_name,
+                    points_selector=Filter(
+                        must=[FieldCondition(key="source", match=MatchAny(any=[source]))]
+                    ),
+                )
+            except Exception:
+                pass
+            deleted_count += 1
+
+        after_count = client.get_collection(col_name).points_count or 0
+        removed = before_count - after_count
+
+        return {
+            "status": "ok",
+            "message": f"{deleted_count} source dihapus, ~{removed} chunk diremove dari '{col_name}'.",
+            "deleted_sources": request.sources,
+            "chunks_before": before_count,
+            "chunks_after": after_count,
+        }
+
+    except Exception as e:
+        log.error("delete_by_source error", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
+
+
 @app.delete(
     "/knowledge/documents/{point_id}",
     summary="Hapus satu dokumen dari collection by ID",
@@ -1110,72 +1199,6 @@ class DeleteBySourceRequest(BaseModel):
     collection: str = Field(default="dental", description="'dental' atau 'faq'")
 
 
-@app.delete(
-    "/knowledge/documents/by-source",
-    summary="Hapus semua chunk dari satu atau beberapa source",
-)
-async def delete_by_source(
-    request: DeleteBySourceRequest,
-    x_internal_secret: str | None = Header(default=None),
-):
-    """
-    Hapus semua chunk yang metadata.source-nya cocok dengan list yang diberikan.
-    Jauh lebih efisien daripada hapus satu per satu untuk PDF besar.
-    """
-    _verify_internal_secret(x_internal_secret)
-
-    col_name = settings.QDRANT_COLLECTION if request.collection == "dental" else settings.QDRANT_FAQ_COLLECTION
-
-    try:
-        from qdrant_client.models import Filter, FieldCondition, MatchAny
-        client = _get_kb_qdrant_client()
-
-        existing = {c.name for c in client.get_collections().collections}
-        if col_name not in existing:
-            return {"status": "ok", "message": "Collection tidak ada.", "deleted_sources": []}
-
-        before_count = client.get_collection(col_name).points_count or 0
-
-        # Hapus dengan filter metadata.source
-        # Qdrant payload filter: key "metadata.source" untuk nested, atau "source" untuk flat
-        deleted_count = 0
-        for source in request.sources:
-            # Coba filter nested metadata.source dulu
-            try:
-                client.delete(
-                    collection_name=col_name,
-                    points_selector=Filter(
-                        must=[FieldCondition(key="metadata.source", match=MatchAny(any=[source]))]
-                    ),
-                )
-            except Exception:
-                pass
-            # Juga hapus dengan flat source (untuk dokumen lama)
-            try:
-                client.delete(
-                    collection_name=col_name,
-                    points_selector=Filter(
-                        must=[FieldCondition(key="source", match=MatchAny(any=[source]))]
-                    ),
-                )
-            except Exception:
-                pass
-            deleted_count += 1
-
-        after_count = client.get_collection(col_name).points_count or 0
-        removed = before_count - after_count
-
-        return {
-            "status": "ok",
-            "message": f"{deleted_count} source dihapus, ~{removed} chunk diremove dari '{col_name}'.",
-            "deleted_sources": request.sources,
-            "chunks_before": before_count,
-            "chunks_after": after_count,
-        }
-
-    except Exception as e:
-        log.error("delete_by_source error", error=str(e))
-        raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
 
 
 # =============================================================================

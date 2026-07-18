@@ -152,3 +152,52 @@ class TestAppWiring:
             "FastAPI memakai default /openapi.json dan skema lengkap terbuka "
             "walau /docs sudah dimatikan."
         )
+
+
+class TestRouteOrdering:
+    """
+    Route dengan path literal harus didaftarkan SEBELUM route dengan parameter
+    di posisi yang sama. Starlette mencocokkan sesuai urutan pendaftaran.
+
+    Kalau terbalik, `/knowledge/documents/by-source` ditangkap oleh
+    `/knowledge/documents/{point_id}` sebagai point_id="by-source". Qdrant
+    menghapus id yang tidak ada (no-op) lalu endpoint mengembalikan pesan
+    SUKSES PALSU — data tidak terhapus tapi pemanggil mengira berhasil.
+    """
+
+    @staticmethod
+    def _routes() -> list[tuple[int, str, str]]:
+        tree = ast.parse(pathlib.Path("app/main.py").read_text(encoding="utf-8"))
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for dec in node.decorator_list:
+                if (
+                    isinstance(dec, ast.Call)
+                    and isinstance(dec.func, ast.Attribute)
+                    and dec.args
+                    and isinstance(dec.args[0], ast.Constant)
+                ):
+                    found.append((dec.lineno, dec.func.attr.lower(), dec.args[0].value))
+        return sorted(found)
+
+    @pytest.mark.parametrize(
+        "method,literal,param",
+        [
+            ("delete", "/knowledge/documents/by-source", "/knowledge/documents/{point_id}"),
+            ("patch", "/knowledge/documents/bulk-toggle", "/knowledge/documents/{point_id}"),
+        ],
+    )
+    def test_literal_route_registered_before_parameterised(self, method, literal, param):
+        routes = self._routes()
+        lit = next((ln for ln, m, p in routes if m == method and p == literal), None)
+        par = next((ln for ln, m, p in routes if m == method and p == param), None)
+
+        assert lit is not None, f"{method.upper()} {literal} tidak ditemukan"
+        assert par is not None, f"{method.upper()} {param} tidak ditemukan"
+        assert lit < par, (
+            f"{method.upper()} {literal} (baris {lit}) HARUS didaftarkan sebelum "
+            f"{param} (baris {par}), kalau tidak ia tak terjangkau dan yang "
+            f"parameterised mengembalikan sukses palsu."
+        )
