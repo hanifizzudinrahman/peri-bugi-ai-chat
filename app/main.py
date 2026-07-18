@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from app.agents.graph import build_initial_state, build_rnd_state, run_agent
 from app.config.settings import settings
+from app.core.security import assert_internal_secret_configured, verify_internal_secret
 from app.middleware.rate_limit import check_benchmark_rate_limit, check_rnd_rate_limit
 from app.schemas.chat import ChatRequest, RnDChatRequest, make_metrics_event
 from app.services.llm_logger import send_llm_call_logs
@@ -46,6 +47,16 @@ app = FastAPI(
     version="2.0.0",
     docs_url="/docs" if not settings.is_production else None,
     redoc_url=None,
+    # Sebelumnya baris ini tidak ada, sehingga openapi_url jatuh ke default
+    # "/openapi.json" dan skema LENGKAP seluruh endpoint beserta model Pydantic
+    # bisa diambil siapa pun di produksi. Mematikan /docs saja tidak ada gunanya
+    # selama skemanya masih terbuka.
+    openapi_url="/openapi.json" if not settings.is_production else None,
+    # Auth dipasang di level aplikasi, bukan dipanggil manual di tiap endpoint.
+    # Efeknya: route baru TERLINDUNGI secara default, dan pengecekan berjalan
+    # sebelum validasi body sehingga pemanggil tanpa kredensial tidak lagi
+    # menerima 422 yang membocorkan nama field dan tipe.
+    dependencies=[Depends(verify_internal_secret)],
 )
 app.add_middleware(
     CORSMiddleware,
@@ -73,11 +84,23 @@ async def log_requests(request: Request, call_next):
 
 
 def _verify_internal_secret(x_internal_secret: str | None) -> None:
+    """
+    Pengecekan per-endpoint yang sudah ada. FAIL CLOSED sejak 2026-07-19.
+
+    Sekarang menjadi lapisan kedua — `verify_internal_secret` di level aplikasi
+    sudah menolak request tanpa kredensial sebelum sampai ke sini. Dipertahankan
+    supaya endpoint tetap aman kalau suatu saat dependency aplikasi diubah.
+
+    Cabang yang dihapus:
+        if not settings.INTERNAL_SECRET:
+            if settings.is_production: raise 503
+            return                      # <-- lolos tanpa auth
+    `APP_ENV` defaultnya "development", jadi satu env var yang hilang atau salah
+    ketik cukup untuk membuka seluruh service.
+    """
     import hmac
     if not settings.INTERNAL_SECRET:
-        if settings.is_production:
-            raise HTTPException(status_code=503, detail="Internal secret not configured")
-        return
+        raise HTTPException(status_code=503, detail="Internal secret not configured")
     if not x_internal_secret or not hmac.compare_digest(x_internal_secret, settings.INTERNAL_SECRET):
         raise HTTPException(status_code=401, detail="Unauthorized: invalid internal secret")
 
@@ -124,6 +147,23 @@ async def health_agents():
 # =============================================================================
 # Phase 1 — LangGraph checkpointer lifecycle hooks
 # =============================================================================
+
+
+@app.on_event("startup")
+async def startup_validate_config():
+    """
+    Fail fast sebelum apa pun yang lain.
+
+    Service ini bisa dijangkau siapa pun di lapisan jaringan
+    (`--allow-unauthenticated`), jadi X-Internal-Secret satu-satunya yang menahan
+    endpoint LLM dan knowledge base. Konfigurasi kosong = tolak menyala.
+
+    SENGAJA di luar try/except: handler startup di bawah menelan semua exception,
+    dan validasi keamanan tidak boleh ikut tertelan. Cloud Run menolak revision
+    yang gagal start, sehingga revision lama tetap melayani traffic.
+    """
+    assert_internal_secret_configured()
+    log.info("startup_config_validated", internal_secret="configured")
 
 
 @app.on_event("startup")
