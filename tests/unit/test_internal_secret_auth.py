@@ -182,6 +182,43 @@ class TestRouteOrdering:
                     found.append((dec.lineno, dec.func.attr.lower(), dec.args[0].value))
         return sorted(found)
 
+    def test_request_models_defined_before_the_routes_that_use_them(self):
+        """
+        Anotasi tipe dievaluasi saat import, jadi model harus didefinisikan
+        sebelum fungsi yang memakainya.
+
+        Memindahkan route ke atas untuk memperbaiki shadowing sempat memisahkan
+        `delete_by_source` dari `DeleteBySourceRequest`, dan revision gagal start
+        dengan `NameError: name 'DeleteBySourceRequest' is not defined`.
+        `ast.parse()` tetap lolos — sintaksnya valid, yang salah resolusi nama.
+        Test ini menutup celah verifikasi itu.
+        """
+        tree = ast.parse(pathlib.Path("app/main.py").read_text(encoding="utf-8"))
+
+        class_lineno = {
+            node.name: node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        }
+
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not any(isinstance(d, ast.Call) for d in node.decorator_list):
+                continue
+            for arg in list(node.args.args) + list(node.args.kwonlyargs):
+                ann = arg.annotation
+                if not isinstance(ann, ast.Name):
+                    continue
+                defined_at = class_lineno.get(ann.id)
+                if defined_at is None:
+                    continue  # diimpor dari modul lain, bukan urusan kita
+                assert defined_at < node.lineno, (
+                    f"`{ann.id}` didefinisikan di baris {defined_at} tapi dipakai "
+                    f"oleh `{node.name}` di baris {node.lineno}. Anotasi tipe "
+                    f"dievaluasi saat import — ini NameError saat container start."
+                )
+
     @pytest.mark.parametrize(
         "method,literal,param",
         [

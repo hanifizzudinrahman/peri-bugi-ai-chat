@@ -839,6 +839,13 @@ async def upload_pdf(
 # olehnya sebagai point_id="by-source" — endpoint ini jadi tak terjangkau dan
 # Qdrant menghapus id yang tidak ada (no-op) sambil mengembalikan pesan SUKSES
 # PALSU. Pola yang sama sudah diterapkan pada PATCH bulk-toggle.
+# Dipakai oleh DELETE /knowledge/documents/by-source di bawah. Harus
+# didefinisikan SEBELUM route itu — anotasi tipe dievaluasi saat import.
+class DeleteBySourceRequest(BaseModel):
+    sources: list[str] = Field(..., description="List nama source yang akan dihapus")
+    collection: str = Field(default="dental", description="'dental' atau 'faq'")
+
+
 @app.delete(
     "/knowledge/documents/by-source",
     summary="Hapus semua chunk dari satu atau beberapa source",
@@ -1194,9 +1201,6 @@ async def get_sources(
         raise HTTPException(status_code=500, detail=f"Qdrant error: {str(e)}")
 
 
-class DeleteBySourceRequest(BaseModel):
-    sources: list[str] = Field(..., description="List nama source yang akan dihapus")
-    collection: str = Field(default="dental", description="'dental' atau 'faq'")
 
 
 
