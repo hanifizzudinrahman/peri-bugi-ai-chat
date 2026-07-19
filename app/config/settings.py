@@ -11,7 +11,13 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    APP_ENV: str = "development"
+    # Default sengaja "production" — fail safe. Kalau APP_ENV lupa di-set di
+    # suatu host, /docs dan /openapi.json tertutup dan log memakai format JSON.
+    # Yang hilang di dev hanyalah kenyamanan; yang dicegah adalah skema seluruh
+    # endpoint terbuka karena satu env var terlewat.
+    # Dev lokal set APP_ENV=development eksplisit di .env dan .env.example.
+    # Mengikuti preseden peri-bugi-api/app/core/config.py.
+    APP_ENV: str = "production"
     APP_PORT: int = 8003
 
     # Internal security (shared dengan peri-bugi-api)
