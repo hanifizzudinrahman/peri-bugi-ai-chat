@@ -68,6 +68,15 @@ Hasilnya masuk sebagai konteks terstruktur (`structured_report`) yang di-*rephra
 LLM. Kalau foto tidak jelas tampak bagian mana, graph mengembalikan event
 `clarify` dengan pilihan (depan/atas/bawah/kiri/kanan) — bukan langsung menjawab.
 
+## Codebase queries — pakai graphify dulu (hemat token)
+`graphify-out/graph.json` ada di repo ini (code knowledge-graph via AST, di-gitignore).
+Untuk pertanyaan arsitektur / "apa yang connect ke X" / "apa yang manggil Y" / cek
+**blast-radius sebelum ngubah sesuatu** — query graph dulu, jangan langsung grep:
+`graphify explain "<Nama>"` · `graphify path "<A>" "<B>"` · atau skill `/graphify query "..."`.
+Berguna buat maping alur LangGraph (`agents/graph.py`, `generate.py` yang besar).
+Rebuild kalau kode berubah / curiga stale (nol token, nol LLM): `graphify update .`.
+Doc lengkap + benchmark + batasan: workspace `docs/GRAPHIFY.md`.
+
 ## Non-negotiable working rules
 1. **Don't change what's already stable and working** without explicit approval.
 2. **Read before write** — jangan menebak nama node, state key, atau bentuk event.
