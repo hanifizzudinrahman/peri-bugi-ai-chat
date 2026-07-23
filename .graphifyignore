@@ -1,0 +1,37 @@
+# Keep graphify code-only + secret-safe (gitignore syntax; graphify does NOT read .gitignore)
+# --- secrets (defense-in-depth; detect() also auto-skips sensitive files) ---
+.env
+.env.*
+!.env.example
+*credential*.json
+*service-account*.json
+*.key
+*.pem
+*.cert
+*.crt
+secrets/
+# --- docs/config deferred (code-only pilot; drop these to add the semantic doc pass) ---
+*.md
+*.txt
+*.rst
+*.yml
+*.yaml
+*.json
+# --- python build / env / model / vector store ---
+__pycache__/
+.venv/
+venv/
+env/
+.pytest_cache/
+htmlcov/
+dist/
+build/
+*.egg-info/
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+qdrant_storage/
+logs/
+graphify-out/

@@ -62,3 +62,6 @@ qdrant_storage/
 scripts/output/
 experiment_results*.json
 benchmark_results*.json
+
+# graphify knowledge-graph outputs — generated, rebuild with `graphify update`
+graphify-out/
