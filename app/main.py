@@ -131,6 +131,41 @@ async def _stream_with_logging(state) -> AsyncIterator[str]:
         asyncio.create_task(send_llm_call_logs(llm_call_logs, session_id))
 
 
+async def _stream_founder_with_logging(payload: dict) -> AsyncIterator[str]:
+    """Sama seperti `_stream_with_logging`, untuk jalur Tanya Data Founder.
+
+    Fungsi terpisah dan bukan parameter tambahan pada yang di atas: yang itu
+    menerima state LangGraph, yang ini menerima dict payload, dan menyamakannya
+    berarti satu fungsi yang harus tahu dua bentuk.
+
+    Yang WAJIB sama: `llm_call_logs` tetap dikirim. Jalur baru yang lupa
+    melakukannya membuat angka di dashboard Pusat Biaya diam-diam mengecil, dan
+    tidak ada yang akan curiga karena grafiknya tetap naik-turun seperti biasa.
+    """
+    from app.agents.founder_analytics import run_founder_analytics
+
+    llm_call_logs: list[dict] = []
+    session_id: str = payload.get("session_id") or ""
+
+    async for event_str in run_founder_analytics(payload):
+        yield event_str
+        try:
+            if event_str.startswith("data: "):
+                parsed = json.loads(event_str[6:])
+                if parsed.get("event") == "done":
+                    data = parsed.get("data", {})
+                    if isinstance(data, dict):
+                        metadata = data.get("metadata", {})
+                        if isinstance(metadata, dict):
+                            llm_call_logs = metadata.pop("llm_call_logs", [])
+        except Exception:
+            pass
+
+    if llm_call_logs:
+        import asyncio
+        asyncio.create_task(send_llm_call_logs(llm_call_logs, session_id))
+
+
 # =============================================================================
 # Health checks
 #
@@ -276,6 +311,38 @@ async def chat_stream(request: ChatRequest, x_internal_secret: str | None = Head
     return StreamingResponse(_stream_with_logging(initial_state),
                              media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+class FounderAnalyticsRequest(BaseModel):
+    """Payload jalur founder.
+
+    Tidak ada `allowed_agents`, `prompts`, atau `response_mode` di sini — jalur
+    ini tidak punya pemilihan tool maupun mode jawaban. Otoritas siapa yang
+    boleh memanggilnya ada di peri-bugi-api (role founder + feature flag);
+    service ini cuma memastikan pemanggilnya membawa internal secret.
+    """
+
+    question: str = Field(min_length=1, max_length=2000)
+    session_id: Optional[str] = None
+    founder_user_id: Optional[str] = None
+    history: list[dict] = Field(default_factory=list)
+    trace_id: Optional[str] = None
+
+
+@app.post("/founder-analytics/stream")
+async def founder_analytics_stream(
+    request: FounderAnalyticsRequest,
+    x_internal_secret: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None, alias="X-Request-ID"),
+):
+    _verify_internal_secret(x_internal_secret)
+    payload = request.model_dump()
+    payload["trace_id"] = x_request_id or request.trace_id
+    return StreamingResponse(
+        _stream_founder_with_logging(payload),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/chat/rnd")
