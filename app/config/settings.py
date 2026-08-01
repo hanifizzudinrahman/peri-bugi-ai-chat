@@ -79,6 +79,23 @@ class Settings(BaseSettings):
     RND_MODE: bool = True
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Text-to-SQL (1 Agustus 2026)
+    # Otoritas sebenarnya ada di peri-bugi-api: flag founder + strategi dikirim
+    # per request lewat field `data_strategy`. Nilai di sini hanya cadangan
+    # untuk jalur yang tidak lewat api (sandbox RnD, tes lokal), dan default-nya
+    # "tools" supaya sama sekali tidak mengubah perilaku kalau lupa di-set.
+    # ─────────────────────────────────────────────────────────────────────────
+    DATA_STRATEGY: str = "tools"
+
+    #: Model khusus penulis SQL. Kosong = ikut model chat.
+    #: Generasi SQL lebih menuntut ketepatan sintaks daripada gaya bahasa, jadi
+    #: berguna bisa memisahkannya tanpa mengubah model yang menjawab ke orang tua.
+    NL_SQL_MODEL: str = ""
+
+    #: Berapa lama katalog semantik di-cache sebelum diambil ulang dari api.
+    NL_CATALOG_TTL_SECONDS: int = 300
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Langfuse Observability (optional)
     # Pattern 1+2: graceful degradation + explicit toggle.
     # Default OFF supaya safe — Hanif harus eksplisit set true di .env.

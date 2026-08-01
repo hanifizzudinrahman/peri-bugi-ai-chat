@@ -35,6 +35,7 @@ from app.agents.state import (
     SessionMeta,
     UserContextData,
 )
+from app.config.settings import settings
 from app.schemas.chat import ChatRequest, RnDChatRequest
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,7 @@ def build_initial_state(request: ChatRequest) -> AgentState:
     control = AgentControl(
         allowed_agents=request.allowed_agents or [],
         agent_configs=request.agent_configs or {},
+        data_strategy=getattr(request, "data_strategy", None) or "tools",
     )
 
     memory = MemorySnapshot(**(request.memory_context or {}))
@@ -156,6 +158,9 @@ def build_rnd_state(request: RnDChatRequest) -> AgentState:
     control = AgentControl(
         allowed_agents=request.allowed_agents or list(_DEFAULT_RND_AGENTS),
         agent_configs={},
+        data_strategy=(
+            getattr(request, "data_strategy", None) or settings.DATA_STRATEGY
+        ),
     )
 
     rnd = RnDOverrides(

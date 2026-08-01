@@ -62,6 +62,17 @@ baca bagian yang relevan saja, jangan dibaca utuh.
   wajib**: hasil AI adalah screening awal, bukan diagnosis dokter. Angka dan
   disclaimer tidak boleh diubah LLM — hanya boleh di-*rephrase*.
 
+## Text-to-SQL (`data_query`)
+Selain 14 tool tetap, ada satu tool analitik `query_family_data`
+(`agents/tools/data_query.py`) yang menulis SQL dari pertanyaan orang tua. SQL-nya
+divalidasi dan dijalankan di `peri-bugi-api` — service ini tidak pernah menyentuh
+tabel bisnis. Dua kunci: izin agent `data_query` **dan** `data_strategy`
+(`tools` | `hybrid` | `sql`) yang dikirim api per request. Default `tools` =
+perilaku lama persis.
+
+Kalau menambah dataset, yang diedit **katalog di peri-bugi-api**, bukan prompt di
+sini. Eval: `evals/nl_query/run.py`. Selengkapnya: workspace `docs/TEXT2SQL.md`.
+
 ## Integrasi dengan Mata Peri
 Tool `analyze_chat_image` meneruskan foto ke `peri-bugi-ai-cv` lewat `peri-bugi-api`.
 Hasilnya masuk sebagai konteks terstruktur (`structured_report`) yang di-*rephrase*

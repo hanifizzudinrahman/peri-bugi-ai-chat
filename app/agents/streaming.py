@@ -377,6 +377,7 @@ async def _stream_internal(
             **legacy_dict_state.get("llm_metadata", {}),
             "agents_used": agents_used,
             "llm_call_logs": llm_call_logs,
+            **_answer_source_metadata(legacy_dict_state, agents_used),
         },
     )
 
@@ -390,6 +391,61 @@ async def _stream_internal(
 # =============================================================================
 # Helpers
 # =============================================================================
+
+
+def _answer_source_metadata(legacy_dict_state: dict, agents_used: list) -> dict:
+    """Tandai jawaban ini lahir dari jalur mana.
+
+    Tanpa penanda ini, satu-satunya cara mengetahui apakah sebuah angka datang
+    dari tool tetap atau dari SQL adalah menebak — dan pertanyaan itu justru
+    yang paling sering muncul saat mengevaluasi fitur ini.
+
+    Penandanya tinggal di metadata, bukan di layar orang tua: `peri-bugi-api`
+    menyimpan metadata apa adanya ke `chat_messages.metadata`, sehingga terbaca
+    di panel admin dan bisa dicocokkan dengan trace Langfuse lewat trace_id.
+
+    answer_source:
+        text2sql — hanya jalur SQL yang menyuplai data
+        mixed    — jalur SQL dan tool tetap dua-duanya dipakai
+        tools    — hanya tool tetap (dan ini yang berlaku untuk seluruh
+                   percakapan sebelum fitur Text-to-SQL menyala)
+    """
+    agent_results = legacy_dict_state.get("agent_results", {}) or {}
+    nl = agent_results.get("data_query")
+
+    if not nl:
+        return {"answer_source": "tools"}
+
+    data_agents = {
+        "rapot_peri",
+        "rapot_peri_history",
+        "rapot_peri_achievements",
+        "brushing_settings",
+        "brushing_trend",
+        "mata_peri",
+        "mata_peri_scan_detail",
+        "cerita_peri",
+        "cerita_module_detail",
+        "cerita_modules_summary",
+        "caries_risk",
+        "tips",
+    }
+    used_deterministic = bool(data_agents.intersection(agents_used))
+
+    return {
+        "answer_source": "mixed" if used_deterministic else "text2sql",
+        "nl_query": {
+            "question": nl.get("question"),
+            "sql": nl.get("sql"),
+            "row_count": nl.get("row_count", 0),
+            "datasets": nl.get("datasets") or [],
+            "truncated": bool(nl.get("truncated")),
+            "repaired": bool(nl.get("repaired")),
+            "elapsed_ms": nl.get("elapsed_ms"),
+            "catalog_version": nl.get("catalog_version"),
+            "error": nl.get("error"),
+        },
+    }
 
 
 def _extract_user_msg(state: AgentState) -> str:

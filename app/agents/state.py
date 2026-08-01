@@ -62,6 +62,9 @@ class AgentControl(BaseModel):
     """Permission & config (di-inject dari api)."""
     allowed_agents: list[str] = Field(default_factory=list)
     agent_configs: dict[str, dict] = Field(default_factory=dict)
+    #: tools | hybrid | sql — diputuskan di api, dipakai make_tools() untuk
+    #: menentukan apakah query_family_data ikut dirakit di turn ini.
+    data_strategy: str = "tools"
 
 
 class MemorySnapshot(BaseModel):
