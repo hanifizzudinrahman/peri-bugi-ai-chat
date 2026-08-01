@@ -38,9 +38,17 @@ from app.agents.founder_analytics.state import ChartIntent
 
 logger = logging.getLogger(__name__)
 
-#: Kardinalitas warna di atas ini tidak lagi terbaca — legendanya lebih tinggi
-#: daripada grafiknya, dan tidak ada yang bisa membedakan warna ke-13.
-MAX_WARNA = 12
+#: Palet kategori di `peri-bugi-web` punya **lima** warna, dan jumlah itu bukan
+#: selera: palet aslinya diuji dengan validator dataviz terhadap latar terang,
+#: dan lima langkah itu satu-satunya susunan yang lolos seluruh pemeriksaan —
+#: pita terang, lantai kroma, pemisahan buta warna, dan kontras — tanpa satu
+#: pun peringatan.
+#:
+#: Di atas lima, saluran warna dibuang seluruhnya (grafiknya jadi satu warna).
+#: Alternatifnya adalah membangkitkan hue keenam, dan hue yang dibangkitkan
+#: tidak pernah lolos pemeriksaan yang sama — ia cuma terlihat berbeda bagi
+#: yang menulis kodenya.
+MAX_WARNA = 5
 
 #: Satu titik bukan tren, dan satu batang bukan perbandingan.
 MIN_BARIS = 2
