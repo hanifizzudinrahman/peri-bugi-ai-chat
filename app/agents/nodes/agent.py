@@ -270,8 +270,64 @@ def _build_tool_guard(tools: Optional[list], state: AgentState) -> str:
         "JANGAN panggil tool, jawab langsung.\n"
         "=== END ATURAN ===\n"
     )
-    
+
+    guard += _build_data_query_routing(available_tool_names)
+
     return guard
+
+
+def _build_data_query_routing(available_tool_names: list[str]) -> str:
+    """Aturan pemilihan antara tool tetap dan query_family_data.
+
+    Hanya muncul kalau `query_family_data` benar-benar terpasang di turn ini,
+    jadi percakapan yang berjalan tanpa Text-to-SQL sama sekali tidak berubah.
+
+    Kenapa aturan ini perlu ditulis eksplisit, bukan diserahkan ke deskripsi
+    masing-masing tool: graph-nya sekali jalan (agent → tools → generate, tanpa
+    balik ke agent). Model memilih tool SEKALI, sebelum melihat hasilnya. Kalau
+    ia terlanjur memilih tool tetap yang cakupannya kurang — `get_brushing_history`
+    misalnya hanya membaca SATU bulan kalender — tidak ada kesempatan kedua, dan
+    yang sampai ke orang tua adalah "belum ada data" untuk periode yang datanya
+    sebenarnya ada. Itu bukan kesalahan model, itu keputusan yang diambil buta.
+
+    Karena itu batasnya ditarik di sini: apa pun yang menghitung, membandingkan,
+    atau melintasi periode, langsung ke query_family_data.
+    """
+    if "query_family_data" not in available_tool_names:
+        return ""
+
+    return (
+        "\n=== MEMILIH ANTARA TOOL TETAP DAN query_family_data ===\n"
+        "Pakai query_family_data (query langsung ke data) kalau pertanyaannya:\n"
+        "  • MENGHITUNG jumlah — 'berapa hari', 'berapa kali', 'total'\n"
+        "  • MEMBANDINGKAN — 'bandingkan', 'lebih sering', 'paling', 'vs'\n"
+        "  • MELINTASI PERIODE — 'minggu ini', '7 hari terakhir', '60 hari',\n"
+        "    '3 bulan', 'bulan lalu', 'sejak ...', 'tahun ini'\n"
+        "  • MERINCI PER HARI/PER BULAN — 'rincian per hari', 'per bulan'\n"
+        "  • MENGGABUNGKAN dua fitur — mis. sikat gigi DIKAITKAN dengan scan\n"
+        "\n"
+        "Pakai tool tetap kalau pertanyaannya angka tunggal yang sudah jadi:\n"
+        "  • streak hari ini / rekor terbaik  → get_brushing_stats\n"
+        "  • daftar badge yang diraih         → get_brushing_achievements\n"
+        "  • isi temuan hasil scan            → get_mata_peri_scan_detail\n"
+        "  • pengetahuan gigi umum            → search_dental_knowledge\n"
+        "  • cara memakai aplikasi            → search_app_faq\n"
+        "\n"
+        "PENTING: get_brushing_history hanya membaca SATU bulan kalender. "
+        "Untuk rentang yang melewati batas bulan (termasuk 'minggu ini' di awal "
+        "bulan) tool itu akan tampak kosong padahal datanya ada — pakai "
+        "query_family_data.\n"
+        "\n"
+        "Dua pertanyaan yang deskripsi tool tetapnya menyesatkan — untuk kedua "
+        "ini WAJIB query_family_data:\n"
+        "  • 'pagi atau malam yang lebih sering kelewat' tanpa menyebut bulan "
+        "tertentu. get_brushing_history mengaku bisa, tapi jawabannya terbatas "
+        "bulan berjalan.\n"
+        "  • apa pun yang berpangkal dari kejadian lain — 'sejak scan terakhir', "
+        "'sejak dapat badge', 'setelah ke dokter'. Tidak ada tool tetap yang "
+        "bisa menggabungkan dua sumber data.\n"
+        "=== END ===\n"
+    )
 
 
 def _extract_user_message_for_llm(state: AgentState) -> str:

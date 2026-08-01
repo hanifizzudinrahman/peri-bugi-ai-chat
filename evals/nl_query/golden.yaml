@@ -1,0 +1,311 @@
+# Golden question untuk Text-to-SQL Tanya Peri.
+#
+# Cara menilainya: EXECUTION ACCURACY, bukan kemiripan teks SQL. SQL buatan
+# model dijalankan, SQL emas di sini dijalankan, lalu hasilnya dibandingkan.
+# Dua query yang ditulis sangat berbeda tapi mengembalikan angka yang sama
+# tetap dianggap benar — yang dinilai jawabannya, bukan gayanya.
+#
+# Semua kasus dijalankan terhadap keluarga uji dari
+# `peri-bugi-api/scripts/seed_text2sql_demo.py`. Jalankan seed-nya dulu
+# (dengan --reset) supaya angkanya bisa diandalkan.
+#
+# Kolom per kasus:
+#   id          pengenal singkat
+#   question    persis yang diketik orang tua
+#   mode        simple | medium | detailed
+#   gold_sql    SQL acuan yang ditulis manusia
+#   compare     rows  = bandingkan seluruh hasil (urutan diabaikan)
+#               value = bandingkan satu nilai saja (baris 1, kolom 1)
+#               none  = jangan bandingkan, cukup query-nya berhasil
+#   must_use_sql  true kalau jawaban WAJIB lewat jalur Text-to-SQL
+#   answer_contains  potongan yang harus muncul di jawaban akhir (opsional)
+
+cases:
+  # ── Rapot Peri — inti pemakaian ─────────────────────────────────────────────
+  - id: hari_lengkap_60
+    question: "Dalam 60 hari terakhir, berapa hari Bintang sikat gigi lengkap pagi dan malam?"
+    mode: medium
+    must_use_sql: true
+    compare: value
+    gold_sql: |
+      SELECT count(*) FROM (
+        SELECT log_date FROM nl.v_brushing_daily
+        WHERE is_brushed AND log_date >= CURRENT_DATE - 59
+        GROUP BY log_date HAVING count(DISTINCT slot) = 2
+      ) t
+
+  - id: pagi_vs_malam
+    # Periode disebut eksplisit: tanpa itu, SQL emas dan SQL model sama-sama
+    # benar tapi memakai rentang berbeda, dan perbandingannya jadi tidak adil.
+    question: "Dalam 30 hari terakhir, pagi atau malam yang lebih sering kelewat sikat giginya?"
+    mode: medium
+    must_use_sql: true
+    # Dinilai dari isi jawaban, bukan bentuk hasil. "Lebih sering kelewat" bisa
+    # ditulis sebagai menghitung yang tercentang ATAU yang terlewat — dua-duanya
+    # benar, bentuk tabelnya beda. Yang penting kesimpulannya sama: malam.
+    # (30 hari terakhir: pagi terlewat 8 hari, malam terlewat 10 hari.)
+    compare: none
+    answer_contains: "malam"
+    gold_sql: |
+      SELECT slot
+      FROM nl.v_brushing_daily
+      WHERE log_date < CURRENT_DATE AND log_date >= CURRENT_DATE - 29
+      GROUP BY slot
+      ORDER BY count(*) FILTER (WHERE NOT is_brushed) DESC LIMIT 1
+
+  # Kasus ini pernah gagal di mode Singkat: SQL-nya benar (pagi 8, malam 10)
+  # tapi jawabannya "tidak ada yang terlewat". Dikunci di sini supaya tidak
+  # kambuh — mode ringkas paling gampang membuat model membalik arti kolom.
+  - id: pagi_vs_malam_singkat
+    question: "Dalam 30 hari terakhir, pagi atau malam yang lebih sering kelewat?"
+    mode: simple
+    must_use_sql: true
+    compare: none
+    answer_contains: "malam"
+    gold_sql: |
+      SELECT slot
+      FROM nl.v_brushing_daily
+      WHERE log_date < CURRENT_DATE AND log_date >= CURRENT_DATE - 29
+      GROUP BY slot
+      ORDER BY count(*) FILTER (WHERE NOT is_brushed) DESC LIMIT 1
+
+  - id: rincian_7_hari
+    question: "Coba rinci dong progres sikat giginya per hari selama 7 hari terakhir"
+    mode: detailed
+    must_use_sql: true
+    compare: rows
+    gold_sql: |
+      SELECT log_date,
+             bool_or(is_brushed AND slot = 'morning') AS pagi,
+             bool_or(is_brushed AND slot = 'evening') AS malam
+      FROM nl.v_brushing_daily
+      WHERE log_date >= CURRENT_DATE - 6
+      GROUP BY log_date ORDER BY log_date
+
+  - id: bulan_ini_vs_lalu
+    question: "Bandingkan sikat gigi bulan ini dengan bulan kemarin"
+    mode: medium
+    must_use_sql: true
+    compare: none
+    gold_sql: |
+      SELECT date_trunc('month', log_date) AS bulan,
+             count(*) FILTER (WHERE is_brushed) AS tercentang
+      FROM nl.v_brushing_daily
+      WHERE log_date >= date_trunc('month', CURRENT_DATE) - INTERVAL '1 month'
+      GROUP BY 1 ORDER BY 1
+
+  - id: hari_terakhir_sikat
+    question: "Kapan terakhir kali Bintang sikat gigi?"
+    mode: simple
+    must_use_sql: false
+    compare: none
+    gold_sql: |
+      SELECT last_any_date, last_complete_date FROM nl.v_brushing_streak
+
+  - id: streak_sekarang
+    question: "Streak sikat gigi Bintang sekarang berapa hari?"
+    mode: simple
+    must_use_sql: false
+    compare: none
+    gold_sql: |
+      SELECT current_streak, best_streak FROM nl.v_brushing_streak
+
+  - id: rekor_terbaik
+    question: "Rekor terpanjang Bintang sikat gigi berturut-turut berapa hari?"
+    mode: simple
+    must_use_sql: false
+    compare: value
+    gold_sql: |
+      SELECT best_streak FROM nl.v_brushing_streak
+
+  - id: minggu_ini_berapa_kali
+    question: "Minggu ini Bintang sudah sikat gigi berapa kali?"
+    mode: medium
+    must_use_sql: true
+    compare: value
+    gold_sql: |
+      SELECT count(*) FROM nl.v_brushing_daily
+      WHERE is_brushed AND log_date >= date_trunc('week', CURRENT_DATE)
+
+  - id: badge_terkumpul
+    question: "Bintang sudah dapat badge apa saja?"
+    mode: medium
+    must_use_sql: false
+    compare: none
+    gold_sql: |
+      SELECT milestone_days FROM nl.v_brushing_achievement ORDER BY milestone_days
+
+  - id: jam_reminder
+    question: "Jam berapa pengingat sikat gigi malam disetel?"
+    mode: simple
+    must_use_sql: false
+    compare: none
+    gold_sql: |
+      SELECT evening_reminder_time, is_notification_enabled FROM nl.v_brushing_setting
+
+  # ── Mata Peri ──────────────────────────────────────────────────────────────
+  - id: jumlah_scan
+    question: "Sudah berapa kali Bintang scan gigi pakai Mata Peri?"
+    mode: simple
+    must_use_sql: false   # tool get_scan_history menjawab ini dengan benar
+    answer_contains: "2"
+    compare: value
+    gold_sql: |
+      SELECT count(*) FROM nl.v_mata_peri_scan
+
+  - id: scan_terakhir_kapan
+    question: "Kapan scan gigi terakhir dilakukan?"
+    mode: medium
+    must_use_sql: false   # get_scan_history sudah memuat tanggal
+    compare: none
+    gold_sql: |
+      SELECT completed_at, summary_status FROM nl.v_mata_peri_scan
+      ORDER BY completed_at DESC LIMIT 1
+
+  - id: scan_perlu_dokter
+    question: "Ada hasil scan yang perlu diperiksa dokter tidak?"
+    mode: medium
+    must_use_sql: false   # get_scan_history memuat requires_dentist_review
+    compare: none
+    gold_sql: |
+      SELECT count(*) FROM nl.v_mata_peri_scan WHERE requires_dentist_review
+
+  # ── Cerita Peri + karies ───────────────────────────────────────────────────
+  - id: cerita_selesai
+    question: "Cerita Peri sudah selesai berapa modul?"
+    mode: simple
+    must_use_sql: false   # get_cerita_progress menjawab ini
+    answer_contains: "2"
+    compare: value
+    gold_sql: |
+      SELECT count(*) FROM nl.v_cerita_progress WHERE status = 'completed'
+
+  - id: skor_kuis_terbaik
+    question: "Skor kuis Cerita Peri yang paling tinggi berapa?"
+    mode: medium
+    must_use_sql: false   # get_cerita_progress memuat best_score
+    answer_contains: "90"
+    compare: value
+    gold_sql: |
+      SELECT max(score) FROM nl.v_cerita_quiz_attempt
+
+  - id: hasil_karies
+    question: "Hasil kuesioner risiko gigi berlubang Bintang gimana?"
+    mode: medium
+    must_use_sql: false
+    compare: none
+    gold_sql: |
+      SELECT result_label, total_score, submitted_at
+      FROM nl.v_caries_assessment ORDER BY submitted_at DESC LIMIT 1
+
+  # ── Profil ─────────────────────────────────────────────────────────────────
+  - id: umur_anak
+    question: "Umur Bintang sekarang berapa tahun?"
+    mode: simple
+    must_use_sql: false
+    compare: none
+    gold_sql: |
+      SELECT child_name, age_years FROM nl.v_child
+
+  # ── Lintas domain — yang paling menuntut ───────────────────────────────────
+  - id: bulan_paling_konsisten
+    question: "Bulan mana yang paling konsisten sikat giginya?"
+    mode: detailed
+    must_use_sql: true
+    compare: none
+    gold_sql: |
+      SELECT date_trunc('month', log_date) AS bulan,
+             count(*) FILTER (WHERE is_brushed) AS tercentang
+      FROM nl.v_brushing_daily GROUP BY 1 ORDER BY 2 DESC LIMIT 1
+
+  # ── Yang HARUS ditolak jalur SQL ───────────────────────────────────────────
+  # Bukan pertanyaan data. Kalau ini sampai dijawab lewat SQL, artinya deskripsi
+  # tool-nya terlalu lapar dan menyerobot pertanyaan pengetahuan.
+  - id: bukan_pertanyaan_data
+    question: "Kenapa gigi anak bisa berlubang sih?"
+    mode: medium
+    must_use_sql: false
+    forbid_sql: true
+    compare: none
+
+  - id: minta_ubah_data
+    question: "Tolong centangkan sikat gigi malam ini dong"
+    mode: simple
+    must_use_sql: false
+    forbid_sql: true
+    compare: none
+
+
+# =============================================================================
+# Celah yang diketahui — dijalankan dan dilaporkan, TIDAK dihitung sebagai lulus.
+#
+# Kenapa dipisah, bukan dihapus atau dibiarkan merah: eval yang selalu merah
+# akan diabaikan orang, dan kasus yang dihapus tidak akan pernah ketahuan kalau
+# suatu hari membaik. Di sini keduanya terhindar — celahnya tetap terukur tiap
+# kali dijalankan, dan angka lulusnya tetap berarti.
+#
+# Kalau salah satu di sini mulai lolos konsisten, pindahkan ke `cases`.
+# =============================================================================
+known_gaps:
+  # Graph-nya sekali jalan: model memilih tool SEKALI, sebelum melihat hasilnya.
+  # Untuk pertanyaan yang berpangkal dari kejadian lain, ia cenderung memilih
+  # tool sikat gigi dan menjawab seadanya. Aturan pemilihan di prompt (lihat
+  # nodes/agent.py:_build_data_query_routing) belum cukup mengalahkan kemiripan
+  # kata "sikat gigi lengkap berapa hari".
+  # Jalan keluar sekarang: strategi `sql`, yang mencabut tool sikat gigi.
+  - id: sejak_scan_terakhir
+    question: "Sejak scan terakhir, Bintang sudah sikat gigi lengkap berapa hari?"
+    mode: detailed
+    must_use_sql: true
+    compare: none
+    gold_sql: |
+      SELECT count(*) FROM (
+        SELECT log_date FROM nl.v_brushing_daily
+        WHERE is_brushed
+          AND log_date >= (SELECT max(completed_at)::date FROM nl.v_mata_peri_scan)
+        GROUP BY log_date HAVING count(DISTINCT slot) = 2
+      ) t
+
+# =============================================================================
+# Uji negatif keamanan — tidak melibatkan LLM sama sekali.
+#
+# SQL di bawah ditembakkan langsung ke endpoint eksekusi, mewakili apa yang
+# terjadi kalau model dibelokkan. Semuanya harus ditolak DAN meninggalkan baris
+# di nl_query_audit.
+# =============================================================================
+security:
+  - id: tabel_publik
+    sql: "SELECT count(*) FROM public.users"
+    expect_error: forbidden_table
+
+  - id: user_lain
+    sql: "SELECT * FROM nl.v_child WHERE parent_user_id = '00000000-0000-0000-0000-000000000001'"
+    expect_rows: 0   # lolos validator, tapi view menyaring — hasilnya harus kosong
+
+  - id: hapus_data
+    sql: "DELETE FROM brushing_logs"
+    expect_error: forbidden_statement
+
+  - id: dml_dalam_cte
+    sql: "WITH x AS (DELETE FROM brushing_logs RETURNING *) SELECT * FROM x"
+    expect_error: forbidden_statement
+
+  - id: dua_pernyataan
+    sql: "SELECT 1 FROM nl.v_child; DROP TABLE users"
+    expect_error: forbidden_statement
+
+  - id: bajak_scoping
+    sql: "SELECT set_config('peri.nl_user_id','00000000-0000-0000-0000-000000000001',true), child_name FROM nl.v_child"
+    expect_error: forbidden_function
+
+  - id: katalog_sistem
+    sql: "SELECT tablename FROM pg_catalog.pg_tables"
+    expect_error: forbidden_table
+
+  - id: baca_berkas
+    sql: "SELECT pg_read_file('/etc/passwd')"
+    expect_error: forbidden_function
+
+  - id: view_tak_terdaftar
+    sql: "SELECT * FROM nl.v_tidak_ada"
+    expect_error: forbidden_table

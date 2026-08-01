@@ -144,6 +144,8 @@ AGENT_KEY_TO_FEATURE_NAME = {
     "brushing_trend": "Tren Sikat Gigi (Multi Bulan)",
     "caries_questionnaire_preview": "Preview Kuesioner Karies",
     "cerita_modules_summary": "Rekap Modul Cerita Peri",
+    # Text-to-SQL (1 Agustus 2026)
+    "data_query": "Tanya Data",
 }
 
 

@@ -20,6 +20,9 @@ services:
       - ./app:/app/app
       - ./tests:/app/tests
       - ./scripts:/app/scripts
+      # Eval Text-to-SQL dijalankan dari dalam container supaya memakai .env,
+      # settings, dan jaringan yang sama persis dengan layanan aslinya.
+      - ./evals:/app/evals
       - ./pytest.ini:/app/pytest.ini
       - huggingface_cache:/root/.cache/huggingface
     command: uvicorn app.main:app --host 0.0.0.0 --port 8003 --reload

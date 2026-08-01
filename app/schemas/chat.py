@@ -39,6 +39,15 @@ class ChatRequest(BaseModel):
     )
     timezone: str = Field(default="Asia/Jakarta")
     source: str = Field(default="web")
+    data_strategy: str = Field(
+        default="tools",
+        description=(
+            "Cara menjawab pertanyaan data: tools | hybrid | sql. Diputuskan di "
+            "peri-bugi-api (feature flag founder + system_config). Default 'tools' "
+            "supaya versi api yang belum mengirim field ini berperilaku persis "
+            "seperti sebelum Text-to-SQL ada."
+        ),
+    )
     image_url: Optional[str] = None
     image_url_public: Optional[str] = Field(
         default=None,
@@ -96,6 +105,12 @@ class RnDChatRequest(BaseModel):
 
     # v2 additions
     response_mode: Optional[str] = Field(default="simple")
+
+    # Text-to-SQL — sandbox bisa memaksa mode per eksperimen tanpa mengubah
+    # setelan global yang dipakai orang tua sungguhan.
+    data_strategy: Optional[str] = Field(
+        default=None, description="tools | hybrid | sql. None = ikut settings."
+    )
 
     # Simulasi context
     user_context: dict = Field(

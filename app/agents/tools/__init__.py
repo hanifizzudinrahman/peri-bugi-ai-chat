@@ -31,6 +31,8 @@ TOOL ↔ AGENT_KEY MAPPING (for allowed_agents filtering):
     mata_peri    → get_scan_history + analyze_chat_image (existing)
                    get_mata_peri_scan_detail     [NEW Phase 2 expansion]
     tips         → get_parenting_tip_today       [NEW agent group + tool]
+    data_query   → query_family_data             [Text-to-SQL, 1 Agustus 2026 —
+                                                  juga bergantung data_strategy]
     janji_peri   → (Phase 6 — not implemented)
 """
 from __future__ import annotations
@@ -55,6 +57,9 @@ from app.agents.tools.cerita import (
     make_get_cerita_progress_tool,
     make_get_cerita_module_detail_tool,    # NEW Phase 2 expansion
     make_get_cerita_modules_summary_tool,  # NEW Phase 3
+)
+from app.agents.tools.data_query import (
+    make_query_family_data_tool,           # NEW Text-to-SQL (1 Agustus 2026)
 )
 from app.agents.tools.knowledge import (
     make_search_app_faq_tool,
@@ -125,6 +130,13 @@ def make_tools(state: AgentState) -> list[Any]:
 
     allowed = set(state.control.allowed_agents or [])
 
+    # Strategi 'sql' = mode banding/RnD: pertanyaan data harus benar-benar lewat
+    # Text-to-SQL, bukan cuma boleh. peri-bugi-api sudah mencabut agent yang
+    # seluruh tool-nya membaca data (rapot_peri, cerita_peri, tips); yang tersisa
+    # dikerjakan di sini karena butuh ketelitian per tool, bukan per agent.
+    data_strategy = (state.control.data_strategy or "tools").lower()
+    sql_only = data_strategy == "sql" and "data_query" in allowed
+
     tools: list[Any] = []
 
     # ── Knowledge / FAQ tools (gated by kb_dental / app_faq) ─────────────────
@@ -145,7 +157,7 @@ def make_tools(state: AgentState) -> list[Any]:
         tools.append(make_get_user_profile_tool(user_context=user_ctx_dump))
 
     # ── Brushing / Rapot tool (gated by rapot_peri) ──────────────────────────
-    if "rapot_peri" in allowed:
+    if "rapot_peri" in allowed and not sql_only:
         tools.append(make_get_brushing_stats_tool(
             user_id=user_id,
             user_context=user_ctx_dump,
@@ -160,7 +172,7 @@ def make_tools(state: AgentState) -> list[Any]:
         tools.append(make_get_caries_questionnaire_preview_tool())  # no user_id needed
 
     # ── Cerita Peri tools (gated by cerita_peri) ─────────────────────────────
-    if "cerita_peri" in allowed:
+    if "cerita_peri" in allowed and not sql_only:
         tools.append(make_get_cerita_progress_tool(user_id=user_id))
         # Phase 2 Tools Expansion (lock-aware)
         tools.append(make_get_cerita_module_detail_tool(user_id=user_id))
@@ -169,10 +181,15 @@ def make_tools(state: AgentState) -> list[Any]:
 
     # ── Mata Peri tools (gated by mata_peri — history + analyze + scan_detail) ─
     if "mata_peri" in allowed:
-        tools.append(make_get_scan_history_tool(
-            user_id=user_id,
-            user_context=user_ctx_dump,
-        ))
+        # Riwayat scan = pertanyaan data, ikut dicabut di mode sql.
+        if not sql_only:
+            tools.append(make_get_scan_history_tool(
+                user_id=user_id,
+                user_context=user_ctx_dump,
+            ))
+        # analyze_chat_image TIDAK PERNAH dicabut — ini satu-satunya jalan foto
+        # gigi bisa dianalisa, dan tidak punya padanan di katalog SQL. Mode RnD
+        # tidak boleh diam-diam mematikan Mata Peri di dalam chat.
         tools.append(make_analyze_chat_image_tool(
             user_id=user_id,
             image_url=image_url,
@@ -186,12 +203,38 @@ def make_tools(state: AgentState) -> list[Any]:
             rnd_llm_model=rnd_llm_model,
             session_id=session_id,  # FIX (Langfuse audit Bagian B5)
         ))
-        # Phase 2 Tools Expansion
+        # Phase 2 Tools Expansion.
+        # Juga tidak dicabut di mode sql: katalog SQL sengaja tidak memuat teks
+        # temuan medis (summary_text / recommendation_text), jadi tool ini tidak
+        # punya pengganti. Mencabutnya bukan membandingkan dua jalur, melainkan
+        # menghapus kemampuannya.
         tools.append(make_get_mata_peri_scan_detail_tool(user_id=user_id))
 
     # ── Tips Parenting tool (NEW agent group 'tips') ─────────────────────────
     if "tips" in allowed:
         tools.append(make_get_parenting_tip_today_tool(user_id=user_id))
+
+    # ── Text-to-SQL (gated by data_query + strategi dari api) ────────────────
+    #
+    # Dua kunci, sengaja: `allowed_agents` mengurus SIAPA yang boleh (izin per
+    # user + feature flag founder, diputuskan di peri-bugi-api), `data_strategy`
+    # mengurus KAPAN dipakai. Strategi 'tools' berarti tool ini tidak dirakit
+    # sama sekali walau izinnya ada — perilakunya persis sebelum fitur ini ada.
+    #
+    # Di strategi 'sql', api sudah mencabut agent data deterministik dari
+    # allowed_agents, jadi tool tetap di atas otomatis tidak ikut terpasang dan
+    # jalur SQL benar-benar yang teruji.
+    data_strategy = (state.control.data_strategy or "tools").lower()
+    if "data_query" in allowed and data_strategy in ("hybrid", "sql"):
+        tools.append(make_query_family_data_tool(
+            user_id=user_id,
+            timezone=state.session.timezone,
+            trace_id=trace_id,
+            session_id=session_id,
+            llm_provider_override=rnd_llm_provider,
+            llm_model_override=rnd_llm_model,
+            prompts=prompts,
+        ))
 
     # ── janji_peri (Phase 6 — placeholder) ───────────────────────────────────
     # if "janji_peri" in allowed:
@@ -199,7 +242,7 @@ def make_tools(state: AgentState) -> list[Any]:
 
     logger.info(
         f"[tools.make_tools] built {len(tools)} tools for "
-        f"allowed_agents={list(allowed)}"
+        f"allowed_agents={list(allowed)} strategy={data_strategy}"
     )
     return tools
 
@@ -240,6 +283,8 @@ _EXPECTED_TOOL_NAMES = [
     "get_mata_peri_scan_detail",
     # Tips
     "get_parenting_tip_today",
+    # Text-to-SQL (1 Agustus 2026)
+    "query_family_data",
 ]
 
 try:
