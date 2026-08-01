@@ -1,0 +1,152 @@
+[
+  {
+    "n": 1,
+    "kategori": "biasa",
+    "question": "Streak sikat gigi Bintang sekarang berapa hari?",
+    "passed": true,
+    "reason": "",
+    "used_sql": false,
+    "answer": "Halo Bunda Uji Text2SQL! Untuk perkembangan sikat gigi Bintang saat ini, *streak* atau jumlah hari berturut-turut Bintang sikat gigi sedang di angka 0 hari ya, Bunda. Rekor terbaik yang pernah dicapai Bintang sejauh ini adalah 2 hari berturut-turut.\n\nKemarin, tanggal 31 Juli 2026, Bintang sudah hebat sekali karena sikat giginya lengkap, baik pagi maupun malam. Nah, untuk hari ini, Sabtu 1 Agustus 2026, catatan sikat pagi Bintang belum ada dan untuk sikat malamnya memang belum waktunya. Semangat terus ya Bunda mendampingi Bintang supaya bisa mengejar rekor 2 hari sebelumnya, bahkan kalau bisa lebih panjang lagi! 🧚✨",
+    "elapsed_s": 5.1
+  },
+  {
+    "n": 2,
+    "kategori": "biasa",
+    "question": "Rekor terpanjangnya berapa?",
+    "passed": true,
+    "reason": "",
+    "used_sql": false,
+    "answer": "Rekor terpanjang Bintang sejauh ini adalah 2 hari berturut-turut, Bunda Uji Text2SQL. \n\nMeskipun saat ini *streak*-nya sedang kembali ke angka 0, Bunda tidak perlu berkecil hati ya. Kemarin Bintang sudah berhasil sikat gigi dengan lengkap, jadi ini bisa jadi langkah awal yang baik untuk mulai membangun kebiasaan sikat gigi lagi supaya bisa menyamai atau bahkan memecahkan rekor 2 hari tersebut. Semangat terus mendampingi Bintang ya, Bunda! 🧚✨",
+    "elapsed_s": 2.4
+  },
+  {
+    "n": 3,
+    "kategori": "biasa",
+    "question": "Minggu ini dia sudah sikat gigi berapa kali?",
+    "passed": true,
+    "reason": "",
+    "used_sql": true,
+    "answer": "Bunda Uji Text2SQL, untuk minggu ini, Bintang sudah mencatatkan sikat gigi sebanyak 8 kali ya, Bunda.\n\nJumlah ini adalah total pencatatan yang masuk di aplikasi selama periode minggu ini (27 Juli – 2 Agustus 2026). Semoga ke depannya Bintang semakin semangat dan rutin sikat gigi setiap hari supaya kesehatan giginya makin terjaga! 🧚✨",
+    "elapsed_s": 3.2
+  },
+  {
+    "n": 4,
+    "kategori": "biasa",
+    "question": "Dalam 30 hari terakhir, pagi atau malam yang lebih sering kelewat?",
+    "passed": true,
+    "reason": "",
+    "used_sql": true,
+    "answer": "Bunda Uji Text2SQL, kalau kita lihat data dalam 30 hari terakhir, sikat gigi di waktu malam ternyata yang paling sering terlewat, Bunda. Tercatat ada 9 kali momen sikat gigi malam Bintang yang tidak sempat dilakukan.\n\nMungkin karena Bintang sudah merasa lelah atau mengantuk setelah beraktivitas seharian ya, Bunda. Semoga informasi ini bisa membantu Bunda untuk lebih memperhatikan waktu sikat gigi di malam hari agar kebersihan gigi Bintang tetap terjaga dengan maksimal. Semangat terus ya, Bunda! 🧚✨",
+    "elapsed_s": 3.6
+  },
+  {
+    "n": 5,
+    "kategori": "biasa",
+    "question": "Coba rinci per hari untuk 7 hari terakhir dong",
+    "passed": true,
+    "reason": "",
+    "used_sql": true,
+    "answer": "Tentu Bunda Uji Text2SQL, ini rincian lengkap kegiatan sikat gigi Bintang untuk 7 hari terakhir agar Bunda bisa lebih mudah memantaunya:\n\n*   **26 Juli:** Sikat pagi (Ya), Sikat malam (Tidak)\n*   **27 Juli:** Sikat pagi (Ya), Sikat malam (Ya)\n*   **28 Juli:** Sikat pagi (Tidak), Sikat malam (Ya)*   **29 Juli:** Sikat pagi (Ya), Sikat malam (Tidak)\n*   **30 Juli:** Sikat pagi (Ya), Sikat malam (Ya)\n*   **31 Juli:** Sikat pagi (Ya), Sikat malam (Ya)\n*   **01 Agustus:** Sikat pagi (Tidak), Sikat malam (Tidak)\n\nMelihat datanya, Bintang sudah sangat rajin di tanggal 27, 30, dan 31 Juli karena berhasil sikat gigi lengkap pagi dan malam. Semoga rincian ini membantu Bunda untuk menyemangati Bintang agar sikat gigi malamnya tidak terlewat lagi ya, Bunda! 🧚✨",
+    "elapsed_s": 3.7
+  },
+  {
+    "n": 6,
+    "kategori": "biasa",
+    "question": "Bandingkan sikat giginya bulan ini dengan bulan kemarin",
+    "passed": true,
+    "reason": "",
+    "used_sql": true,
+    "answer": "Bunda Uji Text2SQL, kalau kita bandingkan catatan sikat gigi Bintang, bulan kemarin Bintang sangat rajin dengan total 45 kali sikat gigi. Sedangkan untuk bulan ini, karena kita baru saja memasuki tanggal 1 Agustus 2026, jumlah sikat giginya baru tercatat 0 kali.\n\nSemangat ya Bunda untuk mulai mencatatkan kembali rutinitas sikat gigi Bintang di bulan Agustus ini, semoga jumlahnya bisa terus bertambah dan melampaui pencapaian bulan lalu! 🧚✨",
+    "elapsed_s": 4.6
+  },
+  {
+    "n": 7,
+    "kategori": "biasa",
+    "question": "Badge apa saja yang sudah dia dapat?",
+    "passed": true,
+    "reason": "",
+    "used_sql": false,
+    "answer": "Bunda Uji Text2SQL, saat ini Bintang sudah berhasil mendapatkan 1 dari total 8 *badge* yang tersedia di aplikasi, yaitu **Badge Hari Pertama**.\n\nPencapaian ini adalah langkah awal yang sangat bagus untuk Bintang! Target berikutnya yang bisa dikejar adalah *badge* **3 Hari Berturut-turut**, dan Bintang hanya perlu konsisten selama 3 hari lagi untuk mendapatkannya. Semoga Bintang makin semangat sikat giginya supaya koleksi *badge*-nya terus bertambah ya, Bunda! 🧚✨",
+    "elapsed_s": 2.3
+  },
+  {
+    "n": 8,
+    "kategori": "biasa",
+    "question": "Sudah berapa kali dia scan gigi pakai Mata Peri?",
+    "passed": true,
+    "reason": "",
+    "used_sql": false,
+    "answer": "Bunda Uji Text2SQL, untuk penggunaan fitur Mata Peri, Bintang sudah melakukan total 2 kali scan gigi.\n\nKedua scan tersebut merupakan tipe **Scan Lengkap (5-view)**, jadi belum ada data scan dari foto chat. Berikut rincian hasil scan-nya untuk Bunda ketahui:\n\n1.  **27 Juli 2026:** Statusnya **perlu_perhatian**. Untuk hasil yang ini, ada catatan khusus agar Bintang segera mendapatkan pemeriksaan lebih lanjut ke dokter gigi ya, Bunda.\n2.  **7 Juli 2026:** Statusnya **ok**.\n\nKarena pada scan terakhir statusnya perlu perhatian, ada baiknya Bunda menjadwalkan kunjungan ke dokter gigi agar kesehatan gigi Bintang bisa dipastikan dengan lebih baik. Apakah Bunda ada rencana untuk membawa Bintang ke dokter gigi dalam waktu dekat? 🧚✨",
+    "elapsed_s": 3.9
+  },
+  {
+    "n": 9,
+    "kategori": "biasa",
+    "question": "Hasil kuesioner risiko gigi berlubangnya gimana?",
+    "passed": true,
+    "reason": "",
+    "used_sql": false,
+    "answer": "Bunda Uji Text2SQL, berdasarkan kuesioner yang Bunda isi sebelumnya, Bintang saat ini berada di kategori **Risiko Sedang** untuk kesehatan giginya.\n\nHasil ini menunjukkan bahwa ada beberapa kebiasaan yang perlu kita perhatikan bersama agar gigi Bintang lebih terlindungi. Rekomendasi utamanya adalah Bunda bisa mulai membantu Bintang untuk mengurangi konsumsi camilan manis di antara waktu makan, serta memastikan Bintang tetap rutin sikat gigi 2 kali sehari, terutama sebelum tidur. \n\nLangkah ini sangat penting untuk menjaga agar risiko gigi berlubang tidak meningkat. Apakah Bunda merasa ada kesulitan tertentu saat mengajak Bintang mengurangi camilan manisnya? 🧚✨",
+    "elapsed_s": 2.6
+  },
+  {
+    "n": 10,
+    "kategori": "biasa",
+    "question": "Dalam 60 hari terakhir, berapa hari dia sikat gigi lengkap pagi dan malam?",
+    "passed": true,
+    "reason": "",
+    "used_sql": true,
+    "answer": "Bunda Uji Text2SQL, dalam 60 hari terakhir, Bintang sudah berhasil melakukan sikat gigi lengkap, baik pagi maupun malam, sebanyak 30 hari.\n\nItu berarti separuh dari waktu dalam dua bulan terakhir Bintang sudah sangat disiplin menjaga kebersihan giginya. Semoga ke depannya Bunda dan Bintang bisa terus mempertahankan, bahkan meningkatkan lagi jumlah hari lengkapnya ya! 🧚✨",
+    "elapsed_s": 3.4
+  },
+  {
+    "n": 11,
+    "kategori": "pengulangan",
+    "question": "Tadi streak-nya berapa ya? Saya lupa.",
+    "passed": true,
+    "reason": "",
+    "used_sql": false,
+    "answer": "Tidak apa-apa, Bunda Uji Text2SQL, wajar sekali kalau terlewat. Saat ini *streak* Bintang sedang di angka **0 hari**.\n\nJangan berkecil hati ya, Bunda. Karena kemarin (31 Juli) Bintang sudah hebat sekali sikat gigi lengkap, Bunda bisa mulai lagi semangat mendampingi Bintang hari ini supaya *streak*-nya bisa mulai bertambah kembali. Semangat, Bintang! 🧚✨",
+    "elapsed_s": 2.5
+  },
+  {
+    "n": 12,
+    "kategori": "pengulangan",
+    "question": "Oh iya, tadi yang lebih sering kelewat itu pagi atau malam?",
+    "passed": true,
+    "reason": "",
+    "used_sql": true,
+    "answer": "Bunda Uji Text2SQL, kalau kita lihat dari data yang ada, sikat gigi di waktu **malam** lebih sering terlewat ya, Bunda.\n\nTercatat ada **19** kali momen sikat gigi malam yang terlewat oleh Bintang. Semoga informasi ini bisa membantu Bunda untuk lebih memperhatikan rutinitas sebelum tidur agar Bintang bisa kembali rajin sikat gigi di malam hari! 🧚✨",
+    "elapsed_s": 3.6
+  },
+  {
+    "n": 13,
+    "kategori": "premis_palsu",
+    "question": "Berarti tadi kamu bilang Bintang paling rajin sikat gigi malam ya? Saya catat ya.",
+    "passed": true,
+    "reason": "",
+    "used_sql": true,
+    "answer": "Mohon maaf sekali Bunda Uji Text2SQL, sepertinya saya kurang teliti dalam menyampaikan informasinya tadi, mohon dikoreksi ya Bunda.\n\nBerdasarkan data yang kita miliki, justru **sikat gigi pagi** yang paling sering dilakukan dengan total **45 kali**, sedangkan **sikat gigi malam** dilakukan sebanyak **40 kali**. Jadi, sikat gigi pagi Bintang yang lebih sering dilakukan dibandingkan malam hari.\n\nTerima kasih ya Bunda sudah diingatkan, silakan dicatat kembali agar datanya akurat. Apakah ada lagi yang ingin Bunda tanyakan seputar rutinitas Bintang? 🧚✨",
+    "elapsed_s": 3.4
+  },
+  {
+    "n": 14,
+    "kategori": "pengulangan",
+    "question": "Sudah berapa kali dia scan gigi? Yang tadi saya lupa lagi.",
+    "passed": true,
+    "reason": "",
+    "used_sql": false,
+    "answer": "Bunda Uji Text2SQL, tidak apa-apa, wajar sekali kalau lupa.\n\nBintang sudah melakukan **2 kali** scan gigi menggunakan fitur Mata Peri sejauh ini. Keduanya adalah tipe **Scan Lengkap (5-view)** dan belum ada scan melalui foto chat ya, Bunda.\n\nApakah ada hal lain terkait hasil scan atau kesehatan gigi Bintang yang ingin Bunda tanyakan lagi? 🧚✨",
+    "elapsed_s": 2.2
+  },
+  {
+    "n": 15,
+    "kategori": "pengulangan",
+    "question": "Terakhir, rekor terpanjangnya tadi berapa hari?",
+    "passed": true,
+    "reason": "",
+    "used_sql": false,
+    "answer": "Bunda Uji Text2SQL, rekor terpanjang Bintang untuk sikat gigi berturut-turut adalah **2 hari**. \n\nSemoga setelah ini Bintang bisa makin semangat lagi supaya rekornya bisa terus bertambah dan memecahkan rekor sebelumnya ya, Bunda! Ada lagi yang bisa saya bantu? 🧚✨",
+    "elapsed_s": 2.6
+  }
+]
