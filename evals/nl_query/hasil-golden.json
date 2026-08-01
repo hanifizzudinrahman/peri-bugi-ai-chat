@@ -1,0 +1,287 @@
+{
+  "security": [
+    {
+      "id": "tabel_publik",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 0.01803656599986425,
+      "answer": ""
+    },
+    {
+      "id": "user_lain",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 0.026250367000102415,
+      "answer": ""
+    },
+    {
+      "id": "hapus_data",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 0.015224740000121528,
+      "answer": ""
+    },
+    {
+      "id": "dml_dalam_cte",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 0.01739738800097257,
+      "answer": ""
+    },
+    {
+      "id": "dua_pernyataan",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 0.017023897000399302,
+      "answer": ""
+    },
+    {
+      "id": "bajak_scoping",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 0.01518995799960976,
+      "answer": ""
+    },
+    {
+      "id": "katalog_sistem",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 0.014438623000387452,
+      "answer": ""
+    },
+    {
+      "id": "baca_berkas",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 0.01301809299911838,
+      "answer": ""
+    },
+    {
+      "id": "view_tak_terdaftar",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 0.012698386000920436,
+      "answer": ""
+    }
+  ],
+  "chat": [
+    {
+      "id": "hari_lengkap_60",
+      "passed": true,
+      "reason": "",
+      "used_sql": true,
+      "sql": "SELECT COUNT(*) AS hari_lengkap FROM (SELECT log_date FROM nl.v_brushing_daily WHERE child_name = 'Bintang' AND is_brushed AND log_date >= CURRENT_DATE - 59 GROUP BY log_date HAVING COUNT(DISTINCT slot) = 2) AS t LIMIT 200",
+      "elapsed_s": 6.988012981000793,
+      "answer": "Halo Bunda Uji Text2SQL! Senang sekali bisa bantu Bunda memantau perkembangan kebiasaan Bintang.\n\nBerdasarkan catatan kita selama 60 hari terakhir, Bintang sudah berhasil sikat gigi lengkap pagi dan malam sebanyak 30 hari. Ini adalah awal yang bagus untuk membangun kebiasaan baik bagi Bintang, Bunda. Kita bisa terus semangati Bintang supaya ke depannya frekuensi sikat gigi lengkapnya bisa lebih meningkat lagi ya, Bunda! ✨"
+    },
+    {
+      "id": "pagi_vs_malam",
+      "passed": true,
+      "reason": "",
+      "used_sql": true,
+      "sql": "SELECT slot, COUNT(*) AS jumlah_kelewat FROM nl.v_brushing_daily WHERE NOT is_brushed AND log_date < CURRENT_DATE AND log_date >= CURRENT_DATE - 29 GROUP BY slot ORDER BY jumlah_kelewat DESC LIMIT 200",
+      "elapsed_s": 3.6122242940000433,
+      "answer": "Halo Bunda Uji Text2SQL! Kalau kita lihat catatan dalam 30 hari terakhir, ternyata sikat gigi di waktu malam lebih sering terlewat dibandingkan pagi hari.\n\nTercatat ada 9 kali Bintang melewatkan sikat gigi di malam hari, sedangkan untuk waktu pagi ada 7 kali yang terlewat. Mungkin karena Bintang sudah merasa mengantuk sekali di malam hari ya, Bun, jadi kegiatan sikat giginya jadi sering terlewat. Semangat terus ya Bunda mendampingi Bintang supaya kebiasaan sikat giginya makin rutin! 🧚✨"
+    },
+    {
+      "id": "pagi_vs_malam_singkat",
+      "passed": true,
+      "reason": "",
+      "used_sql": true,
+      "sql": "SELECT slot, COUNT(*) FILTER(WHERE NOT is_brushed) AS jumlah_kelewat FROM nl.v_brushing_daily WHERE log_date < CURRENT_DATE AND log_date >= CURRENT_DATE - 29 GROUP BY slot ORDER BY jumlah_kelewat DESC LIMIT 1",
+      "elapsed_s": 3.122408049999649,
+      "answer": "Halo Bunda Uji Text2SQL! Kalau dilihat dari catatan 30 hari terakhir, sikat gigi malam Bintang yang paling sering terlewat ya, Bun, yaitu sebanyak 9 kali. Yuk, kita semangat lagi dampingi Bintang supaya sikat gigi malamnya jadi rutin dan tidak terlewat lagi! 🧚✨"
+    },
+    {
+      "id": "rincian_7_hari",
+      "passed": true,
+      "reason": "",
+      "used_sql": true,
+      "sql": "SELECT log_date, BOOL_OR(is_brushed AND slot = 'morning') AS pagi, BOOL_OR(is_brushed AND slot = 'evening') AS malam FROM nl.v_brushing_daily WHERE log_date >= CURRENT_DATE - 6 GROUP BY log_date ORDER BY log_date ASC LIMIT 200",
+      "elapsed_s": 4.4133417590001045,
+      "answer": "Halo Bunda Uji Text2SQL! Senang sekali bisa membantu Bunda memantau kebiasaan sikat gigi Bintang. Berikut adalah rincian lengkap catatan sikat gigi Bintang selama 7 hari terakhir:\n\n*   **26 Juli:** Sikat gigi pagi (Ya), malam (Tidak)\n*   **27 Juli:** Sikat gigi pagi (Ya), malam (Ya)\n*   **28 Juli:** Sikat gigi pagi (Tidak), malam (Ya)\n*   **29 Juli:** Sikat gigi pagi (Ya), malam (Tidak)\n*   **30 Juli:** Sikat gigi pagi (Ya), malam (Ya)\n*   **31 Juli:** Sikat gigi pagi (Ya), malam (Ya)\n*   **1 Agustus:** Sikat gigi pagi (Tidak), malam (Tidak)\n\nSecara total, Bintang sudah rajin sikat gigi pagi sebanyak 5 kali dan sikat gigi malam sebanyak 4 kali dalam seminggu terakhir.\n\n**Penjelasan Singkat & Tips:**\nMenurut panduan kesehatan gigi anak (seperti rekomendasi AAPD), menyikat gigi dua kali sehari—terutama malam sebelum tidur—sangat krusial. Saat tidur, produksi air liur berkurang, sehingga sisa makanan yang tertinggal akan lebih mudah memicu bakteri penyebab lubang gigi. Jika Bunda merasa Bintang sering terlewat, mungkin bisa dicoba membuat rutinitas yang menyenangkan, misalnya sambil mendengarkan lagu sikat gigi favorit Bintang agar ia lebih semangat.\n\nJika Bunda ingin hasil yang lebih maksimal, jangan lupa untuk memastikan semua permukaan gigi tersikat dengan benar. Karena hasil scan terakhir Bintang menunjukkan status \"perlu perhatian\", kalau Bunda ada waktu luang, tidak ada salahnya untuk membawa Bintang kontrol ke dokter gigi ya, Bunda, agar kesehatan giginya tetap terpantau dengan baik. 🧚✨"
+    },
+    {
+      "id": "bulan_ini_vs_lalu",
+      "passed": true,
+      "reason": "",
+      "used_sql": true,
+      "sql": "SELECT CASE WHEN log_date >= DATE_TRUNC('MONTH', CURRENT_DATE) THEN 'Bulan Ini' ELSE 'Bulan Kemarin' END AS periode, COUNT(*) AS jumlah_sikat FROM nl.v_brushing_daily WHERE is_brushed AND log_date >= DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '1 MONTH' AND log_date < DATE_TRUNC('MONTH', CURRENT_DATE) + INTERVAL '1 MONTH' GROUP BY 1 ORDER BY 1 DESC LIMIT 200",
+      "elapsed_s": 3.85903393999979,
+      "answer": "Halo Bunda Uji Text2SQL! Senang sekali bisa membantu Bunda memantau kebiasaan Bintang.\n\nUntuk perbandingan sikat giginya, catatan yang ada saat ini menunjukkan bahwa jumlah sikat gigi Bintang pada bulan kemarin adalah sebanyak 45 kali. Karena saat ini kita baru memasuki tanggal 1 Agustus 2026, data untuk bulan ini masih dalam proses pengumpulan dan baru akan terlihat perkembangannya di hari-hari ke depan.\n\nMari kita terus dampingi Bintang supaya sikat giginya makin rajin dan semangat ya, Bunda! Kalau ada yang ingin Bunda tanyakan lagi soal kesehatan gigi Bintang, jangan ragu untuk tanya ke Peri ya. 🧚"
+    },
+    {
+      "id": "hari_terakhir_sikat",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.431829891000234,
+      "answer": "Halo Bunda Uji Text2SQL! Untuk Bintang, catatan sikat gigi terakhir yang masuk di sistem itu kemarin, hari Jumat tanggal 31 Juli 2026. Waktu itu Bintang hebat sekali karena sudah sikat gigi lengkap, pagi dan malam. Untuk hari ini, 1 Agustus 2026, belum ada catatan sikat gigi yang masuk ya, Bunda. 🧚✨"
+    },
+    {
+      "id": "streak_sekarang",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.169396481998774,
+      "answer": "Halo Bunda Uji Text2SQL! Saat ini Bintang punya *streak* 0 hari ya, Bunda. Rekor terbaik Bintang sejauh ini adalah 2 hari berturut-turut. Semangat terus ya Bunda buat dampingi Bintang sikat gigi supaya *streak*-nya bisa naik lagi! 🧚✨"
+    },
+    {
+      "id": "rekor_terbaik",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.245403910999812,
+      "answer": "Halo Bunda Uji Text2SQL! Untuk rekor terpanjang Bintang sikat gigi berturut-turut sejauh ini adalah 2 hari, Bunda. Semangat ya, semoga besok Bintang bisa mulai lagi supaya rekornya bisa bertambah panjang! 🧚✨"
+    },
+    {
+      "id": "minggu_ini_berapa_kali",
+      "passed": true,
+      "reason": "",
+      "used_sql": true,
+      "sql": "SELECT COUNT(*) AS jumlah_sikat_gigi FROM nl.v_brushing_daily WHERE child_name = 'Bintang' AND is_brushed AND log_date >= DATE_TRUNC('WEEK', CURRENT_DATE) LIMIT 200",
+      "elapsed_s": 3.250767816000007,
+      "answer": "Halo Bunda Uji Text2SQL! Untuk perkembangan kebiasaan Bintang di minggu ini, tercatat Bintang sudah melakukan sikat gigi sebanyak 8 kali, Bunda.\n\nSemoga catatan ini bisa membantu Bunda dalam memantau rutinitas sikat gigi Bintang supaya ke depannya bisa makin rajin lagi ya. Tetap semangat mendampingi Bintang menjaga kesehatan giginya! 🧚✨"
+    },
+    {
+      "id": "badge_terkumpul",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.3541405369996937,
+      "answer": "Halo Bunda Uji Text2SQL! Senang sekali bisa ngobrol lagi soal perkembangan Bintang.\n\nSaat ini Bintang sudah berhasil mengumpulkan 1 dari 8 badge yang tersedia, yaitu badge \"Hari Pertama\". Untuk badge selanjutnya, Bintang sedang dalam perjalanan menuju target \"3 Hari Berturut-turut\". Karena saat ini streak-nya masih 0 hari, Bunda bisa bantu Bintang untuk mulai rutin sikat gigi lagi ya, supaya target 3 hari berturut-turutnya bisa segera tercapai dalam 3 hari ke depan. Semangat terus ya, Bunda, untuk mendampingi Bintang membangun kebiasaan baik ini! 🧚✨"
+    },
+    {
+      "id": "jam_reminder",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.264092608000283,
+      "answer": "Halo Bunda Uji Text2SQL! Mohon maaf ya Bunda, saat ini saya belum bisa melihat pengaturan jam pengingat sikat gigi Bintang karena ada kendala teknis. Bunda bisa cek langsung jam pengingatnya secara manual di menu Pengaturan yang ada di aplikasi ya. Semoga Bintang tetap semangat sikat gigi malam ini! 🦷✨"
+    },
+    {
+      "id": "jumlah_scan",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.7282432219999464,
+      "answer": "Halo Bunda Uji Text2SQL! Untuk perkembangan gigi Bintang, sejauh ini sudah ada 2 kali scan yang dilakukan menggunakan fitur Mata Peri, dan semuanya merupakan scan lengkap (5-view).\n\nBunda, dari hasil scan terakhir di tanggal 27 Juli kemarin, statusnya menunjukkan \"perlu perhatian\" dan ada catatan untuk segera konsultasi ke dokter gigi ya. Kalau untuk scan sebelumnya di tanggal 7 Juli, hasilnya masih terpantau oke. Semoga Bintang sehat selalu dan makin rajin sikat giginya ya, Bunda! 🧚✨"
+    },
+    {
+      "id": "scan_terakhir_kapan",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.421866155000316,
+      "answer": "Halo Bunda Uji Text2SQL! Untuk scan gigi terakhir Bintang, sudah dilakukan pada tanggal 27 Juli 2026 kemarin ya, Bunda.\n\nBerdasarkan data yang ada, itu merupakan satu-satunya scan yang sudah tercatat sejauh ini. Sayangnya, hasil scan tersebut menunjukkan status \"perlu perhatian\" dengan catatan bahwa Bintang disarankan untuk segera diperiksakan ke dokter gigi. Bunda bisa segera menjadwalkan kunjungan ke dokter gigi agar kondisi gigi Bintang bisa diperiksa lebih lanjut dan mendapatkan penanganan yang tepat ya, Bunda. 🧚✨"
+    },
+    {
+      "id": "scan_perlu_dokter",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.7326384280004277,
+      "answer": "Halo Bunda Uji Text2SQL! Senang sekali bisa membantu Bunda lagi.\n\nKalau kita lihat dari riwayat scan gigi Bintang, memang ada hasil yang perlu perhatian khusus, Bun. Dari total 2 kali scan lengkap (5-view) yang sudah dilakukan, hasil terakhir pada tanggal 27 Juli 2026 menunjukkan status \"perlu perhatian\" dan ada catatan untuk segera konsultasi ke dokter gigi. Sementara itu, hasil scan sebelumnya pada tanggal 7 Juli 2026 kondisinya masih terpantau \"ok\".\n\nKarena hasil terakhir menunjukkan tanda perlu perhatian, saran saya sebaiknya Bintang segera diajak ke dokter gigi ya, Bun, supaya bisa diperiksa langsung dan dipastikan kondisi giginya sehat. Jangan lupa, untuk kebiasaan sikat giginya, kita coba semangat lagi yuk supaya streak-nya bisa meningkat dari yang sekarang, pelan-pelan pasti bisa kok! 🧚✨"
+    },
+    {
+      "id": "cerita_selesai",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.531814382000448,
+      "answer": "Halo Bunda Uji Text2SQL! Untuk Cerita Peri, Bunda sudah berhasil menyelesaikan 2 dari 4 modul yang tersedia, hebat sekali! Saat ini Bunda sedang mengerjakan Modul 3, semangat terus ya Bunda untuk mendampingi Bintang belajar. 🧚✨"
+    },
+    {
+      "id": "skor_kuis_terbaik",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.727857858000789,
+      "answer": "Halo Bunda Uji Text2SQL! Wah, semangat sekali Bunda mendampingi Bintang belajar lewat Cerita Peri.\n\nKalau kita lihat dari hasil belajar Bunda sejauh ini, skor tertinggi yang Bunda dapatkan adalah 90, yaitu saat Bunda menyelesaikan modul \"Kenalan Gigi 🦷\". Untuk modul lainnya, Bunda sudah berhasil menyelesaikan dua modul dengan rincian: Modul 1 dapat skor 90, dan Modul 2 dapat skor 75. Saat ini Bunda sedang berproses di Modul 3, jadi kita kejar terus ya supaya nanti bisa dapat skor maksimal juga di sana! 🧚✨"
+    },
+    {
+      "id": "hasil_karies",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.8731272610002634,
+      "answer": "Halo Bunda Uji Text2SQL! Berdasarkan kuesioner yang Bunda isi untuk Bintang pada tanggal 20 Juli kemarin, hasil penilaiannya menunjukkan bahwa Bintang saat ini berada pada tingkat risiko sedang untuk gigi berlubang. Ini artinya, kondisi kesehatan gigi Bintang perlu mendapatkan perhatian ekstra agar tidak berkembang menjadi masalah yang lebih serius ya, Bunda.\n\nUntuk membantu menjaga gigi Bintang tetap sehat, sarannya adalah Bunda bisa mulai membiasakan Bintang untuk mengurangi konsumsi camilan yang terlalu manis atau lengket, serta memastikan Bintang sikat gigi dua kali sehari secara rutin. Meskipun hasil kuesioner ini menunjukkan risiko sedang, Bunda tidak perlu khawatir berlebihan, yang penting kita konsisten membiasakan Bintang menjaga kebersihan giginya setiap hari. Kalau Bunda merasa ada keluhan atau ingin memastikan kondisi gigi Bintang secara langsung, jangan ragu untuk membawa Bintang berkonsultasi ke dokter gigi ya, Bun! 🧚✨"
+    },
+    {
+      "id": "umur_anak",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 2.0463641149999603,
+      "answer": "Halo Bunda Uji Text2SQL! Saat ini Bintang sudah berusia 6 tahun ya, Bun. Wah, pasti lagi semangat-semangatnya belajar mandiri sikat gigi nih. Kalau ada yang mau ditanyakan soal kesehatan gigi Bintang, tanya ke Peri saja ya! 🧚✨"
+    },
+    {
+      "id": "bulan_paling_konsisten",
+      "passed": true,
+      "reason": "",
+      "used_sql": true,
+      "sql": "SELECT TO_CHAR(log_date, 'YYYY-MM') AS bulan, (CAST(COUNT(*) FILTER(WHERE is_brushed) AS DOUBLE PRECISION) / NULLIF(COUNT(*), 0)) * 100 AS persentase_konsistensi FROM nl.v_brushing_daily WHERE log_date < CURRENT_DATE GROUP BY 1 ORDER BY persentase_konsistensi DESC LIMIT 1",
+      "elapsed_s": 4.314252421001584,
+      "answer": "Halo Bunda Uji Text2SQL! Senang sekali bisa membantu Bunda memantau kebiasaan sikat gigi Bintang.\n\nBerdasarkan data yang tercatat di aplikasi, bulan yang paling konsisten dalam melakukan sikat gigi adalah bulan Juli 2026, dengan tingkat konsistensi mencapai 72,58%.\n\nTingkat konsistensi ini sangat penting untuk menjaga kesehatan rongga mulut Bintang. Berikut adalah penjelasan mengenai mekanisme dan pentingnya menjaga kebiasaan sikat gigi secara rutin:\n\n*   **Mekanisme Pencegahan:** Sikat gigi yang rutin (terutama 2 kali sehari, pagi setelah sarapan dan malam sebelum tidur) berfungsi untuk memutus siklus pembentukan plak. Plak adalah lapisan tipis berisi bakteri yang menempel pada gigi. Jika tidak dibersihkan, bakteri ini akan mengubah sisa makanan (terutama gula) menjadi asam yang dapat mengikis lapisan pelindung gigi (email), yang nantinya berisiko menyebabkan gigi berlubang (karies).\n*   **Pentingnya Konsistensi:** Menurut standar kesehatan gigi dari organisasi kesehatan dunia (WHO), menjaga kebersihan mulut secara berkelanjutan sangat krusial untuk mencegah penyakit periodontal dan kerusakan gigi sejak dini. Konsistensi membantu memastikan bakteri tidak memiliki waktu cukup untuk berkembang biak dan merusak jaringan gigi Bintang yang masih dalam masa pertumbuhan.\n*   **Tips untuk Bunda:** Agar konsistensi di bulan-bulan berikutnya bisa tetap terjaga atau bahkan meningkat, Bunda bisa mencoba membuat jadwal sikat gigi yang menyenangkan, misalnya dengan memberikan apresiasi sederhana atau membacakan cerita peri saat Bintang menyikat gigi. Jika Bunda merasa ada bagian gigi Bintang yang sulit dibersihkan atau terlihat tanda-tanda perubahan warna, jangan ragu untuk segera berkonsultasi ke dokter gigi ya, Bun.\n\nSemoga Bintang semakin semangat menyikat giginya setiap hari ya, Bunda! Jika ada hal lain yang ingin ditanyakan, jangan sungkan untuk bertanya kembali."
+    },
+    {
+      "id": "bukan_pertanyaan_data",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 17.207942855999136,
+      "answer": "Halo Bunda Uji Text2SQL, senang sekali bisa ngobrol lagi. Pertanyaan yang bagus sekali, Bunda! Gigi berlubang pada anak itu sebenarnya terjadi karena proses penumpukan sisa makanan yang menempel di gigi, terutama dari makanan manis atau karbohidrat. Sisa makanan ini kemudian jadi \"makanan\" buat bakteri di dalam mulut, yang lalu mengubahnya menjadi asam. Nah, asam inilah yang pelan-pelan mengikis lapisan luar gigi (email) sampai akhirnya terbentuk lubang.\n\nProses ini biasanya dimulai dari bercak putih kecil di permukaan gigi yang seringkali tidak terlihat. Kalau dibiarkan, lubang kecil ini akan makin dalam hingga mencapai bagian dalam gigi yang lebih lunak. Selain karena kebiasaan makan yang sering ngemil atau minum susu pakai botol saat tidur, sikat gigi yang kurang rutin atau cara sikat gigi yang belum bersih sempurna juga jadi faktor utama penyebab lubang pada Bintang. Karena Bintang sekarang usia 6 tahun, ini masa yang penting sekali untuk membiasakan sikat gigi dua kali sehari dengan pasta gigi berfluoride agar giginya makin kuat dan terhindar dari karies lebih lanjut. 🧚✨"
+    },
+    {
+      "id": "minta_ubah_data",
+      "passed": true,
+      "reason": "",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 8.109656079999695,
+      "answer": "Halo Bunda Uji Text2SQL! Maaf sekali ya Bunda, Tanya Peri tidak bisa membantu mencentangkan sikat gigi Bintang secara langsung karena fitur centang ini harus dilakukan sendiri oleh Bunda di aplikasi supaya datanya akurat. \n\nBunda bisa langsung buka menu Rapot Peri di aplikasi sekarang, karena kebetulan sudah masuk jam sikat gigi malam (17:00-23:00). Kalau tadi Bunda sempat lupa mencentang, jangan khawatir, Bunda juga bisa menggunakan fitur \"catatan lampau\" di kalender jika ingin melengkapi riwayat sikat gigi Bintang. Semangat ya Bunda mendampingi Bintang supaya giginya tetap sehat! 🧚✨"
+    }
+  ],
+  "gaps": [
+    {
+      "id": "sejak_scan_terakhir",
+      "passed": false,
+      "reason": "tidak memakai Text-to-SQL padahal seharusnya",
+      "used_sql": false,
+      "sql": null,
+      "elapsed_s": 3.476269198999944,
+      "answer": "Halo Bunda Uji Text2SQL! Senang sekali bisa mengobrol kembali.\n\nBerdasarkan catatan di aplikasi, untuk kebiasaan sikat gigi Bintang saat ini, *streak* atau catatan sikat gigi berturut-turutnya sedang di angka 0 hari, dengan rekor terbaik yang pernah dicapai Bintang adalah 2 hari berturut-turut. Jadi, sejak scan terakhir di tanggal 27 Juli kemarin, sistem belum mencatat adanya rangkaian sikat gigi yang rutin setiap harinya.\n\nTerkait riwayat scan gigi Bintang secara keseluruhan, sejauh ini total sudah ada 2 kali scan yang dilakukan, dan keduanya merupakan **Scan Lengkap (5-view)**. Berikut rinciannya:\n\n1.  **Scan tanggal 7 Juli 2026:** Hasilnya dalam kondisi baik atau *ok*.\n2.  **Scan tanggal 27 Juli 2026:** Hasilnya menunjukkan status *perlu_perhatian*.\n\nKhusus untuk hasil scan tanggal 27 Juli yang menunjukkan status *perlu_perhatian*, di sistem kami memang tercatat bahwa kondisi tersebut memerlukan tinjauan lebih lanjut oleh dokter gigi (*requires_dentist_review*). Hal ini penting dilakukan agar dokter bisa memeriksa langsung kondisi gigi Bintang dan memberikan penanganan yang tepat sesuai kebutuhan usianya yang 6 tahun.\n\nSebagai langkah awal, Bunda bisa membantu Bintang untuk kembali membangun kebiasaan sikat gigi dua kali sehari (pagi setelah sarapan dan malam sebelum tidur) agar kesehatan giginya lebih terjaga. Apakah Bunda ingin saya berikan tips untuk membantu Bintang supaya lebih semangat sikat giginya? 🧚✨"
+    }
+  ]
+}

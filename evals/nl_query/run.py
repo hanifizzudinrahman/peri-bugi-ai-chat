@@ -456,7 +456,9 @@ async def run_chat(
 # =============================================================================
 
 
-async def main(only: str | None, skip_chat: bool, verbose: bool) -> int:
+async def main(
+    only: str | None, skip_chat: bool, verbose: bool, report_path: str | None = None
+) -> int:
     spec = yaml.safe_load(GOLDEN_PATH.read_text(encoding="utf-8"))
     chat_cases = spec.get("cases") or []
     security_cases = spec.get("security") or []
@@ -533,6 +535,23 @@ async def main(only: str | None, skip_chat: bool, verbose: bool) -> int:
             if verbose and r.answer:
                 print(f"      Jawaban: {r.answer[:200]}")
 
+    if report_path:
+        from dataclasses import asdict
+
+        Path(report_path).write_text(
+            json.dumps(
+                {
+                    "security": [asdict(r) for r in report.security],
+                    "chat": [asdict(r) for r in report.chat],
+                    "gaps": [asdict(r) for r in report.gaps],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"\nLaporan ditulis ke {report_path}")
+
     # Ambang 90%: di bawah itu bukan "kurang rapi", tapi ada yang rusak.
     return 0 if pct >= 90 else 1
 
@@ -542,5 +561,6 @@ if __name__ == "__main__":
     parser.add_argument("--only", help="Jalankan satu kasus saja, sebut id-nya")
     parser.add_argument("--skip-chat", action="store_true", help="Uji keamanan saja")
     parser.add_argument("-v", "--verbose", action="store_true", help="Tampilkan SQL + jawaban")
+    parser.add_argument("--report", help="Tulis hasil lengkap ke berkas JSON")
     args = parser.parse_args()
-    sys.exit(asyncio.run(main(args.only, args.skip_chat, args.verbose)))
+    sys.exit(asyncio.run(main(args.only, args.skip_chat, args.verbose, args.report)))
