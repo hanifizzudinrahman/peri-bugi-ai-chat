@@ -73,6 +73,23 @@ perilaku lama persis.
 Kalau menambah dataset, yang diedit **katalog di peri-bugi-api**, bukan prompt di
 sini. Eval: `evals/nl_query/run.py`. Selengkapnya: workspace `docs/TEXT2SQL.md`.
 
+## Tanya Data Founder (`/founder-analytics/stream`)
+Alur KEDUA di repo ini, **terpisah total** dari graph chat: endpoint sendiri,
+state sendiri, prompt sendiri, nol node dipakai bersama
+(`app/agents/founder_analytics/`). Bentuknya generator async, bukan
+`StateGraph` — pipanya lurus dengan satu simpul perbaikan, tanpa checkpointer,
+dan tiap langkah harus memancarkan event SSE saat itu juga.
+
+    plan -> sql -> exec -> (perbaiki, maks 3) -> chart -> jawab
+
+Model **tidak menulis Vega-Lite**, cuma niat berbatas (`ChartIntent`); server
+yang mengompilasinya, dan hasilnya tanpa `data`/`config`/`width` — ketiganya
+ditambahkan `peri-bugi-web` yang memang punya token brand.
+
+Kalau menambah node: `llm_call_logs` wajib tetap sampai ke event `done`, kalau
+tidak angka dashboard Pusat Biaya diam-diam mengecil. Selengkapnya: workspace
+`docs/FOUNDER_ANALYTICS.md`.
+
 ## Integrasi dengan Mata Peri
 Tool `analyze_chat_image` meneruskan foto ke `peri-bugi-ai-cv` lewat `peri-bugi-api`.
 Hasilnya masuk sebagai konteks terstruktur (`structured_report`) yang di-*rephrase*
