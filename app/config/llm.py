@@ -109,13 +109,36 @@ def _get_gemini(temperature: float, max_tokens: int, streaming: bool,
         timeout=settings.LLM_TIMEOUT_SECONDS,
     )
 
-    if _mendukung_thinking(model_name):
-        kwargs["model_kwargs"] = {
-            "generation_config": {
-                "thinking_config": {"thinking_budget": 0}
-            }
-        }
-
+    # TIDAK ADA penonaktifan `thinking` di sini, dan itu disengaja.
+    #
+    # Sebelumnya baris ini ada:
+    #
+    #     kwargs["model_kwargs"] = {"generation_config":
+    #         {"thinking_config": {"thinking_budget": 0}}}
+    #
+    # Ia tidak pernah berlaku. Diperiksa langsung terhadap pustaka terpasang:
+    #
+    #     ChatGoogleGenerativeAI punya field model_kwargs : False
+    #     model_config extra                              : ignore
+    #     GenerationConfig SDK lama punya thinking_config : False
+    #
+    # `extra="ignore"` berarti kuncinya dibuang diam-diam — tanpa galat, tanpa
+    # peringatan. Dan SDK lamanya memang tidak punya medan itu, jadi tidak ada
+    # cara memasangnya lewat jalur ini seberapa pun benar cara memanggilnya.
+    #
+    # Membiarkannya lebih berbahaya daripada menghapusnya: kode yang terlihat
+    # mengerjakan sesuatu padahal tidak membuat orang percaya biaya sudah
+    # terkendali. Terukur mahal — model Flash biasa memakai 3.898
+    # token/panggilan versus 790, dan isi penalarannya ikut tercetak ke
+    # keluaran sampai SQL-nya gagal di-parse.
+    #
+    # Syarat supaya bisa diisi lagi: `langchain-google-genai >= 3.1`, yang
+    # menuntut `langchain-core >= 1.5` (kita di 0.3.28). Itu upgrade seluruh
+    # tumpukan dan dicatat sebagai utang di `docs/OPEN_ITEMS.md`.
+    #
+    # Sementara itu jalur Tanya Data Founder memakai SDK modern langsung —
+    # lihat `app/config/gemini_direct.py`. Jalur chat orang tua tetap di sini,
+    # apa adanya.
     return ChatGoogleGenerativeAI(**kwargs)
 
 

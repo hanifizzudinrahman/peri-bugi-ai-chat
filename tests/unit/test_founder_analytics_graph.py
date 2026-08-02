@@ -269,6 +269,7 @@ def alur_bersih():
         patch.object(g, "_llm_text", side_effect=fake_llm),
         patch.object(g, "node_execute", side_effect=fake_execute),
         patch.object(g, "get_llm", return_value=FakeLLM()),
+        patch.object(g.gemini_direct, "tersedia", return_value=False),
     ):
         yield
 
@@ -348,6 +349,7 @@ class TestAlurGagal:
             patch.object(g, "_llm_text", side_effect=fake_llm),
             patch.object(g, "node_execute", side_effect=fake_execute),
             patch.object(g, "get_llm", return_value=FakeLLM()),
+        patch.object(g.gemini_direct, "tersedia", return_value=False),
         ):
             events = await _kumpulkan({"question": "data semua orang"})
 
@@ -387,6 +389,7 @@ class TestAlurGagal:
             patch.object(g, "_llm_text", side_effect=fake_llm),
             patch.object(g, "node_execute", side_effect=fake_execute),
             patch.object(g, "get_llm", return_value=FakeLLM()),
+        patch.object(g.gemini_direct, "tersedia", return_value=False),
         ):
             await _kumpulkan({"question": "q"})
 
@@ -453,6 +456,7 @@ class TestAlurGagal:
             patch.object(g, "_llm_text", side_effect=fake_llm),
             patch.object(g, "node_execute", side_effect=fake_execute),
             patch.object(g, "get_llm", return_value=FakeLLM()),
+        patch.object(g.gemini_direct, "tersedia", return_value=False),
         ):
             events = await _kumpulkan({"question": "berapa orang tua?"})
 
@@ -486,6 +490,7 @@ class TestAlurGagal:
             patch.object(g, "_prompt_for", AsyncMock(return_value=("x", "v"))),
             patch.object(g, "_llm_text", side_effect=fake_llm),
             patch.object(g, "get_llm", return_value=FakeLLM()),
+        patch.object(g.gemini_direct, "tersedia", return_value=False),
         ):
             events = await _kumpulkan({"question": "berapa harga saham kita"})
 

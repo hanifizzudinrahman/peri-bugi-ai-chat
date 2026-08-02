@@ -41,6 +41,7 @@ from app.agents.founder_analytics.state import (
     SqlAttempt,
 )
 from app.agents.tools._http import call_internal_get, call_internal_post
+from app.config import gemini_direct
 from app.config.llm import get_llm
 from app.config.observability import trace_generation, trace_node
 from app.config.settings import settings
@@ -96,43 +97,88 @@ async def _llm_text(
     model: str | None = None,
 ) -> str:
     """Satu panggilan LLM non-streaming, ter-trace dan ter-catat biayanya."""
-    llm = get_llm(
-        temperature=temperature,
-        max_tokens=max_tokens,
-        streaming=False,
-        model=model or (settings.FOUNDER_SQL_MODEL or None),
-    )
+    nama_model = model or (settings.FOUNDER_SQL_MODEL or None) or settings.GEMINI_MODEL
     mulai = time.perf_counter()
+
+    # Jalur utama: SDK Gemini modern, dengan penalaran ditekan ke MINIMAL.
+    #
+    # Lewat LangChain, kendali penalaran TIDAK PERNAH sampai — adaptornya tidak
+    # punya field `model_kwargs` dan SDK lamanya tidak punya `thinking_config`.
+    # Akibatnya terukur: model Flash biasa memakai 3.898 token/panggilan
+    # (versus 790) dan isi penalarannya ikut tercetak ke dalam SQL, sehingga
+    # query-nya gagal di-parse. Selengkapnya di `app/config/gemini_direct.py`.
+    pakai_langsung = gemini_direct.tersedia()
+    teks = ""
+    pemakaian: dict = {}
 
     async with trace_generation(
         name=span_name,
-        model=getattr(llm, "model", None) or getattr(llm, "model_name", None),
+        model=nama_model,
         system_prompt=system,
         user_message=user,
-        metadata={"session_id": state.session_id, "trace_id": state.trace_id},
+        metadata={
+            "session_id": state.session_id,
+            "trace_id": state.trace_id,
+            "klien": "gemini_direct" if pakai_langsung else "langchain",
+        },
     ) as span:
-        hasil = await llm.ainvoke(
-            [("system", system), ("human", user)]
-        )
-        teks = (hasil.content or "").strip() if hasattr(hasil, "content") else ""
+        if pakai_langsung:
+            try:
+                hasil = await gemini_direct.generate(
+                    system=system,
+                    user=user,
+                    model=nama_model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                teks = hasil.teks
+                pemakaian = {
+                    "input_tokens": hasil.input_tokens,
+                    "output_tokens": hasil.output_tokens,
+                    "total_tokens": hasil.total_tokens,
+                }
+            except Exception as e:
+                # Jangan menjatuhkan giliran gara-gara jalur cepat. Fitur tetap
+                # jalan lewat LangChain, cuma tanpa kendali penalaran.
+                logger.warning(
+                    "[founder_analytics] gemini_direct gagal (%s), "
+                    "mundur ke LangChain: %s",
+                    span_name,
+                    str(e)[:200],
+                )
+                pakai_langsung = False
+
+        if not pakai_langsung:
+            llm = get_llm(
+                temperature=temperature,
+                max_tokens=max_tokens,
+                streaming=False,
+                model=model or (settings.FOUNDER_SQL_MODEL or None),
+            )
+            hasil_lc = await llm.ainvoke([("system", system), ("human", user)])
+            teks = (
+                (hasil_lc.content or "").strip()
+                if hasattr(hasil_lc, "content")
+                else ""
+            )
+            pemakaian = getattr(hasil_lc, "usage_metadata", None) or {}
+
+        teks = (teks or "").strip()
         if span:
             span.update(output=teks[:4000])
 
     # Biaya harus tetap terlihat di dashboard Pusat Biaya. Jalur baru yang
     # lupa mencatat ini bikin angka biaya diam-diam mengecil, dan tidak ada
     # yang akan curiga karena grafiknya tetap naik-turun seperti biasa.
-    meta = getattr(hasil, "usage_metadata", None) or {}
     state.llm_call_logs.append(
         {
             "prompt_key": span_name,
-            "model": getattr(llm, "model", None)
-            or getattr(llm, "model_name", None)
-            or "unknown",
+            "model": nama_model,
             "provider": settings.LLM_PROVIDER,
             "node": span_name,
-            "input_tokens": meta.get("input_tokens"),
-            "output_tokens": meta.get("output_tokens"),
-            "total_tokens": meta.get("total_tokens"),
+            "input_tokens": pemakaian.get("input_tokens"),
+            "output_tokens": pemakaian.get("output_tokens"),
+            "total_tokens": pemakaian.get("total_tokens"),
             "latency_ms": int((time.perf_counter() - mulai) * 1000),
             "success": bool(teks),
         }
@@ -517,32 +563,47 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
     jawaban = ""
     mulai_jawab = time.perf_counter()
     pemakaian: dict = {}
-    llm = get_llm(temperature=0.3, max_tokens=700, streaming=True)
+    model_jawab = settings.GEMINI_MODEL
+    pakai_langsung = gemini_direct.tersedia()
+
     async with trace_generation(
         name="founder-answer",
-        model=getattr(llm, "model", None) or getattr(llm, "model_name", None),
+        model=model_jawab,
         system_prompt=system,
         user_message=user,
         metadata={
             "row_count": state.row_count,
             "has_chart": state.chart_spec is not None,
             "repaired": state.repaired,
+            "klien": "gemini_direct" if pakai_langsung else "langchain",
         },
     ) as span:
         try:
-            async for potongan in llm.astream(
-                [("system", system), ("human", user)]
-            ):
-                bagian = getattr(potongan, "content", "") or ""
-                if bagian:
-                    jawaban += bagian
-                    yield _sse("token", bagian)
-                # Pemakaian token datang di potongan terakhir, bukan di
-                # tiap potongan. Kalau tidak dipungut di sini, panggilan
-                # terbesar di giliran ini hilang dari dashboard biaya.
-                meta_potongan = getattr(potongan, "usage_metadata", None)
-                if meta_potongan:
-                    pemakaian = meta_potongan
+            if pakai_langsung:
+                # SDK modern juga melaporkan pemakaian token di potongan
+                # terakhir. Jalur LangChain tidak pernah memberikannya sama
+                # sekali, sehingga node ini tercatat nol token di dashboard
+                # biaya — padahal ia panggilan terbesar di giliran ini.
+                async for bagian, meta_potongan in gemini_direct.stream(
+                    system=system, user=user, model=model_jawab
+                ):
+                    if bagian:
+                        jawaban += bagian
+                        yield _sse("token", bagian)
+                    if meta_potongan:
+                        pemakaian = meta_potongan
+            else:
+                llm = get_llm(temperature=0.3, max_tokens=700, streaming=True)
+                async for potongan in llm.astream(
+                    [("system", system), ("human", user)]
+                ):
+                    bagian = getattr(potongan, "content", "") or ""
+                    if bagian:
+                        jawaban += bagian
+                        yield _sse("token", bagian)
+                    meta_potongan = getattr(potongan, "usage_metadata", None)
+                    if meta_potongan:
+                        pemakaian = meta_potongan
         except Exception as e:
             logger.exception("[founder_analytics] gagal menyusun jawaban: %s", e)
             if not jawaban:
@@ -561,9 +622,7 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
     state.llm_call_logs.append(
         {
             "prompt_key": "founder-answer",
-            "model": getattr(llm, "model", None)
-            or getattr(llm, "model_name", None)
-            or "unknown",
+            "model": model_jawab,
             "provider": settings.LLM_PROVIDER,
             "node": "founder-answer",
             "input_tokens": pemakaian.get("input_tokens"),
