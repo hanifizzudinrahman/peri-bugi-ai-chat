@@ -184,12 +184,29 @@ cases:
   # kali lipat: 1,5 giliran bertanya, 2,9 termasuk balasan Peri. Model yang
   # menjawab 3,2 dulu dihitung berhalusinasi — padahal ia menjawab pertanyaan
   # yang lain, yang juga ditanyakan kalimat ini. Soalnya yang dipertegas.
+  #
+  # Akun internal WAJIB dikecualikan, dan itu bukan detail kecil di sini:
+  #
+  #     seluruh sesi          518 sesi   rata-rata 1,48
+  #     tanpa akun internal   125 sesi   rata-rata 3,18
+  #
+  # 393 dari 518 sesi milik akun uji. Angka yang memuatnya bukan cuma kurang
+  # tepat — ia menggambarkan platform yang lain. gemini-3.6-flash menambahkan
+  # filter itu sendiri dan DIHITUNG SALAH karenanya, sementara model yang
+  # mengikuti soal emas dihitung benar. Yang keliru soalnya.
+  #
+  # Memperbaikinya membuat model yang tadinya menang kehilangan satu poin.
+  # Itu justru alasan memperbaikinya: kalau soal emas cuma diperbaiki saat
+  # merugikan model favorit, yang diukur bukan lagi modelnya.
   - id: tanya-pesan-per-sesi
-    question: "Rata-rata berapa kali orang tua bertanya per sesi Tanya Peri? Hitung giliran bertanya orang tua saja, jangan balasan Peri."
+    question: "Rata-rata berapa kali orang tua bertanya per sesi Tanya Peri? Hitung giliran bertanya orang tua saja (jangan balasan Peri), dan jangan sertakan akun internal."
     mode: scalar
     chart: none
     sql: >
-      SELECT round(avg(message_count), 1) AS rata_pesan FROM nlf.v_chat_session
+      SELECT round(avg(cs.message_count), 1) AS rata_pesan
+      FROM nlf.v_chat_session cs
+      JOIN nlf.v_user u ON u.user_id = cs.user_id
+      WHERE NOT u.is_internal
 
   - id: tanya-thumbs-down
     question: "Berapa persen jawaban Tanya Peri yang dapat jempol ke bawah 30 hari terakhir?"
