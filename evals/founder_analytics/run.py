@@ -79,12 +79,21 @@ class Laporan:
 
 
 async def jalankan(client: httpx.AsyncClient, sql: str) -> dict:
-    r = await client.post(
-        EXECUTE,
-        json={"sql": sql, "question": "[eval]", "attempt": 1},
-        headers=H_API,
-        timeout=60,
-    )
+    """Jalankan SQL lewat api. Tidak pernah melempar — galat jadi hasil biasa.
+
+    Sama alasannya dengan `tanya()`: satu galat transport tidak boleh membuang
+    seluruh putaran. Bedanya di sini juga menyangkut FASE KEAMANAN, dan fase itu
+    menghentikan — kalau ia mati karena jaringan, yang terbaca "gerbang jebol".
+    """
+    try:
+        r = await client.post(
+            EXECUTE,
+            json={"sql": sql, "question": "[eval]", "attempt": 1},
+            headers=H_API,
+            timeout=60,
+        )
+    except Exception as e:
+        return {"ok": False, "error_type": f"transport_{type(e).__name__}"}
     if r.status_code != 200:
         return {"ok": False, "error_type": f"http_{r.status_code}"}
     return r.json()
@@ -220,8 +229,12 @@ async def fase_keamanan(client: httpx.AsyncClient) -> list[Hasil]:
 
     for kasus in data.get("cases", []):
         r = await jalankan(client, kasus["sql"])
-        ditolak = not r.get("ok")
-        tipe = r.get("error_type")
+        tipe = r.get("error_type") or ""
+        # Galat jaringan BUKAN penolakan. Tanpa baris ini, api yang mati
+        # membuat seluruh fase keamanan hijau — 28/28 karena tidak ada yang
+        # sampai ke penjaganya. Hijau paling berbahaya adalah hijau yang
+        # didapat karena tidak ada yang diuji.
+        ditolak = (not r.get("ok")) and not tipe.startswith("transport_")
         sesuai = ditolak and (
             not kasus.get("expect") or tipe in kasus["expect"]
         )
@@ -259,7 +272,16 @@ async def fase_keamanan(client: httpx.AsyncClient) -> list[Hasil]:
 
 
 async def tanya(client: httpx.AsyncClient, pertanyaan: str) -> dict:
-    """Kirim satu pertanyaan, kumpulkan SQL, grafik, dan jawabannya."""
+    """Kirim satu pertanyaan, kumpulkan SQL, grafik, dan jawabannya.
+
+    TIDAK PERNAH melempar. Galat transport dikembalikan sebagai `meta.failure`.
+
+    Sebelumnya `httpx.ReadError` di satu pertanyaan **menjatuhkan seluruh
+    putaran** — 14 kasus yang sudah selesai ikut hilang, ringkasannya tidak
+    pernah tercetak, dan artefaknya tidak pernah ditulis. Dari luar itu terbaca
+    seperti model yang diam-diam dilewati. Satu pertanyaan yang bermasalah
+    adalah satu kasus merah, bukan alasan membuang 20 kasus lainnya.
+    """
     keluar = {
         "sql": None,
         "chart": None,
@@ -268,7 +290,14 @@ async def tanya(client: httpx.AsyncClient, pertanyaan: str) -> dict:
         "pii": [],
         "row_count": 0,
     }
+    try:
+        return await _tanya(client, pertanyaan, keluar)
+    except Exception as e:
+        keluar["meta"] = {"failure": f"{type(e).__name__}: {str(e)[:160]}".strip(": ")}
+        return keluar
 
+
+async def _tanya(client: httpx.AsyncClient, pertanyaan: str, keluar: dict) -> dict:
     async with client.stream(
         "POST",
         f"{AI_CHAT}/founder-analytics/stream",
