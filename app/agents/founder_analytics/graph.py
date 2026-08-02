@@ -370,76 +370,92 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
 
     await node_plan(state)
 
+    # Node `plan` tidak menghasilkan apa-apa? JANGAN menyerah di sini.
+    #
+    # "Gagal memilih dataset" dan "tidak ada dataset yang cocok" adalah dua
+    # hal berbeda, dan menyamakannya membuat seluruh giliran mati hanya karena
+    # satu keluaran JSON yang tidak terbaca. Terbukti mahal: mengganti model
+    # menghasilkan 0/19 pada eval — bukan karena model penggantinya lebih
+    # buruk, tapi karena bentuk keluarannya sedikit berbeda dan pipa ini tidak
+    # punya jalan mundur sama sekali.
+    #
+    # Yang benar: mundur ke katalog penuh dan biarkan node SQL yang memutuskan.
+    # Ia punya cara menyatakan menyerah (TIDAK_BISA) DAN ia melihat definisi
+    # kolomnya — jauh lebih siap menilai daripada node pemilih. Harganya cuma
+    # token; harga menyerah lebih awal adalah jawaban yang hilang.
     if not state.dataset_names:
-        state.failure = "tidak ada dataset yang cocok dengan pertanyaan ini"
-    else:
-        prompt_text, versi = await _prompt_for(state.dataset_names)
-        state.catalog_prompt = prompt_text or katalog.get("prompt_text", "")
-        if versi:
-            state.catalog_version = versi
-
-        yield _sse(
-            "thinking",
-            {"step": 2, "label": "Menyusun query", "datasets": state.dataset_names},
+        logger.info(
+            "[founder_analytics] node plan tidak memilih dataset — "
+            "mundur ke katalog penuh"
         )
 
-        maks = max(1, settings.FOUNDER_SQL_MAX_ATTEMPTS)
-        hasil: dict | None = None
+    prompt_text, versi = await _prompt_for(state.dataset_names)
+    state.catalog_prompt = prompt_text or katalog.get("prompt_text", "")
+    if versi:
+        state.catalog_version = versi
 
-        for attempt in range(1, maks + 1):
-            sql = await node_sql(state, attempt=attempt)
-            if not sql:
-                state.failure = (
-                    "model menyatakan pertanyaan ini tidak terjawab oleh katalog"
-                )
-                break
+    yield _sse(
+        "thinking",
+        {"step": 2, "label": "Menyusun query", "datasets": state.dataset_names},
+    )
 
-            if attempt > 1:
-                yield _sse(
-                    "thinking",
-                    {"step": 2, "label": f"Memperbaiki query (percobaan {attempt})"},
-                )
+    maks = max(1, settings.FOUNDER_SQL_MAX_ATTEMPTS)
+    hasil: dict | None = None
 
-            hasil = await node_execute(state, sql=sql, attempt=attempt)
-            ok = bool(hasil.get("ok"))
-            state.attempts.append(
-                SqlAttempt(
-                    attempt=attempt,
-                    sql=sql,
-                    ok=ok,
-                    error_type=hasil.get("error_type"),
-                    message=hasil.get("message"),
-                    elapsed_ms=int(hasil.get("elapsed_ms") or 0),
-                )
-            )
-
-            if ok:
-                state.sql = hasil.get("sql") or sql
-                break
-
-            # Galat yang tidak bisa diperbaiki dengan menulis ulang SQL —
-            # mencoba lagi cuma membakar token dan menunda pesan yang jujur.
-            if hasil.get("error_type") in ("guard_unavailable", "timeout"):
-                break
-        else:
-            hasil = hasil or {}
-
-        if hasil and hasil.get("ok"):
-            state.columns = hasil.get("columns") or []
-            state.rows = hasil.get("rows") or []
-            state.row_count = int(hasil.get("row_count") or 0)
-            state.truncated = bool(hasil.get("truncated"))
-            state.datasets = hasil.get("datasets") or []
-            state.pii_datasets = hasil.get("pii_datasets") or []
-            state.elapsed_ms = int(hasil.get("elapsed_ms") or 0)
-            state.executed_at = datetime.now(timezone.utc).isoformat()
-        elif not state.failure:
-            terakhir = state.attempts[-1] if state.attempts else None
+    for attempt in range(1, maks + 1):
+        sql = await node_sql(state, attempt=attempt)
+        if not sql:
             state.failure = (
-                f"{terakhir.error_type}: {terakhir.message}"
-                if terakhir
-                else "query tidak bisa dijalankan"
+                "model menyatakan pertanyaan ini tidak terjawab oleh katalog"
             )
+            break
+
+        if attempt > 1:
+            yield _sse(
+                "thinking",
+                {"step": 2, "label": f"Memperbaiki query (percobaan {attempt})"},
+            )
+
+        hasil = await node_execute(state, sql=sql, attempt=attempt)
+        ok = bool(hasil.get("ok"))
+        state.attempts.append(
+            SqlAttempt(
+                attempt=attempt,
+                sql=sql,
+                ok=ok,
+                error_type=hasil.get("error_type"),
+                message=hasil.get("message"),
+                elapsed_ms=int(hasil.get("elapsed_ms") or 0),
+            )
+        )
+
+        if ok:
+            state.sql = hasil.get("sql") or sql
+            break
+
+        # Galat yang tidak bisa diperbaiki dengan menulis ulang SQL —
+        # mencoba lagi cuma membakar token dan menunda pesan yang jujur.
+        if hasil.get("error_type") in ("guard_unavailable", "timeout"):
+            break
+    else:
+        hasil = hasil or {}
+
+    if hasil and hasil.get("ok"):
+        state.columns = hasil.get("columns") or []
+        state.rows = hasil.get("rows") or []
+        state.row_count = int(hasil.get("row_count") or 0)
+        state.truncated = bool(hasil.get("truncated"))
+        state.datasets = hasil.get("datasets") or []
+        state.pii_datasets = hasil.get("pii_datasets") or []
+        state.elapsed_ms = int(hasil.get("elapsed_ms") or 0)
+        state.executed_at = datetime.now(timezone.utc).isoformat()
+    elif not state.failure:
+        terakhir = state.attempts[-1] if state.attempts else None
+        state.failure = (
+            f"{terakhir.error_type}: {terakhir.message}"
+            if terakhir
+            else "query tidak bisa dijalankan"
+        )
 
     # ── Kirim SQL dan tabelnya lebih dulu ───────────────────────────────────
     #

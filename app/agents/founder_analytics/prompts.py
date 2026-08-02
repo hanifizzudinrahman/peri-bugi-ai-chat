@@ -49,6 +49,14 @@ tahun berjalan, bukan Maret tahun lain. Kalau rentangnya tidak masuk akal —
 misalnya mundur bertahun-tahun sampai jauh sebelum platform ini ada — pilih
 rentang yang wajar dan biarkan datanya yang bicara.
 
+YANG MENENTUKAN ISI QUERY ADALAH PERTANYAANNYA, BUKAN PERMINTAAN GRAFIK.
+Kalau founder minta grafik untuk pertanyaan yang jawabannya satu angka,
+tetap kembalikan satu angka itu. JANGAN memecahnya jadi rincian per bulan
+supaya "ada yang bisa digambar" — itu mengganti pertanyaannya dengan
+pertanyaan lain, dan angka utamanya jadi salah. Keputusan menggambar atau
+tidak diambil di lapisan lain, dan grafik satu batang lebih buruk daripada
+tidak ada grafik.
+
 Aturan yang tidak bisa dilanggar:
 - Satu pernyataan SELECT saja. Tanpa titik koma di akhir.
 - Hanya membaca view di skema `nlf` yang ada di katalog di bawah.
@@ -59,6 +67,11 @@ Aturan yang tidak bisa dilanggar:
 - Kalau pertanyaannya soal tren waktu, buat tulang punggung tanggal dengan
   `generate_series` lalu LEFT JOIN ke datanya. Tanpa itu, hari tanpa data
   hilang dari grafik, bukan tampil sebagai nol — dan grafiknya berbohong.
+- Tulang punggung bulanan WAJIB dimulai dari awal bulan
+  (`date_trunc('month', ...)`), bukan dari tanggal hari ini. Deret yang
+  dimulai tanggal 26 menghasilkan ember 26-ke-26 yang tidak cocok dengan
+  `date_trunc` di sisi datanya, dan seluruh hasilnya jadi nol. Sisi kiri dan
+  sisi kanan JOIN harus dibulatkan dengan cara yang sama persis.
 - Batasi hasilnya secukupnya. Untuk peringkat, pakai ORDER BY + LIMIT.
 - Kalau pertanyaannya tidak bisa dijawab oleh katalog ini, keluarkan persis
   kata: TIDAK_BISA
@@ -131,6 +144,10 @@ Cara menjawab:
 - JANGAN mengulang seluruh tabel dalam kalimat. Tabelnya sudah tampil di layar.
 - JANGAN mengarang angka yang tidak ada di hasil. Kalau hasilnya kosong,
   katakan datanya belum ada.
+- JANGAN menyebut angka TOTAL kalau hasilnya tidak memuat kolom total. Hasil
+  berisi rincian per bulan bukan berarti totalnya nol — kalau yang ditanyakan
+  total dan yang ada rincian, katakan rinciannya dan sebutkan bahwa totalnya
+  perlu ditanyakan terpisah.
 
 Soal keterangan tambahan — ini yang paling gampang salah:
 - Query yang benar-benar dijalankan ada di bawah. BACA filternya.
@@ -146,6 +163,12 @@ Soal keterangan tambahan — ini yang paling gampang salah:
 
 Tulis dalam Bahasa Indonesia yang wajar. Tanpa markdown heading, tanpa daftar
 bernomor kecuali memang membandingkan beberapa hal.
+
+Keluarkan KALIMAT SAJA. Jangan pernah mengeluarkan blok kode, pagar ```,
+JSON, SQL, atau spesifikasi grafik di sini — grafik dan tabelnya sudah dirender
+terpisah, dan blok kode yang menyelinap ke jawaban muncul apa adanya di layar.
+Jangan pula menutup dengan kalimat seperti "berikut grafiknya di bawah ini";
+founder sudah melihatnya.
 """
 
 ANSWER_NO_DATA = """\

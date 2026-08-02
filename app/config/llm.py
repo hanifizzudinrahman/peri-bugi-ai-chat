@@ -109,7 +109,7 @@ def _get_gemini(temperature: float, max_tokens: int, streaming: bool,
         timeout=settings.LLM_TIMEOUT_SECONDS,
     )
 
-    if "2.5" in model_name:
+    if _mendukung_thinking(model_name):
         kwargs["model_kwargs"] = {
             "generation_config": {
                 "thinking_config": {"thinking_budget": 0}
@@ -117,6 +117,25 @@ def _get_gemini(temperature: float, max_tokens: int, streaming: bool,
         }
 
     return ChatGoogleGenerativeAI(**kwargs)
+
+
+#: Keluarga Gemini yang punya mode "thinking" dan menyalakannya secara bawaan.
+#:
+#: Dulu pemeriksaannya `"2.5" in model_name` — benar saat ditulis, dan diam-diam
+#: salah begitu keluarga 3.x muncul. Akibatnya terukur: mencoba
+#: `gemini-3-flash-preview` menghasilkan 480rb token untuk 99 panggilan
+#: (4.800/panggilan, versus 790 pada model tanpa thinking), empat kali lebih
+#: lambat, dan SEPARUH SQL-nya gagal di-parse karena penalarannya ikut
+#: tercetak. Terbaca seperti "model besar ternyata lebih bodoh" padahal itu
+#: konfigurasi yang tidak pernah menjangkaunya.
+#:
+#: Dicocokkan per-keluarga, bukan dengan `startswith("gemini-")`, supaya model
+#: baru tanpa thinking tidak diam-diam ikut disetel.
+_KELUARGA_THINKING = ("2.5", "3.0", "3.1", "gemini-3-")
+
+
+def _mendukung_thinking(model_name: str) -> bool:
+    return any(k in model_name for k in _KELUARGA_THINKING)
 
 
 def _get_openai(temperature: float, max_tokens: int, streaming: bool,

@@ -402,10 +402,75 @@ class TestAlurGagal:
             assert jargon not in teks.lower()
 
     @pytest.mark.asyncio
-    async def test_tidak_ada_dataset_cocok(self):
+    async def test_plan_kosong_mundur_ke_katalog_penuh_bukan_menyerah(self):
+        """Gagal MEMILIH dataset bukan hal yang sama dengan tidak ada yang cocok.
+
+        Sebelum diperbaiki, `dataset_names` kosong langsung mematikan giliran.
+        Akibatnya fatal dan tidak kelihatan: mengganti model LLM menghasilkan
+        0/19 pada eval — bukan karena model penggantinya lebih buruk, tapi
+        karena bentuk keluaran JSON-nya sedikit berbeda dan pipa ini tidak
+        punya jalan mundur.
+
+        Sekarang: mundur ke katalog penuh, dan node SQL yang memutuskan.
+        """
+        dipanggil = {"sql": 0}
+
         async def fake_llm(*, system, user, span_name, state, **kw):
             if span_name == "founder-plan":
-                return '{"dataset_names": [], "reason": "tidak ada yang cocok"}'
+                # Keluaran yang tidak terbaca — persis yang terjadi di lapangan.
+                return "Maaf, saya tidak yakin dataset mana yang cocok."
+            if span_name.startswith("founder-sql"):
+                dipanggil["sql"] += 1
+                return "SELECT count(*) AS jumlah FROM nlf.v_user"
+            if span_name == "founder-chart-intent":
+                return '{"kind": "none", "reason": "satu angka"}'
+            return "{}"
+
+        async def fake_execute(state, *, sql, attempt):
+            return {
+                "ok": True,
+                "columns": ["jumlah"],
+                "rows": [[23]],
+                "row_count": 1,
+                "truncated": False,
+                "datasets": ["user"],
+                "pii_datasets": [],
+                "elapsed_ms": 5,
+                "sql": sql,
+            }
+
+        class FakeChunk:
+            def __init__(self, c):
+                self.content = c
+
+        class FakeLLM:
+            async def astream(self, msgs):
+                yield FakeChunk("Ada 23 orang tua.")
+
+        with (
+            patch.object(g, "_load_catalog", AsyncMock(return_value=KATALOG)),
+            patch.object(g, "_prompt_for", AsyncMock(return_value=("katalog penuh", "v"))),
+            patch.object(g, "_llm_text", side_effect=fake_llm),
+            patch.object(g, "node_execute", side_effect=fake_execute),
+            patch.object(g, "get_llm", return_value=FakeLLM()),
+        ):
+            events = await _kumpulkan({"question": "berapa orang tua?"})
+
+        assert dipanggil["sql"] >= 1, "node SQL harus tetap dicoba"
+        assert any(e["event"] == "sql" for e in events)
+        assert any(e["event"] == "data" for e in events)
+        meta = next(e["data"] for e in events if e["event"] == "meta")
+        assert not meta["failure"], f"tidak boleh gagal: {meta['failure']}"
+
+    @pytest.mark.asyncio
+    async def test_sql_menyerah_eksplisit_tetap_dihormati(self):
+        """Yang boleh menyerah adalah node SQL, karena ia melihat katalognya."""
+
+        async def fake_llm(*, system, user, span_name, state, **kw):
+            if span_name == "founder-plan":
+                return '{"dataset_names": ["user"]}'
+            if span_name.startswith("founder-sql"):
+                return "TIDAK_BISA"
             return "{}"
 
         class FakeChunk:
@@ -418,6 +483,7 @@ class TestAlurGagal:
 
         with (
             patch.object(g, "_load_catalog", AsyncMock(return_value=KATALOG)),
+            patch.object(g, "_prompt_for", AsyncMock(return_value=("x", "v"))),
             patch.object(g, "_llm_text", side_effect=fake_llm),
             patch.object(g, "get_llm", return_value=FakeLLM()),
         ):
@@ -425,4 +491,4 @@ class TestAlurGagal:
 
         assert not any(e["event"] == "sql" for e in events)
         meta = next(e["data"] for e in events if e["event"] == "meta")
-        assert "dataset" in (meta["failure"] or "")
+        assert meta["failure"]
