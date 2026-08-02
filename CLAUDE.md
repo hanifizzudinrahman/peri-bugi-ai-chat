@@ -9,7 +9,9 @@ Dipanggil **hanya oleh `peri-bugi-api`**, tidak pernah langsung dari browser/mob
 ## Stack
 - **FastAPI** + Uvicorn, async, response **SSE streaming**
 - **LangGraph** — graph node/edge, checkpointer di PostgreSQL
-- **Gemini 2.5 Flash** sebagai LLM utama
+- **Gemini** sebagai LLM utama — model aktifnya dari `GEMINI_MODEL` di `.env`,
+  saat ini `gemini-3.1-flash-lite` (menang telak di perbandingan 2 Agustus 2026:
+  19/20 lawan 16/20 `gemini-3.6-flash`, separuh token, dua pertiga waktu)
 - **Qdrant** untuk knowledge base dental (RAG)
 - **Langfuse** untuk tracing LLM
 - Pydantic v2 · pytest (`asyncio_mode=auto`)
@@ -89,6 +91,21 @@ ditambahkan `peri-bugi-web` yang memang punya token brand.
 Kalau menambah node: `llm_call_logs` wajib tetap sampai ke event `done`, kalau
 tidak angka dashboard Pusat Biaya diam-diam mengecil. Selengkapnya: workspace
 `docs/FOUNDER_ANALYTICS.md`.
+
+### Dua jalur LLM di satu service — sengaja, sementara
+Jalur founder memanggil `app/config/gemini_direct.py` (SDK modern `google.genai`),
+bukan `get_llm()`. Alasannya: kendali `thinking` **tidak bisa** diungkapkan lewat
+`langchain-google-genai` 2.0.8 yang terpasang — `model_kwargs` dibuang diam-diam
+oleh pydantic (`extra="ignore"`) dan SDK lamanya tidak punya medan
+`thinking_config` sama sekali. Tanpa kendali itu, model keluarga Flash mencetak
+isi penalarannya ke dalam SQL sampai gagal di-parse.
+
+Aturannya: **`thinking_level` untuk Gemini 3.x, `thinking_budget` untuk 2.5,
+jangan pernah keduanya** (Google menjawab 400). Bagian jawaban bertanda `thought`
+dibuang di tingkat *part*. Kalau apa pun gagal, jatuh kembali ke `get_llm()`.
+
+Jalur Tanya Peri **tidak** disentuh dan masih memakai LangChain. Penyatuannya
+menunggu upgrade tumpukan — utang tercatat di workspace `docs/OPEN_ITEMS.md`.
 
 ## Integrasi dengan Mata Peri
 Tool `analyze_chat_image` meneruskan foto ke `peri-bugi-ai-cv` lewat `peri-bugi-api`.
