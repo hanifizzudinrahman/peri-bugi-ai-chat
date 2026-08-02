@@ -15,9 +15,10 @@ jadi kuncinya **dibuang diam-diam**, tanpa galat dan tanpa peringatan. SDK
 lamanya sendiri memang tidak punya medan `thinking_config` sama sekali. Artinya
 penonaktifan itu tidak pernah berlaku, untuk keluarga model mana pun.
 
-Akibatnya terukur saat membandingkan model:
+Akibatnya terukur saat membandingkan model — angka di bawah ini **sebelum**
+modul ini ada:
 
-    gemini-3.1-flash-lite     790 token/panggilan   akurasi 19/20
+    gemini-3.1-flash-lite    ~990 token/panggilan   akurasi 19/20
     gemini-3.5-flash        3.898 token/panggilan   eval tidak selesai
     gemini-3-flash-preview  4.843 token/panggilan   akurasi 10/20
 
@@ -25,6 +26,15 @@ Kegagalan model besar berbunyi "SQL tidak bisa di-parse" — isi penalaran ikut
 tercetak ke dalam query. `gemini-3.5-flash` bahkan menyalin potongan prompt ke
 tengah SQL. Terbaca seperti "model besar ternyata lebih bodoh", padahal yang
 terjadi kita tidak pernah punya tuasnya.
+
+Catatan angka: `790` yang sempat tercatat untuk flash-lite adalah **kekurangan
+hitung**, bukan penghematan — jalur LangChain tidak melaporkan pemakaian token
+saat streaming, jadi node jawaban tercatat nol. Yang sebenarnya selalu ~990.
+
+Dan catatan yang lebih penting, ditemukan belakangan: setelah kendali penalaran
+benar-benar sampai, **model besar berhenti gagal karena format**. Sisa selisih
+skornya soal menalar data, sebagian malah cacat di katalog dan soal emas kita
+sendiri. Jangan pakai berkas ini sebagai bukti "model besar lebih buruk".
 
 Kenapa cuma jalur founder
 -------------------------
@@ -107,7 +117,41 @@ def _thinking_config(model: str, level: str | None):
         return types.ThinkingConfig(thinking_budget=0, include_thoughts=False)
 
     # Model tanpa mode penalaran — kirim apa pun justru berisiko ditolak.
+    #
+    # Tapi katakan, jangan diam. Pencocokannya substring, jadi nama model baru
+    # yang tidak mengandung pola di atas akan jalan TANPA kendali penalaran sama
+    # sekali — persis keadaan yang modul ini dibuat untuk mengakhiri, dan tidak
+    # ada satu pun gejala yang kelihatan sampai tagihannya datang.
+    logger.warning(
+        "[gemini_direct] model '%s' tidak cocok keluarga mana pun — "
+        "jalan TANPA kendali thinking. Tambahkan polanya ke _KELUARGA_LEVEL "
+        "atau _KELUARGA_BUDGET.",
+        model,
+    )
     return None
+
+
+class TeksTerpotong(RuntimeError):
+    """Model berhenti karena kehabisan `max_output_tokens`, bukan karena selesai.
+
+    Dibedakan dari galat lain karena obatnya beda dan sebabnya ada di sisi kita.
+    Sebelum ada kelas ini, respons terpotong pulang sebagai string kosong, lalu
+    dilaporkan ke founder sebagai *"model menyatakan pertanyaan ini tidak
+    terjawab oleh katalog"* — sebab teknis menyamar jadi keputusan model.
+    """
+
+
+#: Alasan berhenti yang berarti keluarannya tidak utuh.
+_BERHENTI_TERPOTONG = ("MAX_TOKENS", "MAX_OUTPUT_TOKENS")
+
+
+def _alasan_berhenti(response: Any) -> str:
+    for kandidat in getattr(response, "candidates", None) or []:
+        fr = getattr(kandidat, "finish_reason", None)
+        if fr is None:
+            continue
+        return getattr(fr, "name", None) or str(fr)
+    return ""
 
 
 def _ambil_teks(response: Any) -> tuple[str, int]:
@@ -162,7 +206,13 @@ def _klien():
 
 
 def _config(
-    *, model: str, system: str, temperature: float, max_tokens: int, level: str | None
+    *,
+    model: str,
+    system: str,
+    temperature: float,
+    max_tokens: int,
+    level: str | None,
+    response_schema: Any = None,
 ):
     from google.genai import types
 
@@ -174,6 +224,15 @@ def _config(
     tc = _thinking_config(model, level)
     if tc is not None:
         kw["thinking_config"] = tc
+
+    # Decoding berbatas. Ini yang membuat pipa tahan model apa pun: bentuk
+    # keluarannya dijamin di sisi Google, bukan diharapkan dari prompt lalu
+    # ditebak-tebak parser kita. Prompt yang meminta JSON cuma imbauan; model
+    # yang lebih cerewet tetap boleh membungkusnya dengan kalimat pengantar.
+    if response_schema is not None:
+        kw["response_mime_type"] = "application/json"
+        kw["response_schema"] = response_schema
+
     return types.GenerateContentConfig(**kw)
 
 
@@ -185,8 +244,13 @@ async def generate(
     temperature: float = 0.0,
     max_tokens: int = 900,
     thinking_level: str | None = None,
+    response_schema: Any = None,
 ) -> HasilGenerasi:
-    """Satu panggilan non-streaming dengan penalaran terkendali."""
+    """Satu panggilan non-streaming dengan penalaran terkendali.
+
+    `response_schema` boleh model Pydantic; SDK menerjemahkannya sendiri. Kalau
+    diisi, keluarannya dijamin JSON yang cocok skema itu.
+    """
     nama_model = model or settings.GEMINI_MODEL
     client = _klien()
 
@@ -199,6 +263,7 @@ async def generate(
             temperature=temperature,
             max_tokens=max_tokens,
             level=thinking_level,
+            response_schema=response_schema,
         ),
     )
 
@@ -208,6 +273,20 @@ async def generate(
             "[gemini_direct] %s bagian bertanda thought dibuang (model %s)",
             dibuang,
             nama_model,
+        )
+
+    # Diperiksa SETELAH teks diambil: potongan yang sempat keluar sebelum
+    # anggaran habis tetap berguna untuk log, tapi tidak boleh dipakai seolah
+    # jawaban utuh. Kalau modelnya berpikir banyak, penalaran itu memakan
+    # `max_output_tokens` yang sama — jadi anggaran yang pas untuk model kecil
+    # bisa habis sebelum satu karakter jawaban keluar.
+    berhenti = _alasan_berhenti(response)
+    if berhenti in _BERHENTI_TERPOTONG:
+        pakai = _pemakaian(response)
+        raise TeksTerpotong(
+            f"keluaran terpotong di max_output_tokens={max_tokens} "
+            f"(model {nama_model}, penalaran {pakai.get('thought_tokens') or 0} token, "
+            f"teks yang sempat keluar {len(teks.strip())} karakter)"
         )
 
     return HasilGenerasi(
@@ -250,4 +329,14 @@ async def stream(
 
     async for potongan in iterator:
         teks, _ = _ambil_teks(potongan)
+        # Di sini terpotong TIDAK dilempar: jawaban yang separuh jadi tetap
+        # lebih berguna bagi founder daripada pesan galat, dan tabel hasilnya
+        # tetap utuh di bawahnya. Tapi jangan diam — kalau ini sering muncul,
+        # anggaran node jawabannya yang perlu dinaikkan.
+        if _alasan_berhenti(potongan) in _BERHENTI_TERPOTONG:
+            logger.warning(
+                "[gemini_direct] jawaban terpotong di max_output_tokens=%s (model %s)",
+                max_tokens,
+                nama_model,
+            )
         yield teks, _pemakaian(potongan)

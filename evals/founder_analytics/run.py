@@ -26,7 +26,7 @@ import argparse
 import asyncio
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import httpx
@@ -51,6 +51,17 @@ class Hasil:
     id: str
     lulus: bool
     catatan: str = ""
+
+    # Di bawah ini bukan hiasan. Sebelum ada medan-medan ini, sebuah kasus merah
+    # cuma berbunyi "baris emas=6 model=6" — enam baris di dua sisi, isinya beda,
+    # beda di mana tidak pernah dicetak. Perbandingan empat model jadi tiga angka
+    # yang tidak bisa dipertanggungjawabkan.
+    pertanyaan: str = ""
+    mode: str = ""
+    sql_emas: str = ""
+    sql_model: str = ""
+    beda: dict = field(default_factory=dict)
+    chart_spec: dict | None = None
 
 
 @dataclass
@@ -78,6 +89,16 @@ async def jalankan(client: httpx.AsyncClient, sql: str) -> dict:
     return r.json()
 
 
+def _satu_baris(sql: str, batas: int = 220) -> str:
+    """SQL multi-baris jadi satu baris, dipendekkan — buat dicetak di terminal.
+
+    Yang utuh tetap ada di artefak `--keluar`; ini cuma supaya ringkasannya
+    terbaca tanpa menggulung layar.
+    """
+    rapat = " ".join((sql or "").split())
+    return rapat if len(rapat) <= batas else rapat[: batas - 1] + "…"
+
+
 def _normalkan(baris: list) -> list:
     """Urutkan dan bulatkan supaya beda gaya query tidak dihitung beda hasil."""
 
@@ -92,28 +113,76 @@ def _normalkan(baris: list) -> list:
     )
 
 
-def bandingkan(mode: str, emas: dict, model: dict) -> tuple[bool, str]:
+#: Berapa baris beda yang dicetak per sisi. Cukup untuk mengenali polanya
+#: (nilai geser, kolom ketuker, NULL lawan 0) tanpa membanjiri terminal.
+MAKS_BARIS_BEDA = 3
+
+
+def _beda_baris(be: list, bm: list) -> dict:
+    """Baris mana yang cuma ada di satu sisi, setelah dinormalkan.
+
+    Multiset, bukan himpunan: baris kembar yang jumlahnya beda tetap terlihat.
+    """
+    ne, nm = _normalkan(be), _normalkan(bm)
+    sisa = list(nm)
+    hanya_emas = []
+    for b in ne:
+        if b in sisa:
+            sisa.remove(b)
+        else:
+            hanya_emas.append(b)
+    return {
+        "hanya_emas": hanya_emas[:MAKS_BARIS_BEDA],
+        "hanya_model": sisa[:MAKS_BARIS_BEDA],
+        "jumlah_hanya_emas": len(hanya_emas),
+        "jumlah_hanya_model": len(sisa),
+    }
+
+
+def bandingkan(mode: str, emas: dict, model: dict) -> tuple[bool, str, dict]:
     if not model.get("ok"):
-        return False, f"SQL model gagal: {model.get('error_type')}"
+        return False, f"SQL model gagal: {model.get('error_type')}", {
+            "pesan_model": model.get("error") or model.get("message") or ""
+        }
     if not emas.get("ok"):
-        return False, f"SQL EMAS gagal: {emas.get('error_type')} — perbaiki golden.yaml"
+        return (
+            False,
+            f"SQL EMAS gagal: {emas.get('error_type')} — perbaiki golden.yaml",
+            {"pesan_emas": emas.get("error") or emas.get("message") or ""},
+        )
 
     be, bm = emas.get("rows") or [], model.get("rows") or []
 
     if mode == "scalar":
         if not be or not bm:
-            return (be == bm), "dua-duanya kosong" if be == bm else "salah satu kosong"
+            return (
+                (be == bm),
+                "dua-duanya kosong" if be == bm else "salah satu kosong",
+                {"emas": be[:1], "model": bm[:1]},
+            )
         a, b = be[0][0], bm[0][0]
         if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-            return (abs(float(a) - float(b)) < 0.05), f"emas={a} model={b}"
-        return (a == b), f"emas={a} model={b}"
+            cocok = abs(float(a) - float(b)) < 0.05
+        else:
+            cocok = a == b
+        return cocok, f"emas={a} model={b}", {} if cocok else {"emas": a, "model": b}
 
     if mode == "shape":
         cocok = len(be) == len(bm)
-        return cocok, f"baris emas={len(be)} model={len(bm)}"
+        catatan = f"baris emas={len(be)} model={len(bm)}"
+        return cocok, catatan, {} if cocok else _beda_baris(be, bm)
 
     cocok = _normalkan(be) == _normalkan(bm)
-    return cocok, f"baris emas={len(be)} model={len(bm)}"
+    catatan = f"baris emas={len(be)} model={len(bm)}"
+    if cocok:
+        return True, catatan, {}
+
+    beda = _beda_baris(be, bm)
+    # Jumlah baris sama tapi isinya beda adalah kasus yang paling sering
+    # disalahartikan sebagai "modelnya salah" — katakan terang-terangan.
+    if len(be) == len(bm):
+        catatan = f"{catatan} — jumlah sama, isi beda di {beda['jumlah_hanya_emas']} baris"
+    return False, catatan, beda
 
 
 # =============================================================================
@@ -251,23 +320,52 @@ async def fase_akurasi(client: httpx.AsyncClient) -> tuple[list[Hasil], list[Has
         jawaban = await tanya(client, kasus["question"])
         sql_model = jawaban["sql"]
 
+        mode = kasus.get("mode", "exact")
+
         if not sql_model:
             akurasi.append(
-                Hasil(kasus["id"], False, f"nol SQL — {jawaban['meta'].get('failure')}")
+                Hasil(
+                    kasus["id"],
+                    False,
+                    f"nol SQL — {jawaban['meta'].get('failure')}",
+                    pertanyaan=kasus["question"],
+                    mode=mode,
+                    sql_emas=kasus["sql"],
+                )
             )
             print(f"  GAGAL {kasus['id']:34} {akurasi[-1].catatan}")
             continue
 
         emas = await jalankan(client, kasus["sql"])
         model = await jalankan(client, sql_model)
-        lulus, catatan = bandingkan(kasus.get("mode", "exact"), emas, model)
-        akurasi.append(Hasil(kasus["id"], lulus, catatan))
+        lulus, catatan, beda = bandingkan(mode, emas, model)
+        akurasi.append(
+            Hasil(
+                kasus["id"],
+                lulus,
+                catatan,
+                pertanyaan=kasus["question"],
+                mode=mode,
+                sql_emas=kasus["sql"],
+                sql_model=sql_model,
+                beda=beda,
+                chart_spec=jawaban["chart"],
+            )
+        )
         print(f"  {'OK  ' if lulus else 'GAGAL'} {kasus['id']:34} {catatan}")
 
         g_lulus, g_catatan = nilai_grafik(
             kasus.get("chart", "none"), jawaban["chart"], jawaban["row_count"]
         )
-        grafik.append(Hasil(kasus["id"], g_lulus, g_catatan))
+        grafik.append(
+            Hasil(
+                kasus["id"],
+                g_lulus,
+                g_catatan,
+                pertanyaan=kasus["question"],
+                chart_spec=jawaban["chart"],
+            )
+        )
 
         if kasus.get("expect_pii"):
             benar = bool(jawaban["pii"])
@@ -298,12 +396,13 @@ async def fase_akurasi(client: httpx.AsyncClient) -> tuple[list[Hasil], list[Has
 # =============================================================================
 
 
-async def main(skip_chat: bool) -> int:
+async def main(skip_chat: bool, keluar: str | None = None) -> int:
     if not API:
         print("PERI_API_URL kosong — eval butuh peri-bugi-api hidup.")
         return 2
 
     laporan = Laporan()
+    katalog: dict = {}
 
     async with httpx.AsyncClient() as client:
         r = await client.get(CATALOG, headers=H_API, timeout=30)
@@ -319,10 +418,14 @@ async def main(skip_chat: bool) -> int:
             print(f"\nFASE KEAMANAN GAGAL — {len(bocor)} kasus. Akurasi TIDAK diukur.")
             for h in bocor:
                 print(f"  - {h.id}: {h.catatan}")
+            if keluar:
+                tulis_artefak(keluar, laporan, katalog)
             return 1
 
         if skip_chat:
             print("\n--skip-chat: fase akurasi dilewati.")
+            if keluar:
+                tulis_artefak(keluar, laporan, katalog)
             return 0
 
         (
@@ -341,25 +444,87 @@ async def main(skip_chat: bool) -> int:
         print(f"  {nama:9} {lulus}/{len(daftar)}")
 
     # Angka ringkasan tanpa daftar yang gagal tidak bisa ditindaklanjuti —
-    # "16/19" tidak memberi tahu grafik mana yang perlu diperbaiki.
+    # "16/19" tidak memberi tahu grafik mana yang perlu diperbaiki. Dan daftar
+    # yang gagal tanpa SQL model juga tidak: "baris emas=6 model=6" tidak
+    # memberi tahu siapa yang salah, modelnya atau soal emasnya.
     for nama, daftar in (("akurasi", laporan.akurasi), ("grafik", laporan.grafik)):
         gagal = [h for h in daftar if not h.lulus]
         if gagal:
             print(f"\n  {nama} yang gagal:")
             for h in gagal:
                 print(f"    - {h.id}: {h.catatan}")
+                if h.sql_model:
+                    print(f"        SQL model : {_satu_baris(h.sql_model)}")
+                    print(f"        SQL emas  : {_satu_baris(h.sql_emas)}")
+                for sisi, kunci in (("hanya emas ", "hanya_emas"), ("hanya model", "hanya_model")):
+                    baris = h.beda.get(kunci)
+                    if baris:
+                        jumlah = h.beda.get(f"jumlah_{kunci}", len(baris))
+                        lebih = f" (+{jumlah - len(baris)} lagi)" if jumlah > len(baris) else ""
+                        print(f"        {sisi}: {json.dumps(baris, default=str)}{lebih}")
+                if h.beda.get("emas") is not None and "hanya_emas" not in h.beda:
+                    print(f"        nilai     : emas={h.beda['emas']} model={h.beda.get('model')}")
 
     if laporan.gaps:
         print("\n  celah yang diketahui (diukur, tidak dihitung):")
         for h in laporan.gaps:
             print(f"    - {h.id}: {h.catatan}")
 
+    if keluar:
+        tulis_artefak(keluar, laporan, katalog)
+        print(f"\n  artefak ditulis: {keluar}")
+
     gagal = [h for h in laporan.akurasi if not h.lulus]
     return 1 if gagal else 0
+
+
+def tulis_artefak(path: str, laporan: Laporan, katalog: dict) -> None:
+    """Simpan hasil per kasus ke JSON.
+
+    Perbandingan model sebelumnya cuma hidup di terminal dan di transkrip sesi;
+    sekali sesinya hilang, tidak ada yang bisa diaudit. Ini yang membuat
+    kesimpulan "model besar kalah" bertahan berhari-hari tanpa ada yang bisa
+    memeriksanya ulang.
+    """
+
+    def satu(h: Hasil) -> dict:
+        d = asdict(h)
+        return {k: v for k, v in d.items() if v not in ("", {}, None)} | {
+            "id": h.id,
+            "lulus": h.lulus,
+        }
+
+    isi = {
+        "model": settings.FOUNDER_SQL_MODEL or settings.GEMINI_MODEL,
+        "katalog_versi": katalog.get("version"),
+        "ringkasan": {
+            nama: {
+                "lulus": sum(1 for h in daftar if h.lulus),
+                "total": len(daftar),
+            }
+            for nama, daftar in (
+                ("keamanan", laporan.keamanan),
+                ("akurasi", laporan.akurasi),
+                ("grafik", laporan.grafik),
+            )
+        },
+        "keamanan": [satu(h) for h in laporan.keamanan],
+        "akurasi": [satu(h) for h in laporan.akurasi],
+        "grafik": [satu(h) for h in laporan.grafik],
+        "celah": [satu(h) for h in laporan.gaps],
+    }
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(isi, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--skip-chat", action="store_true", help="keamanan saja")
+    p.add_argument(
+        "--keluar",
+        metavar="PATH",
+        help="tulis hasil per kasus ke JSON (SQL model, baris yang beda, niat grafik)",
+    )
     args = p.parse_args()
-    sys.exit(asyncio.run(main(args.skip_chat)))
+    sys.exit(asyncio.run(main(args.skip_chat, args.keluar)))

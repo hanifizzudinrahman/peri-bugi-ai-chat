@@ -180,8 +180,12 @@ cases:
       FROM nlf.v_cerita_progress GROUP BY 1 ORDER BY 1
 
   # ── Tanya Peri ──────────────────────────────────────────────────────────
+  # "Pesan per sesi" punya dua jawaban yang sama-sama benar dan beda hampir dua
+  # kali lipat: 1,5 giliran bertanya, 2,9 termasuk balasan Peri. Model yang
+  # menjawab 3,2 dulu dihitung berhalusinasi — padahal ia menjawab pertanyaan
+  # yang lain, yang juga ditanyakan kalimat ini. Soalnya yang dipertegas.
   - id: tanya-pesan-per-sesi
-    question: "Rata-rata berapa pesan per sesi Tanya Peri?"
+    question: "Rata-rata berapa kali orang tua bertanya per sesi Tanya Peri? Hitung giliran bertanya orang tua saja, jangan balasan Peri."
     mode: scalar
     chart: none
     sql: >
@@ -198,17 +202,47 @@ cases:
       AND created_date_wib >= CURRENT_DATE - 30
 
   # ── Biaya ───────────────────────────────────────────────────────────────
+  # "Bulan ini" tanpa mengecualikan hari ini membuat kasus ini MENGUKUR DIRINYA
+  # SENDIRI: llm_call_logs bertambah karena eval ini yang memanggil LLM, jadi
+  # SQL emas dan SQL model membaca tabel yang sama pada dua saat yang berbeda
+  # dan wajar berbeda. Sempat tercatat 93.513 lawan 97.316 — selisih tiga
+  # panggilan yang terjadi di antara dua kueri itu, bukan kesalahan model.
+  #
+  # Model bahkan menulis tulang punggung tanggal seperti yang diminta prompt.
+  # Menghukumnya di sini berarti menghukum perilaku yang benar.
   - id: biaya-token-harian
-    question: "Token LLM per hari bulan ini"
+    question: "Token LLM per hari bulan ini, sampai kemarin saja — jangan sertakan hari ini."
     mode: exact
     chart: line
     sql: >
       SELECT created_date_wib, sum(total_tokens) AS token FROM nlf.v_llm_call
       WHERE created_date_wib >= date_trunc('month', CURRENT_DATE)::date
+        AND created_date_wib < CURRENT_DATE
       GROUP BY 1 ORDER BY 1
 
+  # Soalnya yang diperbaiki, bukan pembandingnya yang dilonggarkan.
+  #
+  # Dulu pertanyaannya superlatif ("model MANA yang paling banyak") tapi
+  # dinilai mode `shape` — jumlah baris. Model yang menulis ORDER BY ... LIMIT 1
+  # menjawab pertanyaannya dengan BENAR lalu dihitung salah karena mengembalikan
+  # 1 baris, bukan 2. Itu kesalahan soal, dan dua model kehilangan poin karenanya.
+  #
+  # Superlatif diukur `scalar` pada nama pemenangnya — yang memang jadi isi
+  # jawaban ke founder. LIMIT 1 dan tanpa LIMIT dua-duanya lulus, karena
+  # `scalar` membaca sel pertama.
   - id: biaya-model-terbanyak
-    question: "Model mana yang paling banyak dipakai bulan ini?"
+    question: "Model mana yang paling banyak dipakai bulan ini? Sebut satu nama model."
+    mode: scalar
+    chart: none
+    sql: >
+      SELECT model FROM nlf.v_llm_cost_daily
+      WHERE date_wib >= date_trunc('month', CURRENT_DATE)::date
+      GROUP BY 1 ORDER BY sum(total_tokens) DESC LIMIT 1
+
+  # Peringkat penuhnya diuji terpisah — itu pertanyaan yang berbeda, dan
+  # `shape` memang alat yang benar untuknya.
+  - id: biaya-model-peringkat
+    question: "Urutkan semua model menurut total token bulan ini, dari terbesar."
     mode: shape
     chart: bar
     sql: >

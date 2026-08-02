@@ -38,6 +38,8 @@ from app.agents.founder_analytics.prompts import (
 from app.agents.founder_analytics.state import (
     ChartIntent,
     FounderAnalyticsState,
+    KeluaranSQL,
+    RencanaKueri,
     SqlAttempt,
 )
 from app.agents.tools._http import call_internal_get, call_internal_post
@@ -71,6 +73,40 @@ def _strip_fence(text: str) -> str:
     return _FENCE.sub("", text or "").strip()
 
 
+#: Awalan yang sah untuk sebuah query. Dipakai menyelamatkan keluaran model yang
+#: membungkus SQL-nya dengan kalimat pengantar.
+_AWAL_SQL = re.compile(r"\b(SELECT|WITH)\b", re.I)
+
+
+def _model_pydantic(text: str, kelas):
+    """Parse teks jadi model Pydantic, atau `None` kalau tidak bisa."""
+    parsed = _parse_json(text)
+    if not isinstance(parsed, dict):
+        return None
+    try:
+        return kelas.model_validate(parsed)
+    except Exception:
+        return None
+
+
+def _parse_model(text: str, kelas):
+    """Sama seperti `_model_pydantic`, tapi selalu memberi objek.
+
+    Dengan `response_schema` aktif, cabang gagalnya nyaris tidak pernah kena.
+    Ia tetap ada karena tangga jalur-mundur bisa sampai ke LangChain, dan di
+    sana bentuk keluaran tidak dijamin siapa pun.
+    """
+    hasil = _model_pydantic(text, kelas)
+    if hasil is not None:
+        return hasil
+    logger.info(
+        "[founder_analytics] keluaran tidak terbaca sebagai %s: %r",
+        kelas.__name__,
+        (text or "")[:200],
+    )
+    return kelas()
+
+
 def _parse_json(text: str) -> dict | None:
     bersih = _strip_fence(text)
     try:
@@ -95,8 +131,15 @@ async def _llm_text(
     temperature: float = 0.0,
     max_tokens: int = 900,
     model: str | None = None,
+    response_schema: Any = None,
 ) -> str:
-    """Satu panggilan LLM non-streaming, ter-trace dan ter-catat biayanya."""
+    """Satu panggilan LLM non-streaming, ter-trace dan ter-catat biayanya.
+
+    `response_schema` (model Pydantic) memaksa bentuk keluaran di sisi Google.
+    Kalau modelnya tidak mendukung, panggilannya diulang tanpa skema — bukan
+    langsung jatuh ke LangChain, karena jatuh ke LangChain berarti kehilangan
+    kendali penalaran, dan itu obat yang lebih buruk daripada penyakitnya.
+    """
     nama_model = model or (settings.FOUNDER_SQL_MODEL or None) or settings.GEMINI_MODEL
     mulai = time.perf_counter()
 
@@ -123,30 +166,54 @@ async def _llm_text(
         },
     ) as span:
         if pakai_langsung:
-            try:
-                hasil = await gemini_direct.generate(
-                    system=system,
-                    user=user,
-                    model=nama_model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                teks = hasil.teks
-                pemakaian = {
-                    "input_tokens": hasil.input_tokens,
-                    "output_tokens": hasil.output_tokens,
-                    "total_tokens": hasil.total_tokens,
-                }
-            except Exception as e:
-                # Jangan menjatuhkan giliran gara-gara jalur cepat. Fitur tetap
-                # jalan lewat LangChain, cuma tanpa kendali penalaran.
-                logger.warning(
-                    "[founder_analytics] gemini_direct gagal (%s), "
-                    "mundur ke LangChain: %s",
-                    span_name,
-                    str(e)[:200],
-                )
-                pakai_langsung = False
+            # Tangga, dari yang paling terkendali ke yang paling longgar.
+            # Skema dilepas duluan, kendali penalaran dilepas paling akhir —
+            # urutannya begitu karena kehilangan kendali penalaran adalah
+            # kegagalan yang tidak kelihatan sampai tagihannya datang.
+            tangga = [response_schema, None] if response_schema is not None else [None]
+            for skema in tangga:
+                try:
+                    hasil = await gemini_direct.generate(
+                        system=system,
+                        user=user,
+                        model=nama_model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        response_schema=skema,
+                    )
+                    teks = hasil.teks
+                    pemakaian = {
+                        "input_tokens": hasil.input_tokens,
+                        "output_tokens": hasil.output_tokens,
+                        "total_tokens": hasil.total_tokens,
+                    }
+                    break
+                except gemini_direct.TeksTerpotong as e:
+                    # Ini bukan kegagalan transport dan mengulanginya tanpa
+                    # menaikkan anggaran cuma memberi hasil yang sama. Naikkan
+                    # `max_tokens` di pemanggilnya; pesannya sudah menyebut
+                    # berapa token yang habis dipakai berpikir.
+                    logger.warning("[founder_analytics] %s: %s", span_name, e)
+                    teks = ""
+                    break
+                except Exception as e:
+                    if skema is not None:
+                        logger.info(
+                            "[founder_analytics] %s: decoding berbatas ditolak "
+                            "(%s), ulangi tanpa skema",
+                            span_name,
+                            str(e)[:160],
+                        )
+                        continue
+                    # Jangan menjatuhkan giliran gara-gara jalur cepat. Fitur
+                    # tetap jalan lewat LangChain, cuma tanpa kendali penalaran.
+                    logger.warning(
+                        "[founder_analytics] gemini_direct gagal (%s), "
+                        "mundur ke LangChain: %s",
+                        span_name,
+                        str(e)[:200],
+                    )
+                    pakai_langsung = False
 
         if not pakai_langsung:
             llm = get_llm(
@@ -230,18 +297,23 @@ async def node_plan(state: FounderAnalyticsState) -> None:
             user=state.question,
             span_name="founder-plan",
             state=state,
-            max_tokens=300,
+            # Naik dari 300. Token penalaran memakan `max_output_tokens` yang
+            # sama, jadi anggaran yang pas untuk model kecil bisa habis sebelum
+            # satu karakter JSON keluar — dan itu pulang sebagai "tidak ada
+            # dataset yang cocok". `max_output_tokens` batas atas, bukan target:
+            # keluaran yang memang pendek tidak jadi lebih mahal karenanya.
+            max_tokens=700,
+            response_schema=RencanaKueri,
         )
-        parsed = _parse_json(teks) or {}
-        nama = [str(n) for n in (parsed.get("dataset_names") or [])][:3]
-        state.dataset_names = nama
-        state.time_hint = str(parsed.get("time_hint") or "")
+        rencana = _parse_model(teks, RencanaKueri)
+        state.dataset_names = [str(n) for n in rencana.dataset_names][:3]
+        state.time_hint = rencana.time_hint
         if span:
             span.update(
                 output={
-                    "dataset_names": nama,
+                    "dataset_names": state.dataset_names,
                     "time_hint": state.time_hint,
-                    "reason": parsed.get("reason"),
+                    "reason": rencana.reason,
                 }
             )
 
@@ -254,6 +326,31 @@ def _hari_ini_wib() -> str:
     dua tahun dan grafik berisi 27 baris nol. Model tidak punya jam.
     """
     return datetime.now(_WIB).strftime("%d %B %Y")
+
+
+def _selamatkan_sql(teks: str) -> str:
+    """Ambil SQL dari keluaran yang mungkin dibungkus prosa.
+
+    `_strip_fence` menghapus PENANDA pagar, bukan mengambil isi pagarnya — jadi
+    "Berikut kuerinya:" di depan ikut lolos ke validator, lalu galatnya masuk
+    loop perbaikan sebagai galat *database*. Loop itu menyuruh model membetulkan
+    semantik SQL, padahal masalahnya dia kebanyakan bicara: satu dari tiga
+    percobaan terbakar untuk memperbaiki hal yang salah.
+    """
+    bersih = _strip_fence(teks).strip()
+    if not bersih:
+        return ""
+    if bersih.upper().startswith(("SELECT", "WITH")):
+        return bersih.rstrip(";").strip()
+
+    cocok = _AWAL_SQL.search(bersih)
+    if not cocok:
+        return ""
+    logger.info(
+        "[founder_analytics] SQL dibungkus prosa, diselamatkan dari posisi %s",
+        cocok.start(),
+    )
+    return bersih[cocok.start() :].rstrip(";").strip()
 
 
 async def node_sql(state: FounderAnalyticsState, *, attempt: int) -> str | None:
@@ -273,11 +370,41 @@ async def node_sql(state: FounderAnalyticsState, *, attempt: int) -> str | None:
 
     nama_span = "founder-sql-generate" if attempt == 1 else "founder-sql-repair"
     teks = await _llm_text(
-        system=system, user=user, span_name=nama_span, state=state, max_tokens=800
+        system=system,
+        user=user,
+        span_name=nama_span,
+        state=state,
+        max_tokens=1200,
+        response_schema=KeluaranSQL,
     )
-    sql = _strip_fence(teks).rstrip(";").strip()
 
-    if not sql or sql.upper().startswith("TIDAK_BISA"):
+    keluaran = _model_pydantic(teks, KeluaranSQL)
+    if keluaran is None:
+        # Jalur mundur: tidak ada JSON, perlakukan seluruh teks sebagai SQL.
+        # Ini yang terjadi kalau tangga sampai ke LangChain.
+        sql = _selamatkan_sql(teks)
+        if sql.upper().startswith("TIDAK_BISA"):
+            state.sql_gagal = "model menilai pertanyaan ini di luar katalog"
+            return None
+        if not sql:
+            state.sql_gagal = (
+                "model tidak mengeluarkan SQL — keluarannya kosong atau bukan query"
+            )
+            return None
+        return sql
+
+    if not keluaran.bisa_dijawab:
+        state.sql_gagal = keluaran.alasan or (
+            "model menilai pertanyaan ini tidak terjawab oleh katalog"
+        )
+        return None
+
+    sql = _selamatkan_sql(keluaran.sql)
+    if not sql:
+        # Dibedakan dari penolakan di atas dengan sengaja: yang ini cacat bentuk
+        # keluaran, dan mengumpankannya ke loop perbaikan SQL cuma membakar
+        # percobaan untuk memperbaiki masalah yang bukan masalah SQL.
+        state.sql_gagal = "model menjawab tanpa query yang bisa dijalankan"
         return None
     return sql
 
@@ -321,14 +448,15 @@ async def node_chart(state: FounderAnalyticsState) -> None:
             user="Tentukan bentuk grafiknya.",
             span_name="founder-chart-intent",
             state=state,
-            max_tokens=350,
+            max_tokens=700,
+            response_schema=ChartIntent,
         )
-        parsed = _parse_json(teks) or {"kind": "none", "reason": "keluaran tak terbaca"}
-        try:
-            intent = ChartIntent.model_validate(parsed)
-        except Exception as e:
-            logger.info("[founder_analytics] niat grafik tidak valid: %s", e)
-            intent = ChartIntent(kind="none", reason="niat grafik tidak valid")
+        intent = _model_pydantic(teks, ChartIntent)
+        if intent is None:
+            logger.info(
+                "[founder_analytics] niat grafik tidak terbaca: %r", (teks or "")[:200]
+            )
+            intent = ChartIntent(kind="none", reason="niat grafik tidak terbaca")
 
         state.chart_intent = intent
         try:
@@ -451,8 +579,12 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
     for attempt in range(1, maks + 1):
         sql = await node_sql(state, attempt=attempt)
         if not sql:
-            state.failure = (
-                "model menyatakan pertanyaan ini tidak terjawab oleh katalog"
+            # Sebabnya datang dari node SQL, tidak lagi diasumsikan di sini.
+            # Kalimat lama menyatakan model MENOLAK menjawab, padahal sebabnya
+            # bisa keluaran terpotong atau bukan-SQL — dan orang jadi mencari
+            # kekurangan di katalog padahal yang kurang anggaran token.
+            state.failure = state.sql_gagal or (
+                "model tidak menghasilkan query untuk pertanyaan ini"
             )
             break
 
@@ -563,7 +695,11 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
     jawaban = ""
     mulai_jawab = time.perf_counter()
     pemakaian: dict = {}
-    model_jawab = settings.GEMINI_MODEL
+    # Sama persis dengan node lain (`_llm_text`). Sebelumnya dipaku ke
+    # GEMINI_MODEL, jadi menyetel FOUNDER_SQL_MODEL mengganti tiga node dan
+    # meninggalkan node ini di model lain — perbandingan model yang memakai
+    # override itu diam-diam mengukur dua model sekaligus.
+    model_jawab = (settings.FOUNDER_SQL_MODEL or None) or settings.GEMINI_MODEL
     pakai_langsung = gemini_direct.tersedia()
 
     async with trace_generation(

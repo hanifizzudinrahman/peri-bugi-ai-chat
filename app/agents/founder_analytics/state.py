@@ -45,6 +45,35 @@ class ChartIntent(BaseModel):
     )
 
 
+class RencanaKueri(BaseModel):
+    """Keluaran node `plan` — dataset mana yang dibaca, dan rentang waktunya.
+
+    Bentuknya dipakai dua kali: sebagai `response_schema` supaya model tidak
+    bisa mengarang bentuk lain, dan sebagai pemeriksa hasil parse untuk jalur
+    mundur. Sebelum ada ini, keluaran yang tidak terbaca tidak bisa dibedakan
+    dari "tidak ada dataset yang cocok" — satu model pernah mencetak 0/19
+    karena itu, dan sebabnya baru ketahuan setelah dilacak manual.
+    """
+
+    dataset_names: list[str] = Field(default_factory=list)
+    time_hint: str = ""
+    reason: str = ""
+
+
+class KeluaranSQL(BaseModel):
+    """Keluaran node `sql`.
+
+    `bisa_dijawab` menggantikan sentinel `TIDAK_BISA` yang dulu harus ditulis
+    model persis sebagai teks. Sentinel kata ajaib menaruh beban di tempat yang
+    salah: model yang menulis "TIDAK BISA" (dengan spasi) atau menjelaskan
+    dulu kenapa tidak bisa, keluarannya diperlakukan sebagai SQL.
+    """
+
+    bisa_dijawab: bool = True
+    sql: str = ""
+    alasan: str = ""
+
+
 class SqlAttempt(BaseModel):
     """Satu percobaan menulis SQL, berhasil maupun tidak."""
 
@@ -74,6 +103,13 @@ class FounderAnalyticsState(BaseModel):
     # ── SQL ─────────────────────────────────────────────────────────────────
     sql: str | None = None
     attempts: list[SqlAttempt] = Field(default_factory=list)
+
+    sql_gagal: str | None = None
+    """Kenapa node SQL tidak menghasilkan query. Dulu semuanya dilaporkan
+    sebagai "model menyatakan pertanyaan ini tidak terjawab oleh katalog" —
+    termasuk keluaran terpotong dan keluaran yang bukan SQL. Sebab teknis yang
+    menyamar jadi keputusan model membuat orang mencari-cari di katalog padahal
+    yang kurang anggaran token."""
 
     # ── Hasil ───────────────────────────────────────────────────────────────
     columns: list[str] = Field(default_factory=list)

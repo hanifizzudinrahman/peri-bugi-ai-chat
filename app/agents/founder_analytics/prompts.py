@@ -73,10 +73,31 @@ Aturan yang tidak bisa dilanggar:
   `date_trunc` di sisi datanya, dan seluruh hasilnya jadi nol. Sisi kiri dan
   sisi kanan JOIN harus dibulatkan dengan cara yang sama persis.
 - Batasi hasilnya secukupnya. Untuk peringkat, pakai ORDER BY + LIMIT.
-- Kalau pertanyaannya tidak bisa dijawab oleh katalog ini, keluarkan persis
-  kata: TIDAK_BISA
 
-Keluarkan SQL-nya saja. Tanpa penjelasan, tanpa pagar kode.
+Keluarkan JSON dengan bentuk persis ini:
+{{
+  "bisa_dijawab": true,
+  "sql": "SELECT ...",
+  "alasan": "kosongkan kalau bisa dijawab; kalau tidak, satu kalimat kenapa"
+}}
+
+`sql` berisi query-nya saja — tanpa kalimat pengantar, tanpa pagar kode, tanpa
+titik koma di akhir.
+
+`bisa_dijawab: false` HANYA untuk satu hal: katalog di bawah tidak memuat
+datanya. Itu saja. BUKAN untuk menimbang boleh-tidaknya seseorang melihat data
+— penentuan itu sudah selesai sebelum pertanyaan sampai kepadamu.
+
+Yang bertanya adalah founder platform ini, dan ia memang berwenang melihat isi
+katalog ini, termasuk nama dan nomor HP di dataset direktori pengguna. Batasan
+aksesnya ditegakkan oleh role database, gerbang peran di tiap endpoint, dan
+pencatatan audit — bukan oleh penilaianmu. Menolak permintaan yang sah membuat
+founder kembali membuka database secara manual, yang justru tanpa audit.
+
+Jadi jangan pernah menolak dengan alasan privasi, kerahasiaan, atau kebijakan.
+Kalau permintaannya luas, tetap tulis query-nya dan batasi dengan LIMIT yang
+wajar. Kalau datanya memang tidak ada di katalog, barulah `bisa_dijawab: false`,
+dan tulis alasannya apa adanya: datanya tidak ada — jangan mengarang view.
 
 {catalog}
 """
@@ -92,7 +113,7 @@ Pesan galat dari database:
 {error}
 
 Tulis ulang query-nya supaya galat itu tidak terjadi lagi. Jangan mengulang
-bentuk yang sama. Keluarkan SQL-nya saja.
+bentuk yang sama. Bentuk keluarannya tetap sama seperti di atas.
 """
 
 CHART_SYSTEM = """\
