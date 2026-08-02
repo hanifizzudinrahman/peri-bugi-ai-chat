@@ -147,7 +147,37 @@ Doc lengkap + benchmark + batasan: workspace `docs/GRAPHIFY.md`.
    tidak boleh mengubah fakta.
 
 ## Deploy
-Baca `../docs/BRANCHING_AND_DEPLOY.md`. Repo ini pernah punya branch
+
+### ⚠️ `docker build .` polos SALAH untuk repo ini
+
+`Dockerfile` (default) adalah varian **GPU** — base `nvidia/cuda`, torch cu121,
+sentence-transformers. **Cloud Run tidak mendukung GPU sama sekali.**
+
+```
+docker build .                      -> 15,5 GB   TIDAK BISA jalan di Cloud Run
+docker build -f Dockerfile.cpu .    ->  807 MB   yang benar
+```
+
+Kenapa gampang terjebak, dan kenapa ini bukan kelalaian sesaat:
+`docker-compose.yml` untuk dev lokal memakai `dockerfile: Dockerfile`, jadi
+varian GPU-lah yang dibangun ratusan kali sehari-hari. `Dockerfile.cpu` **tidak
+pernah disentuh kecuali saat deploy**, dan deploy jarang. Nama berkas default
+justru yang salah untuk produksi.
+
+Yang bikin mahal: `docker build` sukses, `docker push` sukses, exit code nol.
+Kegagalannya baru muncul di Cloud Run, jauh dari sebabnya. Terjadi 2 Agustus
+2026 — dua push besar terbuang sebelum ketahuan.
+
+```powershell
+$SHA = git rev-parse --short HEAD
+$IMG = "asia-southeast2-docker.pkg.dev/peri-bugi-491218/peri-bugi"
+docker build -f Dockerfile.cpu -t "$IMG/ai-chat:$SHA" .
+docker push "$IMG/ai-chat:$SHA"
+gcloud run deploy peri-bugi-ai-chat --image="$IMG/ai-chat:$SHA" `
+  --region=asia-southeast2 --project=peri-bugi-491218
+```
+
+Selebihnya baca `../docs/BRANCHING_AND_DEPLOY.md`. Repo ini pernah punya branch
 `langfuse-integration` yang hidup 37 commit di depan `main` sementara produksi
 jalan dari branch itu — sudah disatukan 2026-07-18. Jangan ulangi: kerja di
 branch pendek, merge ke `main`, deploy dari `main`.
