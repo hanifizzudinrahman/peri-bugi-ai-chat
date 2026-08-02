@@ -1,0 +1,304 @@
+# Pertanyaan emas Tanya Data Founder.
+#
+# Dinilai dengan EXECUTION ACCURACY: SQL yang ditulis model dijalankan, SQL emas
+# di sini dijalankan, lalu HASILNYA yang dibandingkan. Query yang ditulis
+# berbeda tapi mengembalikan angka sama tetap lulus — yang diukur jawabannya,
+# bukan gayanya.
+#
+# `mode` menentukan seberapa ketat perbandingannya:
+#   exact  — himpunan baris harus sama persis (setelah diurutkan)
+#   scalar — cukup angka di sel pertama yang sama
+#   shape  — cukup jumlah baris dan nama kolom yang sepadan
+#
+# `chart` menyatakan bentuk grafik yang MASUK AKAL untuk pertanyaan itu.
+# `none` berarti grafik justru salah — satu angka tidak digambar, dan grafik
+# satu batang lebih sulit dibaca daripada angkanya sendiri.
+
+cases:
+  # ── Akuisisi ────────────────────────────────────────────────────────────
+  - id: akuisisi-total-orang-tua
+    question: "Berapa total orang tua yang sudah mendaftar?"
+    mode: scalar
+    chart: none
+    sql: >
+      SELECT count(*) AS jumlah FROM nlf.v_user
+      WHERE role_name = 'parent' AND NOT is_internal
+
+  # Pertanyaannya menyebut rentang SECARA EKSPLISIT. Versi pertama cuma bilang
+  # "per bulan", dan model — dengan benar — membuat tulang punggung tanggal
+  # sehingga bulan tanpa pendaftar muncul sebagai nol, sementara SQL emas cuma
+  # mengembalikan bulan yang ada isinya. Yang gagal waktu itu pertanyaannya,
+  # bukan modelnya.
+  - id: akuisisi-tren-bulanan
+    question: "Tren pendaftaran orang tua per bulan, dari Maret 2026 sampai Agustus 2026, bulan tanpa pendaftar tampilkan sebagai nol"
+    mode: exact
+    chart: line
+    sql: >
+      SELECT b::date AS bulan, COALESCE(p.pendaftar, 0) AS pendaftar
+      FROM generate_series('2026-03-01'::date, '2026-08-01'::date, '1 month') AS b
+      LEFT JOIN (
+        SELECT date_trunc('month', registered_date_wib)::date AS bulan,
+               count(*) AS pendaftar
+        FROM nlf.v_user WHERE role_name = 'parent' AND NOT is_internal
+        GROUP BY 1
+      ) p ON p.bulan = b::date
+      ORDER BY 1
+
+  - id: akuisisi-onboarding
+    question: "Berapa persen akun orang tua yang sudah menyelesaikan onboarding?"
+    mode: scalar
+    chart: none
+    sql: >
+      SELECT round(100.0 * count(*) FILTER (WHERE onboarding_completed)
+      / NULLIF(count(*), 0), 1) AS persen
+      FROM nlf.v_user WHERE role_name = 'parent' AND NOT is_internal
+
+  # `scalar` di sini bukan pelonggaran: yang ditanyakan SATU nama sekolah, dan
+  # sel pertama baris pertama persis itu. Model boleh menambah kolom kota atau
+  # jumlah anak tanpa dianggap salah, karena jawabannya tetap sama.
+  - id: akuisisi-sekolah-teratas
+    question: "Sekolah mana yang paling banyak anaknya? Urutkan dari terbanyak."
+    mode: scalar
+    chart: bar
+    sql: >
+      SELECT school_name FROM nlf.v_school
+      WHERE child_count > 0 ORDER BY child_count DESC, school_name
+
+  - id: akuisisi-sebaran-umur
+    question: "Sebaran umur anak yang terdaftar"
+    mode: exact
+    chart: bar
+    sql: >
+      SELECT age_years, count(*) AS jumlah FROM nlf.v_child
+      GROUP BY age_years ORDER BY age_years
+
+  # ── Retensi — dua yang paling sulit ─────────────────────────────────────
+  # Keduanya menuntut penyebut diambil dari daftar anak, bukan dari catatan
+  # perilakunya. Kalau model memulai dari view perilaku, angkanya bias ke atas
+  # dan kelihatan wajar — itu justru kesalahan yang paling sulit ketahuan.
+  - id: retensi-belum-pernah-sikat
+    question: "Berapa anak yang belum pernah mencatat sikat gigi sama sekali?"
+    mode: scalar
+    chart: none
+    sql: >
+      SELECT count(*) AS belum_pernah FROM nlf.v_brushing_streak
+      WHERE NOT has_ever_brushed
+
+  # Rentangnya ABSOLUT. "30 hari terakhir" bisa dibaca dua cara — termasuk hari
+  # ini atau tidak — dan meleset satu hari bukan kesalahan yang layak dihitung
+  # sebagai jawaban salah.
+  - id: retensi-kepatuhan-30-hari
+    question: "Kepatuhan sikat gigi per hari, dari 1 Juli 2026 sampai 31 Juli 2026, seluruh pengguna"
+    mode: exact
+    chart: line
+    sql: >
+      SELECT log_date,
+             round(100.0 * count(*) FILTER (WHERE is_brushed)
+             / NULLIF(count(*), 0), 1) AS persen_patuh
+      FROM nlf.v_brushing_daily_recent
+      WHERE log_date BETWEEN '2026-07-01' AND '2026-07-31'
+      GROUP BY 1 ORDER BY 1
+
+  # `scalar` dengan urutan yang ditentukan pertanyaannya: sel pertama = slot
+  # yang paling sering terlewat, dan itu memang jawaban yang diminta.
+  - id: retensi-pagi-vs-malam
+    question: "Pagi atau malam yang lebih sering terlewat sepanjang Juli 2026? Urutkan dari yang paling sering terlewat."
+    mode: scalar
+    chart: bar
+    sql: >
+      SELECT slot FROM nlf.v_brushing_daily_recent
+      WHERE log_date BETWEEN '2026-07-01' AND '2026-07-31'
+      GROUP BY slot ORDER BY count(*) FILTER (WHERE NOT is_brushed) DESC
+
+  # ── Mata Peri ───────────────────────────────────────────────────────────
+  - id: mata-peri-persen-gagal
+    question: "Berapa persen scan Mata Peri yang gagal bulan ini?"
+    mode: scalar
+    chart: none
+    sql: >
+      SELECT round(100.0 * count(*) FILTER (WHERE status <> 'completed' OR NOT has_result)
+      / NULLIF(count(*), 0), 1) AS persen_gagal
+      FROM nlf.v_mata_peri_scan
+      WHERE created_date_wib >= date_trunc('month', CURRENT_DATE)::date
+
+  # Sama seperti tren bulanan: rentang absolut, dan hari tanpa scan HARUS
+  # muncul sebagai nol. Tanpa itu grafiknya berbohong — hari kosong hilang
+  # alih-alih terlihat kosong.
+  - id: mata-peri-tren-harian
+    question: "Tren jumlah scan Mata Peri per hari, dari 1 Juli 2026 sampai 31 Juli 2026, hari tanpa scan tampilkan sebagai nol"
+    mode: exact
+    chart: line
+    sql: >
+      SELECT d::date AS tanggal, COALESCE(s.sesi, 0) AS sesi
+      FROM generate_series('2026-07-01'::date, '2026-07-31'::date, '1 day') AS d
+      LEFT JOIN (
+        SELECT created_date_wib, count(*) AS sesi FROM nlf.v_mata_peri_scan
+        GROUP BY 1
+      ) s ON s.created_date_wib = d::date
+      ORDER BY 1
+
+  - id: mata-peri-durasi-per-model
+    question: "Rata-rata durasi analisa per versi model"
+    mode: shape
+    chart: bar
+    sql: >
+      SELECT model_version, round(avg(duration_seconds), 1) AS rata_detik
+      FROM nlf.v_mata_peri_job WHERE duration_seconds IS NOT NULL
+      GROUP BY 1 ORDER BY 1
+
+  # ── Janji Peri ──────────────────────────────────────────────────────────
+  - id: janji-status-per-fasilitas
+    question: "Janji temu selesai vs tidak hadir per fasilitas"
+    mode: shape
+    chart: bar
+    sql: >
+      SELECT facility_name,
+             count(*) FILTER (WHERE status = 'completed') AS selesai,
+             count(*) FILTER (WHERE status = 'no_show') AS tidak_hadir
+      FROM nlf.v_appointment WHERE facility_name IS NOT NULL
+      GROUP BY 1 ORDER BY 1
+
+  - id: janji-lead-time
+    question: "Rata-rata berapa hari sebelumnya orang memesan janji temu?"
+    mode: scalar
+    chart: none
+    sql: >
+      SELECT round(avg(lead_time_days), 1) AS rata_hari FROM nlf.v_appointment
+      WHERE lead_time_days >= 0 AND NOT is_reschedule
+
+  # ── Cerita Peri ─────────────────────────────────────────────────────────
+  # Kolomnya disebut eksplisit supaya model tidak dianggap salah cuma karena
+  # menambahkan judul modul sebagai konteks.
+  - id: cerita-corong-modul
+    question: "Corong penyelesaian modul Cerita Peri: nomor modul, jumlah yang mulai, dan jumlah yang selesai. Hanya tiga kolom itu."
+    mode: exact
+    chart: bar
+    sql: >
+      SELECT module_id,
+             count(started_at) AS mulai,
+             count(completed_at) AS selesai
+      FROM nlf.v_cerita_progress GROUP BY 1 ORDER BY 1
+
+  # ── Tanya Peri ──────────────────────────────────────────────────────────
+  # "Pesan per sesi" punya dua jawaban yang sama-sama benar dan beda hampir dua
+  # kali lipat: 1,5 giliran bertanya, 2,9 termasuk balasan Peri. Model yang
+  # menjawab 3,2 dulu dihitung berhalusinasi — padahal ia menjawab pertanyaan
+  # yang lain, yang juga ditanyakan kalimat ini. Soalnya yang dipertegas.
+  #
+  # Akun internal WAJIB dikecualikan, dan itu bukan detail kecil di sini:
+  #
+  #     seluruh sesi          518 sesi   rata-rata 1,48
+  #     tanpa akun internal   125 sesi   rata-rata 3,18
+  #
+  # 393 dari 518 sesi milik akun uji. Angka yang memuatnya bukan cuma kurang
+  # tepat — ia menggambarkan platform yang lain. gemini-3.6-flash menambahkan
+  # filter itu sendiri dan DIHITUNG SALAH karenanya, sementara model yang
+  # mengikuti soal emas dihitung benar. Yang keliru soalnya.
+  #
+  # Memperbaikinya membuat model yang tadinya menang kehilangan satu poin.
+  # Itu justru alasan memperbaikinya: kalau soal emas cuma diperbaiki saat
+  # merugikan model favorit, yang diukur bukan lagi modelnya.
+  - id: tanya-pesan-per-sesi
+    question: "Rata-rata berapa kali orang tua bertanya per sesi Tanya Peri? Hitung giliran bertanya orang tua saja (jangan balasan Peri), dan jangan sertakan akun internal."
+    mode: scalar
+    chart: none
+    sql: >
+      SELECT round(avg(cs.message_count), 1) AS rata_pesan
+      FROM nlf.v_chat_session cs
+      JOIN nlf.v_user u ON u.user_id = cs.user_id
+      WHERE NOT u.is_internal
+
+  - id: tanya-thumbs-down
+    question: "Berapa persen jawaban Tanya Peri yang dapat jempol ke bawah 30 hari terakhir?"
+    mode: scalar
+    chart: none
+    sql: >
+      SELECT round(100.0 * count(*) FILTER (WHERE is_positive_feedback = FALSE)
+      / NULLIF(count(*) FILTER (WHERE is_positive_feedback IS NOT NULL), 0), 1) AS persen
+      FROM nlf.v_chat_message_stat WHERE role = 'assistant'
+      AND created_date_wib >= CURRENT_DATE - 30
+
+  # ── Biaya ───────────────────────────────────────────────────────────────
+  # "Bulan ini" tanpa mengecualikan hari ini membuat kasus ini MENGUKUR DIRINYA
+  # SENDIRI: llm_call_logs bertambah karena eval ini yang memanggil LLM, jadi
+  # SQL emas dan SQL model membaca tabel yang sama pada dua saat yang berbeda
+  # dan wajar berbeda. Sempat tercatat 93.513 lawan 97.316 — selisih tiga
+  # panggilan yang terjadi di antara dua kueri itu, bukan kesalahan model.
+  #
+  # Model bahkan menulis tulang punggung tanggal seperti yang diminta prompt.
+  # Menghukumnya di sini berarti menghukum perilaku yang benar.
+  - id: biaya-token-harian
+    question: "Token LLM per hari bulan ini, sampai kemarin saja — jangan sertakan hari ini."
+    mode: exact
+    chart: line
+    sql: >
+      SELECT created_date_wib, sum(total_tokens) AS token FROM nlf.v_llm_call
+      WHERE created_date_wib >= date_trunc('month', CURRENT_DATE)::date
+        AND created_date_wib < CURRENT_DATE
+      GROUP BY 1 ORDER BY 1
+
+  # Soalnya yang diperbaiki, bukan pembandingnya yang dilonggarkan.
+  #
+  # Dulu pertanyaannya superlatif ("model MANA yang paling banyak") tapi
+  # dinilai mode `shape` — jumlah baris. Model yang menulis ORDER BY ... LIMIT 1
+  # menjawab pertanyaannya dengan BENAR lalu dihitung salah karena mengembalikan
+  # 1 baris, bukan 2. Itu kesalahan soal, dan dua model kehilangan poin karenanya.
+  #
+  # Superlatif diukur `scalar` pada nama pemenangnya — yang memang jadi isi
+  # jawaban ke founder. LIMIT 1 dan tanpa LIMIT dua-duanya lulus, karena
+  # `scalar` membaca sel pertama.
+  - id: biaya-model-terbanyak
+    question: "Model mana yang paling banyak dipakai bulan ini? Sebut satu nama model."
+    mode: scalar
+    chart: none
+    sql: >
+      SELECT model FROM nlf.v_llm_cost_daily
+      WHERE date_wib >= date_trunc('month', CURRENT_DATE)::date
+      GROUP BY 1 ORDER BY sum(total_tokens) DESC LIMIT 1
+
+  # Peringkat penuhnya diuji terpisah — itu pertanyaan yang berbeda, dan
+  # `shape` memang alat yang benar untuknya.
+  - id: biaya-model-peringkat
+    question: "Urutkan semua model menurut total token bulan ini, dari terbesar."
+    mode: shape
+    chart: bar
+    sql: >
+      SELECT model, sum(total_tokens) AS token FROM nlf.v_llm_cost_daily
+      WHERE date_wib >= date_trunc('month', CURRENT_DATE)::date
+      GROUP BY 1 ORDER BY token DESC
+
+  # ── Jalur data pribadi ──────────────────────────────────────────────────
+  # Model HARUS memilih v_user_directory di sini, dan HARUS TIDAK memilihnya
+  # untuk pertanyaan hitungan biasa di atas.
+  - id: pii-pendaftar-terakhir
+    question: "Siapa 5 orang tua yang terakhir mendaftar?"
+    mode: shape
+    chart: none
+    expect_pii: true
+    sql: >
+      SELECT full_name, phone_number, registered_date_wib
+      FROM nlf.v_user_directory WHERE role_name = 'parent' AND NOT is_internal
+      ORDER BY registered_at DESC LIMIT 5
+
+# Yang sengaja TIDAK dihitung sebagai lulus, tapi tetap diukur supaya
+# angkanya tidak berbohong. Kalau salah satu mulai lulus, pindahkan ke `cases`.
+known_gaps:
+  - id: gap-churn
+    question: "Berapa pengguna yang berhenti pakai aplikasi bulan ini?"
+    alasan: >
+      Nol soft delete di seluruh model — penghapusan bersifat cascade. Churn
+      tidak bisa dihitung dari data yang ada. Jawaban yang benar adalah
+      mengatakan itu, bukan mengarang angka.
+
+  - id: gap-tagihan-historis
+    question: "Berapa rupiah biaya LLM bulan Juni?"
+    alasan: >
+      Harga vendor berlaku-tanggal dan kurs berubah. Katalog sengaja tidak
+      menyediakan tabel harga yang bisa di-join. Jawaban yang benar adalah
+      menyebut token dan mengarahkan ke ekspor Pusat Biaya.
+
+  - id: gap-zona-waktu-pengguna
+    question: "Jam berapa anak-anak di Indonesia timur biasanya sikat gigi?"
+    alasan: >
+      Tidak ada `users.timezone` di sistem ini. Semua batas hari memakai
+      Asia/Jakarta. Pertanyaan per-zona-waktu tidak bisa dijawab jujur.

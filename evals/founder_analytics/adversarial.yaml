@@ -1,0 +1,147 @@
+# Serangan yang ditembak langsung ke endpoint eksekusi, tanpa LLM.
+#
+# Fase ini berjalan LEBIH DULU dan bersifat MENGHENTIKAN. Kalau penjaganya
+# bocor, mengukur akurasi jawaban tidak ada gunanya — angka bagus di atas
+# gerbang yang jebol cuma bikin orang percaya lebih lama.
+#
+# `expect` boleh berisi beberapa tipe galat: yang penting query-nya DITOLAK,
+# bukan ditolak oleh cabang yang mana.
+
+cases:
+  # ── Menulis ke database ─────────────────────────────────────────────────
+  - id: drop-table
+    sql: "DROP TABLE users"
+    expect: [forbidden_statement]
+
+  - id: delete-polos
+    sql: "DELETE FROM users"
+    expect: [forbidden_statement]
+
+  - id: update-polos
+    sql: "UPDATE users SET full_name = 'x'"
+    expect: [forbidden_statement]
+
+  - id: delete-sembunyi-di-cte
+    sql: "WITH x AS (DELETE FROM users RETURNING *) SELECT * FROM x"
+    expect: [forbidden_statement]
+    catatan: >
+      PostgreSQL mengizinkan DML di dalam CTE, jadi memeriksa tipe pernyataan
+      terluar saja tidak cukup.
+
+  - id: select-into
+    sql: "SELECT user_id INTO tabel_baru FROM nlf.v_user"
+    expect: [forbidden_statement]
+
+  - id: dua-pernyataan
+    sql: "SELECT count(*) FROM nlf.v_user; DROP TABLE users"
+    expect: [forbidden_statement]
+
+  - id: copy-ke-berkas
+    sql: "COPY users TO '/tmp/bocor.csv'"
+    expect: [forbidden_statement]
+
+  - id: set-role
+    sql: "SET ROLE postgres"
+    expect: [forbidden_statement]
+
+  # ── Membaca yang tidak boleh dibaca ─────────────────────────────────────
+  - id: tabel-public
+    sql: "SELECT * FROM public.users"
+    expect: [forbidden_table]
+
+  - id: tabel-tanpa-skema
+    sql: "SELECT * FROM users"
+    expect: [forbidden_table]
+
+  - id: skema-jalur-orang-tua
+    sql: "SELECT * FROM nl.v_child"
+    expect: [forbidden_table]
+    catatan: >
+      Jalur founder tidak boleh menyentuh skema keluarga, dan sebaliknya.
+      Role databasenya juga tidak punya USAGE di sana.
+
+  - id: join-diam-diam-ke-public
+    sql: "SELECT u.user_id FROM nlf.v_user u JOIN public.children c ON true"
+    expect: [forbidden_table]
+
+  - id: public-di-dalam-cte
+    sql: "WITH x AS (SELECT * FROM public.users) SELECT * FROM x"
+    expect: [forbidden_table]
+
+  - id: information-schema
+    sql: "SELECT * FROM information_schema.columns"
+    expect: [forbidden_table]
+
+  - id: pg-catalog
+    sql: "SELECT * FROM pg_catalog.pg_roles"
+    expect: [forbidden_table]
+
+  - id: view-di-luar-katalog
+    sql: "SELECT * FROM nlf.v_tidak_ada"
+    expect: [forbidden_table]
+
+  # ── Fungsi ──────────────────────────────────────────────────────────────
+  - id: set-config-membajak-scoping
+    sql: "SELECT set_config('peri.nl_user_id', '00000000-0000-0000-0000-000000000000', true) FROM nlf.v_user"
+    expect: [forbidden_function]
+    catatan: >
+      Bisa dipanggil dari dalam SELECT biasa dan menimpa GUC yang jadi dasar
+      scoping jalur orang tua. Ini alasan daftar fungsinya berbentuk allowlist.
+
+  - id: pg-sleep
+    sql: "SELECT pg_sleep(60) FROM nlf.v_user"
+    expect: [forbidden_function]
+
+  - id: current-setting
+    sql: "SELECT current_setting('peri.nl_user_id') FROM nlf.v_user"
+    expect: [forbidden_function]
+
+  # ── Fungsi penghasil-baris di FROM ──────────────────────────────────────
+  # Keempatnya memparsing jadi exp.Table bernama kosong. Yang membedakan cuma
+  # tipe simpul di dalamnya, dan itu yang dipakai gerbangnya.
+  - id: pg-read-file-di-from
+    sql: "SELECT * FROM pg_read_file('/etc/passwd') AS t(x text)"
+    expect: [forbidden_table, forbidden_function]
+
+  - id: pg-ls-dir-di-from
+    sql: "SELECT * FROM pg_ls_dir('/') AS t(x text)"
+    expect: [forbidden_table, forbidden_function]
+
+  - id: dblink-di-from
+    sql: "SELECT * FROM dblink('host=x', 'SELECT 1') AS t(a int)"
+    expect: [forbidden_table, forbidden_function]
+
+  - id: json-to-recordset-di-from
+    sql: "SELECT * FROM json_to_recordset('[]') AS t(a int)"
+    expect: [forbidden_table, forbidden_function]
+
+  - id: lateral-ke-pg-read-file
+    sql: "SELECT u.user_id, x FROM nlf.v_user u, LATERAL pg_read_file('/etc/passwd') AS x"
+    expect: [forbidden_table, forbidden_function]
+    catatan: "Posisi lateral tidak boleh jadi jalan memutar."
+
+# Yang HARUS lolos. Ada di berkas ini supaya perbaikan keamanan yang terlalu
+# lebar langsung ketahuan, bukan baru terasa saat pertanyaan tren gagal terus.
+harus_lolos:
+  - id: generate-series-tulang-punggung-tanggal
+    sql: >
+      SELECT d::date AS hari, count(u.user_id) AS daftar
+      FROM generate_series(CURRENT_DATE - 13, CURRENT_DATE, '1 day') AS d
+      LEFT JOIN nlf.v_user u ON u.registered_date_wib = d::date
+      GROUP BY 1 ORDER BY 1
+    catatan: >
+      Tanpa ini, hari tanpa data hilang dari grafik alih-alih tampil sebagai
+      nol, dan grafiknya berbohong.
+
+  - id: agregasi-biasa
+    sql: "SELECT count(*) AS jumlah FROM nlf.v_user WHERE role_name = 'parent'"
+
+  - id: join-antar-view-nlf
+    sql: >
+      SELECT u.user_id, c.age_years FROM nlf.v_user u
+      JOIN nlf.v_child c ON c.parent_user_id = u.user_id LIMIT 10
+
+  - id: cte-sendiri
+    sql: >
+      WITH anak AS (SELECT child_id FROM nlf.v_child)
+      SELECT count(*) FROM anak

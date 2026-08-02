@@ -96,6 +96,29 @@ class Settings(BaseSettings):
     NL_CATALOG_TTL_SECONDS: int = 300
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Tanya Data Founder (2 Agustus 2026)
+    # Jalur terpisah dari chat orang tua: endpoint sendiri, graph sendiri,
+    # katalog sendiri. Otoritasnya tetap di peri-bugi-api — feature flag dan
+    # role founder diperiksa di sana sebelum request sampai ke sini.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    #: Model penulis SQL untuk jalur founder. Kosong = ikut model chat.
+    FOUNDER_SQL_MODEL: str = ""
+
+    #: Cache katalog founder. Katalognya jauh lebih besar daripada katalog orang
+    #: tua, jadi mengambilnya ulang tiap giliran terasa.
+    FOUNDER_CATALOG_TTL_SECONDS: int = 300
+
+    #: Timeout memanggil endpoint eksekusi di api. WAJIB lebih besar daripada
+    #: `statement_timeout` di sana (20 detik) — kalau klien menyerah lebih dulu,
+    #: query tetap membakar koneksi sampai selesai dan tidak ada yang membaca
+    #: hasilnya.
+    FOUNDER_EXECUTE_TIMEOUT_SECONDS: int = 30
+
+    #: Berapa kali SQL yang gagal boleh diperbaiki dalam satu giliran.
+    FOUNDER_SQL_MAX_ATTEMPTS: int = 3
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Langfuse Observability (optional)
     # Pattern 1+2: graceful degradation + explicit toggle.
     # Default OFF supaya safe — Hanif harus eksplisit set true di .env.

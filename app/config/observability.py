@@ -32,6 +32,7 @@ Default behavior:
 from __future__ import annotations
 
 import logging
+import sys
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
@@ -615,6 +616,8 @@ async def trace_node(
         yield None
         return
 
+    cm = None
+    span = None
     try:
         # Truncate input_data values defensively
         safe_input = {}
@@ -627,16 +630,42 @@ async def trace_node(
                 else:
                     safe_input[k] = _truncate(str(v), 500)
 
-        with langfuse.start_as_current_observation(
+        cm = langfuse.start_as_current_observation(
             as_type="span",
             name=name,
             input=safe_input or None,
             metadata=metadata or {},
-        ) as span:
-            yield span
+        )
+        span = cm.__enter__()
     except Exception as e:
         logger.warning(f"trace_node instrumentation failed for {name}: {e}")
+        cm = None
+
+    if cm is None:
         yield None
+        return
+
+    # Galat dari BADAN blok `async with` harus lolos apa adanya.
+    #
+    # Sebelum ini, seluruh blok dibungkus satu `try/except Exception` yang
+    # diakhiri `yield None`. Akibatnya, exception apa pun dari badan blok
+    # sampai ke generator lewat athrow(), tertangkap di sana, lalu generatornya
+    # yield untuk KEDUA kalinya — dan Python menggantinya dengan
+    # `RuntimeError: generator didn't stop after athrow()`.
+    #
+    # Penyebab aslinya hilang total. Satu 403 dari penyedia LLM muncul sebagai
+    # RuntimeError yang tidak menyebut LLM sama sekali. Itu berlaku di semua
+    # node ter-trace, termasuk jalur chat orang tua yang sudah live.
+    #
+    # Sekarang: kegagalan INSTRUMENTASI tetap ditelan (span-nya None, node
+    # jalan terus), kegagalan BADAN diteruskan setelah span-nya ditutup.
+    try:
+        yield span
+    except BaseException:
+        if not cm.__exit__(*sys.exc_info()):
+            raise
+    else:
+        cm.__exit__(None, None, None)
 
 
 @asynccontextmanager
@@ -702,8 +731,22 @@ async def trace_generation(
         if model:
             kwargs["model"] = model
 
-        with langfuse.start_as_current_observation(**kwargs) as gen_span:
-            yield gen_span
+        cm = langfuse.start_as_current_observation(**kwargs)
+        gen_span = cm.__enter__()
     except Exception as e:
         logger.warning(f"trace_generation instrumentation failed for {name}: {e}")
+        cm = None
+
+    if cm is None:
         yield None
+        return
+
+    # Sama seperti `trace_node`: kegagalan instrumentasi ditelan, kegagalan
+    # badan blok diteruskan. Lihat catatan panjang di sana.
+    try:
+        yield gen_span
+    except BaseException:
+        if not cm.__exit__(*sys.exc_info()):
+            raise
+    else:
+        cm.__exit__(None, None, None)

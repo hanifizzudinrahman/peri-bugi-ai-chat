@@ -22,6 +22,17 @@ langchain-core==0.3.28
 langchain-community==0.3.13
 langchain-ollama==0.2.2
 langchain-google-genai==2.0.8
+# SDK Gemini modern — dipakai HANYA jalur Tanya Data Founder
+# (app/config/gemini_direct.py). Hidup berdampingan dengan
+# langchain-google-genai yang lama; namespace-nya berbeda.
+#
+# Alasannya: adaptor LangChain 2.0.8 tidak punya field model_kwargs dan
+# SDK lamanya tidak punya thinking_config, jadi kendali penalaran tidak
+# pernah sampai ke API. Terukur: 3.898 token/panggilan versus 790.
+# Memperbaikinya lewat LangChain menuntut langchain-core >= 1.5 —
+# upgrade seluruh tumpukan, dicatat sebagai utang di docs/OPEN_ITEMS.md.
+google-genai>=1.65.0,<3.0.0
+
 langchain-openai==0.2.14
 
 # PostgreSQL driver untuk LangGraph PostgresSaver
@@ -32,7 +43,12 @@ qdrant-client==1.12.1
 langchain-qdrant==0.2.0
 
 # HTTP client
-httpx==0.27.2
+# Dinaikkan dari 0.27.2 karena google-genai menuntut >=0.28.1 (SEMUA
+# versinya, termasuk seri 1.x). Permukaan pakainya di repo ini kecil dan
+# seluruhnya API yang tidak berubah di 0.28: AsyncClient, TimeoutException,
+# HTTPStatusError, RequestError. Yang berubah di 0.28 — pintasan `app=`,
+# `proxies=` — tidak dipakai di sini.
+httpx>=0.28.1,<1.0.0
 
 # PDF processing
 pypdf==5.1.0

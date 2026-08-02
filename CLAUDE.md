@@ -9,7 +9,9 @@ Dipanggil **hanya oleh `peri-bugi-api`**, tidak pernah langsung dari browser/mob
 ## Stack
 - **FastAPI** + Uvicorn, async, response **SSE streaming**
 - **LangGraph** — graph node/edge, checkpointer di PostgreSQL
-- **Gemini 2.5 Flash** sebagai LLM utama
+- **Gemini** sebagai LLM utama — model aktifnya dari `GEMINI_MODEL` di `.env`,
+  saat ini `gemini-3.1-flash-lite` (menang telak di perbandingan 2 Agustus 2026:
+  19/20 lawan 16/20 `gemini-3.6-flash`, separuh token, dua pertiga waktu)
 - **Qdrant** untuk knowledge base dental (RAG)
 - **Langfuse** untuk tracing LLM
 - Pydantic v2 · pytest (`asyncio_mode=auto`)
@@ -72,6 +74,53 @@ perilaku lama persis.
 
 Kalau menambah dataset, yang diedit **katalog di peri-bugi-api**, bukan prompt di
 sini. Eval: `evals/nl_query/run.py`. Selengkapnya: workspace `docs/TEXT2SQL.md`.
+
+## Tanya Data Founder (`/founder-analytics/stream`)
+Alur KEDUA di repo ini, **terpisah total** dari graph chat: endpoint sendiri,
+state sendiri, prompt sendiri, nol node dipakai bersama
+(`app/agents/founder_analytics/`). Bentuknya generator async, bukan
+`StateGraph` — pipanya lurus dengan satu simpul perbaikan, tanpa checkpointer,
+dan tiap langkah harus memancarkan event SSE saat itu juga.
+
+    plan -> sql -> exec -> (perbaiki, maks 3) -> chart -> jawab
+
+Model **tidak menulis Vega-Lite**, cuma niat berbatas (`ChartIntent`); server
+yang mengompilasinya, dan hasilnya tanpa `data`/`config`/`width` — ketiganya
+ditambahkan `peri-bugi-web` yang memang punya token brand.
+
+Kalau menambah node: `llm_call_logs` wajib tetap sampai ke event `done`, kalau
+tidak angka dashboard Pusat Biaya diam-diam mengecil. Selengkapnya: workspace
+`docs/FOUNDER_ANALYTICS.md`.
+
+### Dua jalur LLM di satu service — sengaja, sementara
+Jalur founder memanggil `app/config/gemini_direct.py` (SDK modern `google.genai`),
+bukan `get_llm()`. Alasannya: kendali `thinking` **tidak bisa** diungkapkan lewat
+`langchain-google-genai` 2.0.8 yang terpasang — `model_kwargs` dibuang diam-diam
+oleh pydantic (`extra="ignore"`) dan SDK lamanya tidak punya medan
+`thinking_config` sama sekali. Tanpa kendali itu, model keluarga Flash mencetak
+isi penalarannya ke dalam SQL sampai gagal di-parse.
+
+Aturannya: **`thinking_level` untuk Gemini 3.x, `thinking_budget` untuk 2.5,
+jangan pernah keduanya** (Google menjawab 400). Bagian jawaban bertanda `thought`
+dibuang di tingkat *part*.
+
+Node plan, sql, dan chart memakai **`response_schema`** (model Pydantic di
+`state.py`), jadi bentuk keluarannya dijamin di sisi Google — bukan diminta lewat
+prompt lalu ditebak parser. Kalau menambah node yang butuh keluaran terstruktur,
+pakai jalan yang sama; jangan menulis parser JSON baru.
+
+Tangga jalur-mundurnya berurutan dan urutannya penting: **skema dilepas duluan,
+kendali penalaran paling akhir**, baru `get_llm()`. Kehilangan kendali penalaran
+adalah kegagalan yang tidak kelihatan sampai tagihannya datang; bentuk keluaran
+yang longgar cuma menyulitkan parser.
+
+`gemini_direct.generate()` melempar `TeksTerpotong` kalau `finish_reason` =
+`MAX_TOKENS`. Jangan ditelan jadi string kosong — token penalaran memakan
+`max_output_tokens` yang sama, dan kalau disamarkan, sebabnya terbaca sebagai
+"model menolak menjawab" lalu orang mencari kekurangan di katalog.
+
+Jalur Tanya Peri **tidak** disentuh dan masih memakai LangChain. Penyatuannya
+menunggu upgrade tumpukan — utang tercatat di workspace `docs/OPEN_ITEMS.md`.
 
 ## Integrasi dengan Mata Peri
 Tool `analyze_chat_image` meneruskan foto ke `peri-bugi-ai-cv` lewat `peri-bugi-api`.
