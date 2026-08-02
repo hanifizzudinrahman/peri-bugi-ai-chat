@@ -24,6 +24,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
+from zoneinfo import ZoneInfo
 
 from app.agents.founder_analytics.chart_compile import ChartSkipped, compile_chart
 from app.agents.founder_analytics.prompts import (
@@ -60,6 +61,9 @@ _MAX_ROWS_TO_PROMPT = 50
 _catalog_cache: dict[str, Any] = {"at": 0.0, "data": None}
 
 _FENCE = re.compile(r"^\s*```(?:sql|json)?\s*|\s*```\s*$", re.I | re.M)
+
+#: Satu zona waktu untuk seluruh sistem — sama dengan view di skema `nlf`.
+_WIB = ZoneInfo("Asia/Jakarta")
 
 
 def _strip_fence(text: str) -> str:
@@ -196,9 +200,21 @@ async def node_plan(state: FounderAnalyticsState) -> None:
             )
 
 
+def _hari_ini_wib() -> str:
+    """Tanggal hari ini menurut WIB, untuk prompt.
+
+    Tanpa ini, "sejak Maret" dijawab dengan Maret tahun mana pun yang ada di
+    kepala model — terbukti menghasilkan tulang punggung tanggal yang mundur
+    dua tahun dan grafik berisi 27 baris nol. Model tidak punya jam.
+    """
+    return datetime.now(_WIB).strftime("%d %B %Y")
+
+
 async def node_sql(state: FounderAnalyticsState, *, attempt: int) -> str | None:
     """Tulis SQL. Percobaan >1 membawa pesan galat percobaan sebelumnya."""
-    system = SQL_SYSTEM.format(catalog=state.catalog_prompt)
+    system = SQL_SYSTEM.format(
+        catalog=state.catalog_prompt, today=_hari_ini_wib()
+    )
     user = state.question
     if state.time_hint:
         user += f"\n\n(rentang waktu yang diminta: {state.time_hint})"
@@ -314,7 +330,26 @@ def _sse(event: str, data: Any) -> str:
 
 
 async def run_founder_analytics(payload: dict) -> AsyncIterator[str]:
-    """Jalankan satu giliran, memancarkan event SSE sambil berjalan."""
+    """Jalankan satu giliran, memancarkan event SSE sambil berjalan.
+
+    Seluruh giliran dibungkus satu span induk. Tanpa itu, tiap panggilan LLM
+    membuat trace-nya sendiri di Langfuse dan satu pertanyaan tersebar jadi
+    lima trace terpisah — span-nya ada, tapi tidak bisa dibaca sebagai satu
+    cerita. Diperiksa dengan menanyakan Langfuse, bukan dengan membaca kode.
+    """
+    async with trace_node(
+        name="founder-analytics-turn",
+        input_data={
+            "question": (payload.get("question") or "")[:500],
+            "session_id": payload.get("session_id"),
+        },
+        metadata={"trace_id": payload.get("trace_id")},
+    ):
+        async for peristiwa in _jalankan(payload):
+            yield peristiwa
+
+
+async def _jalankan(payload: dict) -> AsyncIterator[str]:
     state = FounderAnalyticsState(
         question=(payload.get("question") or "").strip(),
         session_id=payload.get("session_id"),
@@ -448,8 +483,13 @@ async def run_founder_analytics(payload: dict) -> AsyncIterator[str]:
 
     if state.has_data:
         system = ANSWER_SYSTEM
+        # SQL-nya ikut, dan itu bukan hiasan: tanpa melihat filternya, model
+        # mengarang keterangan yang berlawanan dengan query-nya sendiri —
+        # terbukti menulis "termasuk akun uji internal" untuk query yang
+        # justru memuat `NOT is_internal`.
         user = (
             f"Pertanyaan: {state.question}\n\n"
+            f"Query yang dijalankan:\n{state.sql}\n\n"
             f"Hasil query ({state.row_count} baris"
             f"{', dipotong' if state.truncated else ''}):\n"
             f"{_table_for_prompt(state)}"
@@ -459,6 +499,8 @@ async def run_founder_analytics(payload: dict) -> AsyncIterator[str]:
         user = ANSWER_NO_DATA.format(reason=state.failure or "tidak diketahui")
 
     jawaban = ""
+    mulai_jawab = time.perf_counter()
+    pemakaian: dict = {}
     llm = get_llm(temperature=0.3, max_tokens=700, streaming=True)
     async with trace_generation(
         name="founder-answer",
@@ -479,6 +521,12 @@ async def run_founder_analytics(payload: dict) -> AsyncIterator[str]:
                 if bagian:
                     jawaban += bagian
                     yield _sse("token", bagian)
+                # Pemakaian token datang di potongan terakhir, bukan di
+                # tiap potongan. Kalau tidak dipungut di sini, panggilan
+                # terbesar di giliran ini hilang dari dashboard biaya.
+                meta_potongan = getattr(potongan, "usage_metadata", None)
+                if meta_potongan:
+                    pemakaian = meta_potongan
         except Exception as e:
             logger.exception("[founder_analytics] gagal menyusun jawaban: %s", e)
             if not jawaban:
@@ -489,6 +537,26 @@ async def run_founder_analytics(payload: dict) -> AsyncIterator[str]:
                 yield _sse("token", jawaban)
         if span:
             span.update(output=jawaban[:4000])
+
+    # Node jawaban memakai `astream`, bukan `_llm_text`, jadi ia tidak ikut
+    # tercatat otomatis. Sempat terlewat — dan yang terlewat justru panggilan
+    # paling besar di giliran ini. Ketahuan dari isi tabel llm_call_logs,
+    # bukan dari membaca kode.
+    state.llm_call_logs.append(
+        {
+            "prompt_key": "founder-answer",
+            "model": getattr(llm, "model", None)
+            or getattr(llm, "model_name", None)
+            or "unknown",
+            "provider": settings.LLM_PROVIDER,
+            "node": "founder-answer",
+            "input_tokens": pemakaian.get("input_tokens"),
+            "output_tokens": pemakaian.get("output_tokens"),
+            "total_tokens": pemakaian.get("total_tokens"),
+            "latency_ms": int((time.perf_counter() - mulai_jawab) * 1000),
+            "success": bool(jawaban),
+        }
+    )
 
     yield _sse(
         "meta",

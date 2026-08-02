@@ -24,14 +24,25 @@ cases:
       SELECT count(*) AS jumlah FROM nlf.v_user
       WHERE role_name = 'parent' AND NOT is_internal
 
+  # Pertanyaannya menyebut rentang SECARA EKSPLISIT. Versi pertama cuma bilang
+  # "per bulan", dan model — dengan benar — membuat tulang punggung tanggal
+  # sehingga bulan tanpa pendaftar muncul sebagai nol, sementara SQL emas cuma
+  # mengembalikan bulan yang ada isinya. Yang gagal waktu itu pertanyaannya,
+  # bukan modelnya.
   - id: akuisisi-tren-bulanan
-    question: "Tren pendaftaran orang tua per bulan"
+    question: "Tren pendaftaran orang tua per bulan, dari Maret 2026 sampai Agustus 2026, bulan tanpa pendaftar tampilkan sebagai nol"
     mode: exact
-    chart: bar
+    chart: line
     sql: >
-      SELECT to_char(registered_date_wib, 'YYYY-MM') AS bulan, count(*) AS pendaftar
-      FROM nlf.v_user WHERE role_name = 'parent' AND NOT is_internal
-      GROUP BY 1 ORDER BY 1
+      SELECT b::date AS bulan, COALESCE(p.pendaftar, 0) AS pendaftar
+      FROM generate_series('2026-03-01'::date, '2026-08-01'::date, '1 month') AS b
+      LEFT JOIN (
+        SELECT date_trunc('month', registered_date_wib)::date AS bulan,
+               count(*) AS pendaftar
+        FROM nlf.v_user WHERE role_name = 'parent' AND NOT is_internal
+        GROUP BY 1
+      ) p ON p.bulan = b::date
+      ORDER BY 1
 
   - id: akuisisi-onboarding
     question: "Berapa persen akun orang tua yang sudah menyelesaikan onboarding?"
@@ -42,12 +53,15 @@ cases:
       / NULLIF(count(*), 0), 1) AS persen
       FROM nlf.v_user WHERE role_name = 'parent' AND NOT is_internal
 
+  # `scalar` di sini bukan pelonggaran: yang ditanyakan SATU nama sekolah, dan
+  # sel pertama baris pertama persis itu. Model boleh menambah kolom kota atau
+  # jumlah anak tanpa dianggap salah, karena jawabannya tetap sama.
   - id: akuisisi-sekolah-teratas
-    question: "Sekolah mana yang paling banyak anaknya?"
-    mode: exact
+    question: "Sekolah mana yang paling banyak anaknya? Urutkan dari terbanyak."
+    mode: scalar
     chart: bar
     sql: >
-      SELECT school_name, child_count FROM nlf.v_school
+      SELECT school_name FROM nlf.v_school
       WHERE child_count > 0 ORDER BY child_count DESC, school_name
 
   - id: akuisisi-sebaran-umur
@@ -70,8 +84,11 @@ cases:
       SELECT count(*) AS belum_pernah FROM nlf.v_brushing_streak
       WHERE NOT has_ever_brushed
 
+  # Rentangnya ABSOLUT. "30 hari terakhir" bisa dibaca dua cara — termasuk hari
+  # ini atau tidak — dan meleset satu hari bukan kesalahan yang layak dihitung
+  # sebagai jawaban salah.
   - id: retensi-kepatuhan-30-hari
-    question: "Kepatuhan sikat gigi 30 hari terakhir, seluruh pengguna, per hari"
+    question: "Kepatuhan sikat gigi per hari, dari 1 Juli 2026 sampai 31 Juli 2026, seluruh pengguna"
     mode: exact
     chart: line
     sql: >
@@ -79,16 +96,19 @@ cases:
              round(100.0 * count(*) FILTER (WHERE is_brushed)
              / NULLIF(count(*), 0), 1) AS persen_patuh
       FROM nlf.v_brushing_daily_recent
-      WHERE log_date >= CURRENT_DATE - 30 GROUP BY 1 ORDER BY 1
+      WHERE log_date BETWEEN '2026-07-01' AND '2026-07-31'
+      GROUP BY 1 ORDER BY 1
 
+  # `scalar` dengan urutan yang ditentukan pertanyaannya: sel pertama = slot
+  # yang paling sering terlewat, dan itu memang jawaban yang diminta.
   - id: retensi-pagi-vs-malam
-    question: "Pagi atau malam yang lebih sering terlewat, seluruh pengguna?"
-    mode: exact
+    question: "Pagi atau malam yang lebih sering terlewat sepanjang Juli 2026? Urutkan dari yang paling sering terlewat."
+    mode: scalar
     chart: bar
     sql: >
-      SELECT slot, count(*) FILTER (WHERE NOT is_brushed) AS terlewat
-      FROM nlf.v_brushing_daily_recent
-      WHERE log_date >= CURRENT_DATE - 30 GROUP BY slot ORDER BY slot
+      SELECT slot FROM nlf.v_brushing_daily_recent
+      WHERE log_date BETWEEN '2026-07-01' AND '2026-07-31'
+      GROUP BY slot ORDER BY count(*) FILTER (WHERE NOT is_brushed) DESC
 
   # ── Mata Peri ───────────────────────────────────────────────────────────
   - id: mata-peri-persen-gagal
@@ -101,13 +121,21 @@ cases:
       FROM nlf.v_mata_peri_scan
       WHERE created_date_wib >= date_trunc('month', CURRENT_DATE)::date
 
+  # Sama seperti tren bulanan: rentang absolut, dan hari tanpa scan HARUS
+  # muncul sebagai nol. Tanpa itu grafiknya berbohong — hari kosong hilang
+  # alih-alih terlihat kosong.
   - id: mata-peri-tren-harian
-    question: "Tren jumlah scan per hari 30 hari terakhir"
+    question: "Tren jumlah scan Mata Peri per hari, dari 1 Juli 2026 sampai 31 Juli 2026, hari tanpa scan tampilkan sebagai nol"
     mode: exact
     chart: line
     sql: >
-      SELECT created_date_wib, count(*) AS sesi FROM nlf.v_mata_peri_scan
-      WHERE created_date_wib >= CURRENT_DATE - 30 GROUP BY 1 ORDER BY 1
+      SELECT d::date AS tanggal, COALESCE(s.sesi, 0) AS sesi
+      FROM generate_series('2026-07-01'::date, '2026-07-31'::date, '1 day') AS d
+      LEFT JOIN (
+        SELECT created_date_wib, count(*) AS sesi FROM nlf.v_mata_peri_scan
+        GROUP BY 1
+      ) s ON s.created_date_wib = d::date
+      ORDER BY 1
 
   - id: mata-peri-durasi-per-model
     question: "Rata-rata durasi analisa per versi model"
@@ -139,14 +167,16 @@ cases:
       WHERE lead_time_days >= 0 AND NOT is_reschedule
 
   # ── Cerita Peri ─────────────────────────────────────────────────────────
+  # Kolomnya disebut eksplisit supaya model tidak dianggap salah cuma karena
+  # menambahkan judul modul sebagai konteks.
   - id: cerita-corong-modul
-    question: "Corong penyelesaian modul Cerita Peri"
+    question: "Corong penyelesaian modul Cerita Peri: nomor modul, jumlah yang mulai, dan jumlah yang selesai. Hanya tiga kolom itu."
     mode: exact
     chart: bar
     sql: >
       SELECT module_id,
-             count(*) FILTER (WHERE completed_at IS NOT NULL) AS selesai,
-             count(*) AS mulai
+             count(started_at) AS mulai,
+             count(completed_at) AS selesai
       FROM nlf.v_cerita_progress GROUP BY 1 ORDER BY 1
 
   # ── Tanya Peri ──────────────────────────────────────────────────────────

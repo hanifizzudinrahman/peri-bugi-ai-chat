@@ -169,7 +169,14 @@ async def fase_keamanan(client: httpx.AsyncClient) -> list[Hasil]:
 
 async def tanya(client: httpx.AsyncClient, pertanyaan: str) -> dict:
     """Kirim satu pertanyaan, kumpulkan SQL, grafik, dan jawabannya."""
-    keluar = {"sql": None, "chart": None, "jawaban": "", "meta": {}, "pii": []}
+    keluar = {
+        "sql": None,
+        "chart": None,
+        "jawaban": "",
+        "meta": {},
+        "pii": [],
+        "row_count": 0,
+    }
 
     async with client.stream(
         "POST",
@@ -197,15 +204,32 @@ async def tanya(client: httpx.AsyncClient, pertanyaan: str) -> dict:
                 keluar["jawaban"] += d or ""
             elif t == "data":
                 keluar["pii"] = (d or {}).get("pii_datasets") or []
+                keluar["row_count"] = int((d or {}).get("row_count") or 0)
             elif t == "meta":
                 keluar["meta"] = d or {}
     return keluar
 
 
-def nilai_grafik(diharapkan: str, spec: dict | None) -> tuple[bool, str]:
+#: Di bawah ini grafik memang TIDAK boleh digambar — satu titik bukan tren,
+#: satu batang bukan perbandingan. Sama dengan `MIN_BARIS` di `chart_compile`.
+MIN_BARIS_GRAFIK = 2
+
+
+def nilai_grafik(
+    diharapkan: str, spec: dict | None, jumlah_baris: int
+) -> tuple[bool, str]:
     ada = spec is not None
     if diharapkan == "none":
         return (not ada), "tidak digambar" if not ada else "digambar padahal tidak perlu"
+
+    # `chart` di golden.yaml menyatakan bentuk yang MASUK AKAL untuk pertanyaan
+    # itu — tapi apakah grafiknya layak digambar sama sekali bergantung pada
+    # data yang kebetulan ada. Di lingkungan dengan satu sekolah dan satu
+    # fasilitas, penjaga menolak menggambar, dan itu perilaku yang BENAR.
+    # Menghitungnya gagal berarti menghukum penjaga karena bekerja.
+    if not ada and jumlah_baris < MIN_BARIS_GRAFIK:
+        return True, f"tidak digambar — cuma {jumlah_baris} baris, memang tidak layak"
+
     if not ada:
         return False, "tidak digambar padahal seharusnya"
     mark = spec.get("mark")
@@ -240,7 +264,9 @@ async def fase_akurasi(client: httpx.AsyncClient) -> tuple[list[Hasil], list[Has
         akurasi.append(Hasil(kasus["id"], lulus, catatan))
         print(f"  {'OK  ' if lulus else 'GAGAL'} {kasus['id']:34} {catatan}")
 
-        g_lulus, g_catatan = nilai_grafik(kasus.get("chart", "none"), jawaban["chart"])
+        g_lulus, g_catatan = nilai_grafik(
+            kasus.get("chart", "none"), jawaban["chart"], jawaban["row_count"]
+        )
         grafik.append(Hasil(kasus["id"], g_lulus, g_catatan))
 
         if kasus.get("expect_pii"):
@@ -313,6 +339,15 @@ async def main(skip_chat: bool) -> int:
     ):
         lulus = sum(1 for h in daftar if h.lulus)
         print(f"  {nama:9} {lulus}/{len(daftar)}")
+
+    # Angka ringkasan tanpa daftar yang gagal tidak bisa ditindaklanjuti —
+    # "16/19" tidak memberi tahu grafik mana yang perlu diperbaiki.
+    for nama, daftar in (("akurasi", laporan.akurasi), ("grafik", laporan.grafik)):
+        gagal = [h for h in daftar if not h.lulus]
+        if gagal:
+            print(f"\n  {nama} yang gagal:")
+            for h in gagal:
+                print(f"    - {h.id}: {h.catatan}")
 
     if laporan.gaps:
         print("\n  celah yang diketahui (diukur, tidak dihitung):")
