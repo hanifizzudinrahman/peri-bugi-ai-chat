@@ -102,7 +102,22 @@ isi penalarannya ke dalam SQL sampai gagal di-parse.
 
 Aturannya: **`thinking_level` untuk Gemini 3.x, `thinking_budget` untuk 2.5,
 jangan pernah keduanya** (Google menjawab 400). Bagian jawaban bertanda `thought`
-dibuang di tingkat *part*. Kalau apa pun gagal, jatuh kembali ke `get_llm()`.
+dibuang di tingkat *part*.
+
+Node plan, sql, dan chart memakai **`response_schema`** (model Pydantic di
+`state.py`), jadi bentuk keluarannya dijamin di sisi Google — bukan diminta lewat
+prompt lalu ditebak parser. Kalau menambah node yang butuh keluaran terstruktur,
+pakai jalan yang sama; jangan menulis parser JSON baru.
+
+Tangga jalur-mundurnya berurutan dan urutannya penting: **skema dilepas duluan,
+kendali penalaran paling akhir**, baru `get_llm()`. Kehilangan kendali penalaran
+adalah kegagalan yang tidak kelihatan sampai tagihannya datang; bentuk keluaran
+yang longgar cuma menyulitkan parser.
+
+`gemini_direct.generate()` melempar `TeksTerpotong` kalau `finish_reason` =
+`MAX_TOKENS`. Jangan ditelan jadi string kosong — token penalaran memakan
+`max_output_tokens` yang sama, dan kalau disamarkan, sebabnya terbaca sebagai
+"model menolak menjawab" lalu orang mencari kekurangan di katalog.
 
 Jalur Tanya Peri **tidak** disentuh dan masih memakai LangChain. Penyatuannya
 menunggu upgrade tumpukan — utang tercatat di workspace `docs/OPEN_ITEMS.md`.

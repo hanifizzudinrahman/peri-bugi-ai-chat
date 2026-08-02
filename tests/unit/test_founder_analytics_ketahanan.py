@@ -301,6 +301,69 @@ class TestTanggaJalurMundur:
 
 
 # =============================================================================
+# Pembanding eval — aturannya menentukan vonis tentang model
+# =============================================================================
+
+
+def _run_py():
+    """Muat harness eval sebagai modul. Ia di luar paket `app`.
+
+    Didaftarkan ke `sys.modules` SEBELUM di-exec: `@dataclass` mencari modul
+    kelasnya di sana, dan tanpa itu gagal dengan
+    `'NoneType' object has no attribute '__dict__'` yang tidak menyebut-nyebut
+    sys.modules sama sekali.
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    if "eval_run" in sys.modules:
+        return sys.modules["eval_run"]
+
+    p = Path(__file__).resolve().parents[2] / "evals" / "founder_analytics" / "run.py"
+    spec = importlib.util.spec_from_file_location("eval_run", p)
+    modul = importlib.util.module_from_spec(spec)
+    sys.modules["eval_run"] = modul
+    spec.loader.exec_module(modul)
+    return modul
+
+
+class TestPenyamaanTanggal:
+    """`2026-07-01` dan `2026-07-01T00:00:00+00:00` adalah tanggal yang SAMA.
+
+    Model yang menulis `generate_series(...)` tanpa `::date` menghasilkan kolom
+    timestamptz dengan isi yang identik sampai desimal terakhir. Sebelum aturan
+    ini ada, itu dihitung 31 baris salah dan terbaca sebagai "modelnya kurang
+    akurat" — padahal angkanya sama persis.
+    """
+
+    def test_tengah_malam_utc_disamakan_dengan_tanggal(self):
+        r = _run_py()
+        emas = [["2026-07-01", 5.0], ["2026-07-02", 2.5]]
+        model = [["2026-07-01T00:00:00+00:00", 5.0], ["2026-07-02T00:00:00Z", 2.5]]
+        assert r._normalkan(emas) == r._normalkan(model)
+
+    def test_jam_selain_tengah_malam_TETAP_dianggap_beda(self):
+        """Sengaja sempit. Jam berapa pun selain 00:00:00 memang informasi lain."""
+        r = _run_py()
+        assert r._normalkan([["2026-07-01", 1]]) != r._normalkan(
+            [["2026-07-01T07:00:00+00:00", 1]]
+        )
+
+    def test_nilai_beda_tetap_beda_walau_tanggalnya_disamakan(self):
+        r = _run_py()
+        assert r._normalkan([["2026-07-01", 5.0]]) != r._normalkan(
+            [["2026-07-01T00:00:00+00:00", 6.0]]
+        )
+
+    def test_beda_baris_menunjukkan_sisi_mana_yang_kelebihan(self):
+        r = _run_py()
+        beda = r._beda_baris([["a", 1], ["b", 2]], [["a", 1], ["c", 3]])
+        assert beda["hanya_emas"] == [["b", 2]]
+        assert beda["hanya_model"] == [["c", 3]]
+
+
+# =============================================================================
 # Konfigurasi yang dikirim ke Google
 # =============================================================================
 

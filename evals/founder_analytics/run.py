@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -99,12 +100,33 @@ def _satu_baris(sql: str, batas: int = 220) -> str:
     return rapat if len(rapat) <= batas else rapat[: batas - 1] + "…"
 
 
+#: Tanggal yang pulang sebagai timestamp tengah malam UTC. Terjadi saat model
+#: memakai `generate_series` tanpa `::date` — kolomnya jadi timestamptz, isinya
+#: tetap tanggal yang sama.
+_TENGAH_MALAM = re.compile(r"^(\d{4}-\d{2}-\d{2})T00:00:00(\+00:00|Z)?$")
+
+
 def _normalkan(baris: list) -> list:
-    """Urutkan dan bulatkan supaya beda gaya query tidak dihitung beda hasil."""
+    """Urutkan dan bulatkan supaya beda gaya query tidak dihitung beda hasil.
+
+    Termasuk menyamakan `2026-07-01T00:00:00+00:00` dengan `2026-07-01`.
+    Keduanya tanggal yang SAMA — yang berbeda cuma tipe kolomnya, dan itu
+    urusan gaya query, bukan kebenaran jawaban. Tanpa ini, model yang menulis
+    `generate_series(...)` tanpa `::date` kehilangan poin untuk 31 baris yang
+    angkanya identik sampai desimal terakhir. Itu pernah terjadi dan sempat
+    terbaca sebagai "modelnya kurang akurat".
+
+    Sengaja sempit: HANYA tengah malam UTC persis. Jam berapa pun selain itu
+    memang informasi yang berbeda dan tetap dihitung berbeda.
+    """
 
     def sel(v):
         if isinstance(v, float):
             return round(v, 4)
+        if isinstance(v, str):
+            cocok = _TENGAH_MALAM.match(v)
+            if cocok:
+                return cocok.group(1)
         return v
 
     return sorted(
