@@ -316,10 +316,18 @@ async def chat_stream(request: ChatRequest, x_internal_secret: str | None = Head
 class FounderAnalyticsRequest(BaseModel):
     """Payload jalur founder.
 
-    Tidak ada `allowed_agents`, `prompts`, atau `response_mode` di sini — jalur
-    ini tidak punya pemilihan tool maupun mode jawaban. Otoritas siapa yang
-    boleh memanggilnya ada di peri-bugi-api (role founder + feature flag);
-    service ini cuma memastikan pemanggilnya membawa internal secret.
+    Tidak ada `allowed_agents` atau `prompts` di sini — jalur ini tidak punya
+    pemilihan tool. Otoritas siapa yang boleh memanggilnya ada di peri-bugi-api
+    (role founder + feature flag); service ini cuma memastikan pemanggilnya
+    membawa internal secret.
+
+    `response_mode` dan `allow_dashboard` datang sebagai FAKTA, bukan sebagai
+    permintaan yang dinilai di sini. Keduanya diputuskan peri-bugi-api — ia yang
+    memegang sesi, feature flag, dan Redis. Service ini jalan multi-instance dan
+    tidak boleh menyimpan kebijakan apa pun.
+
+    (Docstring versi sebelumnya menyatakan jalur ini "tidak punya mode jawaban".
+    Itu benar sampai 7 Agustus 2026.)
     """
 
     question: str = Field(min_length=1, max_length=2000)
@@ -327,6 +335,8 @@ class FounderAnalyticsRequest(BaseModel):
     founder_user_id: Optional[str] = None
     history: list[dict] = Field(default_factory=list)
     trace_id: Optional[str] = None
+    response_mode: str = "medium"  # simple | medium | detailed
+    allow_dashboard: bool = False
 
 
 @app.post("/founder-analytics/stream")

@@ -118,6 +118,62 @@ class Settings(BaseSettings):
     #: Berapa kali SQL yang gagal boleh diperbaiki dalam satu giliran.
     FOUNDER_SQL_MAX_ATTEMPTS: int = 3
 
+    #: Berapa giliran terakhir yang dirender ke prompt penulis-ulang pertanyaan.
+    #: Kecil dengan sengaja: yang dibutuhkan cuma antecedent terdekat ("bulan
+    #: itu", "yang tadi"), dan riwayat panjang justru membuat model menggabung
+    #: dua pertanyaan lama jadi satu pertanyaan yang tidak pernah diajukan.
+    FOUNDER_REWRITE_HISTORY_TURNS: int = 3
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # LLM penulis kode dasbor (7 Agustus 2026)
+    #
+    # Penyedia KEDUA, terpisah dari `GEMINI_*` di atas, dan pemisahannya bukan
+    # soal kerapian: kunci API-nya beda, modelnya beda (penulis kode, bukan
+    # penulis SQL), anggaran keluarannya sepuluh kali lipat, dan kalau salah
+    # satunya kena batas kuota, yang lain harus tetap jalan.
+    #
+    # `CODER_LLM_BASE_URL` yang membuat DeepSeek, GLM, Moonshot, dan OpenRouter
+    # bisa dipakai nanti tanpa menyentuh kode — semuanya berbicara
+    # `/v1/chat/completions` yang sama.
+    # ─────────────────────────────────────────────────────────────────────────
+    CODER_LLM_PROVIDER: str = "gemini"  # gemini | anthropic | openai
+
+    #: Diuji 7 Agustus 2026 dengan pertanyaan dan data yang sama, tiga mode:
+    #:
+    #:   gemini-3.6-flash        ~12 dtk, murah — tapi satu dari tiga keluaran
+    #:                           merujuk variabel yang tidak pernah ia buat
+    #:                           (`proxyKpis is not defined`), dan dasbornya
+    #:                           gagal seluruhnya.
+    #:   gemini-3.1-pro-preview  ~30 dtk — deret KPI, dua grafik, dan insight
+    #:                           lengkap di ketiga mode, nol galat.
+    #:
+    #: Dipilih yang Pro. Selisih waktunya tidak terasa karena node dasbor jalan
+    #: SETELAH jawaban selesai di-stream — founder sudah membaca jawabannya dan
+    #: sedang melihat tabel. Yang terasa adalah dasbor yang gagal.
+    #:
+    #: Catatan yang perlu diingat: dokumen Google justru menyebut 3.6-flash
+    #: unggul di "code generation". Untuk beban kerja ini, di prompt ini,
+    #: pengukuran berkata lain.
+    CODER_LLM_MODEL: str = ""
+    CODER_LLM_API_KEY: str = ""
+    CODER_LLM_BASE_URL: str = ""  # kosong = bawaan penyedia
+
+    #: `schema` = JSON Schema ketat (OpenAI resmi). `object` = mode JSON longgar,
+    #: yang didukung hampir semua endpoint OpenAI-compatible. Satu env var ini
+    #: yang membedakan keduanya; sisa modulnya identik.
+    CODER_LLM_JSON_MODE: str = "schema"  # schema | object
+
+    CODER_LLM_TEMPERATURE: float = 0.2
+    CODER_LLM_MAX_OUTPUT_TOKENS: int = 8000
+    CODER_LLM_TIMEOUT_SECONDS: int = 90
+
+    #: SENGAJA tidak dipaku MINIMAL seperti jalur SQL. `DEFAULT_THINKING_LEVEL`
+    #: di `gemini_direct.py` ada karena token penalaran bocor ke dalam SQL.
+    #: Menulis kode adalah satu-satunya beban kerja di sini yang benar-benar
+    #: diuntungkan penalaran — memaksanya minimal berarti membayar model bagus
+    #: lalu melarangnya berpikir.
+    CODER_LLM_THINKING_LEVEL: str = "LOW"
+
     # ─────────────────────────────────────────────────────────────────────────
     # Langfuse Observability (optional)
     # Pattern 1+2: graceful degradation + explicit toggle.
@@ -129,9 +185,15 @@ class Settings(BaseSettings):
     LANGFUSE_SECRET_KEY: str = ""
     LANGFUSE_HOST: str = "http://langfuse-web:3000"  # internal Docker network
 
+    # Daftar ini adalah ALLOWLIST NAMA MEDAN, bukan aturan umum. Medan baru yang
+    # membawa rahasia atau URL dan lupa ditambahkan di sini tidak dibersihkan —
+    # dan spasi atau baris baru yang ikut tertempel dari `.env` atau dari mount
+    # Secret Manager menghasilkan 401 yang terbaca seperti "penyedia menolak
+    # kita", bukan seperti "kuncinya kotor". Itu satu jam yang terbuang.
     @field_validator("INTERNAL_SECRET", "GEMINI_API_KEY", "OPENAI_API_KEY",
                      "QDRANT_API_KEY", "DB_PASSWORD",
-                     "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST")
+                     "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_HOST",
+                     "CODER_LLM_API_KEY", "CODER_LLM_BASE_URL", "CODER_LLM_MODEL")
     @classmethod
     def strip_secrets(cls, v: str) -> str:
         return v.strip() if isinstance(v, str) else v
