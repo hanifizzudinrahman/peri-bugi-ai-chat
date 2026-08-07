@@ -852,7 +852,9 @@ async def node_dashboard(state: FounderAnalyticsState) -> None:
         # kurung yang tidak seimbang berarti mengulang persis kelas kesalahan
         # yang percobaan kedua memang sering betulkan.
         pesan_ulang = "Tulis dasbornya."
+        percobaan_terbuang: list[coder_llm.HasilKode] = []
         for percobaan in (1, 2):
+            mulai_percobaan = time.perf_counter()
             try:
                 hasil = await coder_llm.generate_dashboard(
                     system=system,
@@ -885,6 +887,14 @@ async def node_dashboard(state: FounderAnalyticsState) -> None:
             logger.info(
                 "[founder_dashboard] kode cacat (%s) — mengulang sekali", cacat
             )
+            # Percobaan yang dibuang tetap DIBAYAR. Tanpa dicatat, tokennya
+            # tidak muncul di mana pun dan Pusat Biaya melaporkan satu dasbor
+            # seharga satu panggilan padahal harganya dua.
+            hasil.catatan.append(f"dibuang: {cacat}")
+            hasil.__dict__["_latency_ms"] = int(
+                (time.perf_counter() - mulai_percobaan) * 1000
+            )
+            percobaan_terbuang.append(hasil)
             pesan_ulang = (
                 "Kode JavaScript yang barusan kamu tulis TIDAK BISA DI-PARSE: "
                 f"{cacat}. Tulis ulang seluruh dasbornya. Sederhanakan "
@@ -931,18 +941,39 @@ async def node_dashboard(state: FounderAnalyticsState) -> None:
     # `provider` diisi penyedia KODER, bukan `settings.LLM_PROVIDER`. Menyalin
     # yang salah berarti pengeluaran Anthropic tercatat sebagai Gemini: angkanya
     # tetap masuk akal, cuma di kolom yang keliru, dan nol orang akan curiga.
-    state.llm_call_logs.append(
-        {
+    def _baris_log(h: coder_llm.HasilKode, *, ms: int, ok: bool) -> dict:
+        return {
             "prompt_key": "founder-dashboard",
-            "model": hasil.model,
-            "provider": hasil.provider or coder_llm.penyedia(),
+            "model": h.model,
+            "provider": h.provider or coder_llm.penyedia(),
             "node": "founder-dashboard",
-            "input_tokens": hasil.input_tokens,
-            "output_tokens": hasil.output_tokens,
-            "total_tokens": (hasil.input_tokens or 0) + (hasil.output_tokens or 0),
-            "latency_ms": int((time.perf_counter() - mulai) * 1000),
-            "success": hasil.spec is not None,
+            "input_tokens": h.input_tokens,
+            "output_tokens": h.output_tokens,
+            "total_tokens": (h.input_tokens or 0) + (h.output_tokens or 0),
+            "latency_ms": ms,
+            "success": ok,
+            "error_message": "; ".join(h.catatan)[:400] or None,
         }
+
+    # Percobaan yang dibuang dicatat DULU, dan `success=False`. Satu dasbor yang
+    # butuh dua panggilan harus terbaca sebagai dua panggilan di Pusat Biaya —
+    # kalau tidak, biaya sebenarnya per dasbor tidak akan pernah ketahuan, dan
+    # justru itu angka yang menentukan model mana yang layak dipakai.
+    for terbuang in percobaan_terbuang:
+        state.llm_call_logs.append(
+            _baris_log(
+                terbuang,
+                ms=int(terbuang.__dict__.get("_latency_ms") or 0),
+                ok=False,
+            )
+        )
+
+    state.llm_call_logs.append(
+        _baris_log(
+            hasil,
+            ms=int((time.perf_counter() - mulai) * 1000),
+            ok=hasil.spec is not None,
+        )
     )
 
 
