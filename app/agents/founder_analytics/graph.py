@@ -694,6 +694,58 @@ def _mode_dasbor(state: FounderAnalyticsState) -> str | None:
     return _URUTAN_MODE[min(batas, minta)]
 
 
+def _pembatas_seimbang(js: str) -> str | None:
+    """Cek kasar keseimbangan kurung di kode model. BUKAN parser.
+
+    Harus disebut apa adanya: ini tidak memvalidasi JavaScript. Ia cuma
+    menghitung `()`, `{}`, `[]` di luar string dan komentar. Kode yang lolos di
+    sini masih bisa gagal di-parse browser.
+
+    Alasannya tetap ada: kegagalan yang benar-benar terjadi berbunyi
+    `Unexpected token ')'` — kurung yang tidak seimbang, dan itu justru yang
+    bisa ditangkap tanpa parser. Container ini tidak punya Node maupun pustaka
+    parser JS, dan menambahkannya demi satu pemeriksaan tidak sepadan.
+
+    Yang tertangkap di sini dipakai untuk MENGULANG SEKALI, bukan untuk
+    menolak. Kalau percobaan kedua juga bermasalah, dasbornya dilepas dan
+    grafik biasa yang tampil.
+    """
+    pasangan = {")": "(", "]": "[", "}": "{"}
+    tumpuk: list[str] = []
+    i = 0
+    n = len(js)
+    while i < n:
+        c = js[i]
+        # Lewati string dan komentar — kurung di dalamnya bukan struktur.
+        if c in "\"'`":
+            kutip = c
+            i += 1
+            while i < n:
+                if js[i] == "\\":
+                    i += 2
+                    continue
+                if js[i] == kutip:
+                    break
+                i += 1
+        elif c == "/" and i + 1 < n and js[i + 1] == "/":
+            while i < n and js[i] != "\n":
+                i += 1
+        elif c == "/" and i + 1 < n and js[i + 1] == "*":
+            akhir = js.find("*/", i + 2)
+            i = akhir + 1 if akhir != -1 else n
+        elif c in "([{":
+            tumpuk.append(c)
+        elif c in ")]}":
+            if not tumpuk or tumpuk[-1] != pasangan[c]:
+                return f"kurung tidak seimbang di sekitar posisi {i}"
+            tumpuk.pop()
+        i += 1
+
+    if tumpuk:
+        return f"{len(tumpuk)} kurung tidak ditutup"
+    return None
+
+
 def _ringkasan_kolom(state: FounderAnalyticsState) -> str:
     """Statistik per kolom angka, DIHITUNG DI SINI dari seluruh baris.
 
@@ -791,19 +843,55 @@ async def node_dashboard(state: FounderAnalyticsState) -> None:
             "row_count": state.row_count,
         },
     ) as span:
-        try:
-            hasil = await coder_llm.generate_dashboard(
-                system=system,
-                user="Tulis dasbornya.",
-                schema_model=DashboardSpec,
+        # Satu percobaan ulang, DAN HANYA kalau kurungnya tidak seimbang.
+        #
+        # Model tier tengah sesekali menghasilkan JS yang tidak bisa di-parse
+        # (`Unexpected token ')'`), dan biayanya menjadi dasbor yang dibayar
+        # lalu dibuang. Mengulang buta setiap kegagalan berarti membayar dua
+        # kali untuk masalah yang tidak selalu bisa diperbaiki; mengulang untuk
+        # kurung yang tidak seimbang berarti mengulang persis kelas kesalahan
+        # yang percobaan kedua memang sering betulkan.
+        pesan_ulang = "Tulis dasbornya."
+        for percobaan in (1, 2):
+            try:
+                hasil = await coder_llm.generate_dashboard(
+                    system=system,
+                    user=pesan_ulang,
+                    schema_model=DashboardSpec,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[founder_dashboard] penyedia gagal (%s): %s",
+                    coder_llm.penyedia(),
+                    str(e)[:300],
+                )
+                state.dashboard_skipped_reason = (
+                    "penulis dasbor sedang tidak tersedia"
+                )
+                break
+
+            cacat = (
+                _pembatas_seimbang(str((hasil.spec or {}).get("js") or ""))
+                if hasil.spec
+                else None
             )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "[founder_dashboard] penyedia gagal (%s): %s",
-                coder_llm.penyedia(),
-                str(e)[:300],
+            if not cacat or percobaan == 2:
+                if cacat:
+                    logger.warning(
+                        "[founder_dashboard] percobaan kedua masih cacat: %s", cacat
+                    )
+                break
+
+            logger.info(
+                "[founder_dashboard] kode cacat (%s) — mengulang sekali", cacat
             )
-            state.dashboard_skipped_reason = "penulis dasbor sedang tidak tersedia"
+            pesan_ulang = (
+                "Kode JavaScript yang barusan kamu tulis TIDAK BISA DI-PARSE: "
+                f"{cacat}. Tulis ulang seluruh dasbornya. Sederhanakan "
+                "JavaScript-nya: hindari template literal bersarang, hindari "
+                "rantai pemanggilan yang panjang dalam satu baris, dan tutup "
+                "setiap kurung yang kamu buka."
+            )
 
         if hasil and span:
             span.update(

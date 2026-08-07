@@ -478,6 +478,22 @@ Dasbornya dirasterisasi jadi PNG lewat <foreignObject>, dan itu memaksa:
 - Nol `overflow-x` yang menyembunyikan; kalau ada tabel lebar, bungkus tabelnya
   saja dengan `overflow-x:auto`.
 
+═══ JAGA JAVASCRIPT-MU BISA DI-PARSE ═══
+
+Ini bukan saran gaya. Kode yang tidak bisa di-parse membuat SELURUH dasbor
+hilang, dan founder tidak melihat apa pun kecuali grafik biasa.
+
+- Tulis pernyataan pendek, satu per baris. Jangan merangkai `.map().filter()
+  .join()` panjang dalam satu baris.
+- Hindari template literal BERSARANG (backtick di dalam backtick). Kalau butuh
+  menyusun HTML, pakai penggabungan string biasa atau
+  `document.createElement`.
+- Hitung kurungmu. Kesalahan yang paling sering terjadi adalah `)` atau `}`
+  yang kurang di akhir blok panjang.
+- Jangan memakai sintaks yang perlu transpilasi. Ini dijalankan apa adanya di
+  browser modern — `const`, arrow function, dan template literal sederhana
+  aman; selebihnya tidak perlu.
+
 ═══ YANG TIDAK AKAN JALAN, DAN AKAN MEMBATALKAN DASBORMU ═══
 
 `fetch`, XMLHttpRequest, WebSocket, EventSource, sendBeacon, `import()`,
@@ -485,6 +501,8 @@ Dasbornya dirasterisasi jadi PNG lewat <foreignObject>, dan itu memaksa:
 `src`/`href` apa pun selain `#`, `document.cookie`, `localStorage`,
 `window.parent`, `setInterval`, dan URL literal di mana pun — termasuk di
 dalam CSS.
+
+═══ DATA ═══
 
 KOLOM YANG TERSEDIA:
 {columns}
