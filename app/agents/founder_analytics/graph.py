@@ -29,21 +29,28 @@ from zoneinfo import ZoneInfo
 from app.agents.founder_analytics.chart_compile import ChartSkipped, compile_chart
 from app.agents.founder_analytics.prompts import (
     ANSWER_NO_DATA,
+    ANSWER_RIWAYAT,
     ANSWER_SYSTEM,
+    ATURAN_MODE_DASBOR,
     CHART_SYSTEM,
+    DASHBOARD_SYSTEM,
+    PANJANG_JAWABAN,
     PLAN_SYSTEM,
+    REWRITE_SYSTEM,
     SQL_REPAIR_SUFFIX,
     SQL_SYSTEM,
 )
 from app.agents.founder_analytics.state import (
     ChartIntent,
+    DashboardSpec,
     FounderAnalyticsState,
     KeluaranSQL,
+    PertanyaanMandiri,
     RencanaKueri,
     SqlAttempt,
 )
 from app.agents.tools._http import call_internal_get, call_internal_post
-from app.config import gemini_direct
+from app.config import coder_llm, gemini_direct
 from app.config.llm import get_llm
 from app.config.observability import trace_generation, trace_node
 from app.config.settings import settings
@@ -58,6 +65,29 @@ _EXECUTE_PATH = "/api/v1/internal/agent/founder-query/execute"
 #: ikut terunduh. Daftar panjang membuat model memungut satu-dua baris yang
 #: menarik dan menceritakannya seolah mewakili keseluruhan.
 _MAX_ROWS_TO_PROMPT = 50
+
+#: Baris yang dikirim ke jawaban, per mode. Mode `detailed` boleh melihat lebih
+#: banyak karena ia memang diminta menyebut pola, bukan cuma angka utamanya.
+_BARIS_JAWABAN = {"simple": 20, "medium": 50, "detailed": 100}
+
+#: Anggaran token jawaban, per mode. Dulu dipaku 700 untuk semua.
+_TOKEN_JAWABAN = {"simple": 400, "medium": 700, "detailed": 1600}
+
+#: Baris contoh yang dilihat penulis dasbor. HARUS sama dengan `BARIS_CONTOH` di
+#: `peri-bugi-api/app/services/founder_analytics/dashboard_guard.py` — kalau di
+#: sini lebih banyak, pemeriksaan data-tertanam di sana akan menuduh model
+#: menanam data yang sebenarnya memang kita perlihatkan.
+_BARIS_CONTOH_DASBOR = 5
+
+#: Dasbor tidak dibuat di bawah ambang ini. Meniru `MIN_BARIS` di
+#: `chart_compile.py`: bentuk yang tidak layak digambar tidak jadi layak hanya
+#: karena diberi lebih banyak kotak.
+_MIN_BARIS_DASBOR = 3
+_MIN_KOLOM_DASBOR = 2
+
+#: Batas atas kekayaan dasbor menurut mode jawaban sesi. Model boleh meminta
+#: lebih rendah; lebih tinggi diturunkan diam-diam.
+_URUTAN_MODE = ("simple", "medium", "detailed")
 
 #: Katalog di-cache di proses. TTL-nya pendek supaya perubahan katalog tidak
 #: perlu menunggu redeploy ai-chat.
@@ -120,6 +150,60 @@ def _parse_json(text: str) -> dict | None:
             except json.JSONDecodeError:
                 return None
         return None
+
+
+def _usage_details(pemakaian: dict | None) -> dict:
+    """Bentuk `usage_details` yang dimengerti Langfuse, atau kosong.
+
+    Dipisah jadi fungsi supaya keempat node memakai bentuk yang sama. Kalau
+    pemakaiannya tidak diketahui, JANGAN mengirim nol — nol yang salah lebih
+    buruk daripada tidak ada angka, karena ia terbaca sebagai fakta.
+    """
+    if not pemakaian:
+        return {}
+    masuk = pemakaian.get("input_tokens")
+    keluar = pemakaian.get("output_tokens")
+    if masuk is None and keluar is None:
+        return {}
+    rincian = {}
+    if masuk is not None:
+        rincian["input"] = int(masuk)
+    if keluar is not None:
+        rincian["output"] = int(keluar)
+    total = pemakaian.get("total_tokens")
+    if total is not None:
+        rincian["total"] = int(total)
+    return {"usage_details": rincian}
+
+
+def _riwayat_untuk_prompt(state: FounderAnalyticsState, *, giliran: int) -> str:
+    """Render riwayat jadi teks. Pertanyaan user + SQL-nya, tanpa baris hasil.
+
+    Barisnya sengaja tidak ikut: yang dibutuhkan penulis-ulang cuma APA yang
+    ditanyakan sebelumnya dan BAGAIMANA dijawabnya, bukan angkanya. Menempelkan
+    tabel lama ke prompt membuat model menjawab dari angka basi alih-alih
+    menulis query baru.
+
+    Giliran terakhir dibuang — itu pertanyaan yang sedang diajukan. `peri-bugi-api`
+    menyisipkan pesan user SEBELUM memuat riwayat, jadi elemen terakhir selalu
+    pertanyaan sekarang.
+    """
+    isi = [h for h in (state.history or []) if (h.get("content") or "").strip()]
+    if isi and isi[-1].get("role") == "user":
+        isi = isi[:-1]
+    if not isi:
+        return ""
+
+    potong = isi[-(giliran * 2) :]
+    baris: list[str] = []
+    for h in potong:
+        peran = "Founder" if h.get("role") == "user" else "Jawaban"
+        teks = " ".join(str(h.get("content") or "").split())[:400]
+        baris.append(f"{peran}: {teks}")
+        if h.get("sql"):
+            satu = " ".join(str(h["sql"]).split())[:300]
+            baris.append(f"  (query yang dipakai: {satu})")
+    return "\n".join(baris)
 
 
 async def _llm_text(
@@ -232,7 +316,13 @@ async def _llm_text(
 
         teks = (teks or "").strip()
         if span:
-            span.update(output=teks[:4000])
+            # `usage_details` WAJIB dikirim, bukan cuma `output`. Tanpa ini
+            # seluruh generation founder muncul di Langfuse dengan
+            # `usageDetails = {}` dan `calculatedTotalCost = 0` — jadi biaya
+            # fitur ini cuma terlihat di `llm_call_logs`, dan halaman biaya
+            # Langfuse berbohong dengan angka nol yang rapi. Angkanya sudah di
+            # tangan; yang kurang cuma dikirim.
+            span.update(output=teks[:4000], **_usage_details(pemakaian))
 
     # Biaya harus tetap terlihat di dashboard Pusat Biaya. Jalur baru yang
     # lupa mencatat ini bikin angka biaya diam-diam mengecil, dan tidak ada
@@ -285,6 +375,74 @@ async def _prompt_for(dataset_names: list[str]) -> tuple[str, str | None]:
 # =============================================================================
 # Node
 # =============================================================================
+
+
+async def node_rewrite(state: FounderAnalyticsState) -> None:
+    """Ubah pertanyaan lanjutan jadi pertanyaan yang berdiri sendiri.
+
+    Jalan HANYA kalau ada riwayat. Giliran pertama nol biaya tambahan.
+
+    Kenapa node terpisah, bukan riwayat yang ditempel ke prompt SQL: prompt SQL
+    sudah memuat katalog penuh dua dataset (~5 KB), dan menambah percakapan di
+    atasnya membuat model MENAFSIRKAN ULANG pertanyaannya. Kegagalan itu persis
+    yang sudah tercatat — model besar menjawab pertanyaan yang MIRIP, bukan yang
+    ditanyakan. Memisahkannya membuat masing-masing mengerjakan satu hal.
+
+    Node ini TIDAK BOLEH menjatuhkan giliran. Apa pun yang gagal di sini
+    berujung memakai pertanyaan aslinya, yang memang sudah benar untuk sebagian
+    besar giliran.
+    """
+    riwayat = _riwayat_untuk_prompt(
+        state, giliran=settings.FOUNDER_REWRITE_HISTORY_TURNS
+    )
+    if not riwayat:
+        return
+
+    async with trace_node(
+        name="founder-rewrite", input_data={"question": state.question}
+    ) as span:
+        try:
+            teks = await _llm_text(
+                system=REWRITE_SYSTEM.format(
+                    riwayat=riwayat, question=state.question
+                ),
+                user="Tulis ulang kalau perlu.",
+                span_name="founder-rewrite",
+                state=state,
+                temperature=0.0,
+                max_tokens=400,
+                response_schema=PertanyaanMandiri,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[founder_analytics] rewrite gagal: %s", str(e)[:200])
+            return
+
+        data = _parse_json(teks) or {}
+        try:
+            hasil = PertanyaanMandiri(**data)
+        except Exception:  # noqa: BLE001
+            logger.info("[founder_analytics] rewrite: bentuk tidak terbaca")
+            return
+
+        baru = (hasil.pertanyaan or "").strip()
+        # Dua penjagaan, dan dua-duanya pernah jadi mode gagal di sistem lain:
+        # penulis-ulang yang mengembalikan kalimat kosong, dan penulis-ulang
+        # yang "meringkas" pertanyaan jadi lebih pendek sampai kehilangan
+        # batasannya. Pertanyaan mandiri hampir selalu LEBIH panjang.
+        if hasil.mandiri or not baru or len(baru) < 8:
+            if span:
+                span.update(output={"mandiri": True})
+            return
+
+        logger.info(
+            "[founder_analytics] pertanyaan ditulis ulang: %r -> %r",
+            state.question[:80],
+            baru[:80],
+        )
+        state.question = baru
+        state.rewritten = True
+        if span:
+            span.update(output={"mandiri": False, "pertanyaan": baru[:400]})
 
 
 async def node_plan(state: FounderAnalyticsState) -> None:
@@ -474,15 +632,223 @@ async def node_chart(state: FounderAnalyticsState) -> None:
                     "reason": intent.reason,
                     "dikompilasi": state.chart_spec is not None,
                     "dilewati": state.chart_skipped_reason,
+                    "dasbor": intent.dashboard,
                 }
             )
 
 
+def _mode_dasbor(state: FounderAnalyticsState) -> str | None:
+    """Mode dasbor yang berlaku, atau None kalau tidak usah dibuat.
+
+    Urutan pemeriksaannya sengaja dari yang paling murah: izin dulu (satu
+    boolean yang sudah dikirim api), lalu bentuk hasil, baru niat model. Nol
+    panggilan LLM tambahan di jalur mana pun — `intent.dashboard` sudah ikut
+    dalam panggilan grafik yang memang terjadi.
+    """
+    if not state.allow_dashboard:
+        state.dashboard_skipped_reason = "tidak diizinkan giliran ini"
+        return None
+    if not state.has_data:
+        state.dashboard_skipped_reason = "tidak ada hasil"
+        return None
+    if state.row_count < _MIN_BARIS_DASBOR:
+        state.dashboard_skipped_reason = f"cuma {state.row_count} baris"
+        return None
+    if len(state.columns) < _MIN_KOLOM_DASBOR:
+        state.dashboard_skipped_reason = "cuma satu kolom"
+        return None
+
+    diminta = (state.chart_intent.dashboard if state.chart_intent else "none")
+    if diminta == "none":
+        # Ini jalur DEFAULT, bukan kegagalan. Sebagian besar pertanyaan founder
+        # dijawab satu angka, dan dasbor yang tidak diminta cuma menambah yang
+        # harus dibaca.
+        state.dashboard_skipped_reason = "tidak perlu untuk pertanyaan ini"
+        return None
+
+    # Mode sesi adalah BATAS ATAS, bukan usulan. Founder yang memilih "Singkat"
+    # meminta jawaban singkat; memberinya dasbor penuh mengabaikan pilihannya.
+    batas = _URUTAN_MODE.index(state.response_mode)
+    minta = _URUTAN_MODE.index(diminta) if diminta in _URUTAN_MODE else 0
+    return _URUTAN_MODE[min(batas, minta)]
+
+
+def _ringkasan_kolom(state: FounderAnalyticsState) -> str:
+    """Statistik per kolom angka, DIHITUNG DI SINI dari seluruh baris.
+
+    Ini menutup lubang yang cuma terlihat setelah melihat keluaran modelnya.
+    Penulis dasbor cuma melihat lima baris contoh, dan ia menulis insight dari
+    lima baris itu — pada uji pertama ia menyebut *"kepatuhan mencapai 71,5%
+    pada Juli"* dan *"anak aktif 688"* sebagai nilai terakhir, padahal itu baris
+    kelima. Nilai sebenarnya 74,1% dan 742.
+
+    Kode-nya aman dari kesalahan semacam itu karena ia menghitung dari
+    `ctx.data.rows` yang lengkap. Insight TIDAK — ia teks, ditulis sekali, dan
+    penjaga di api tidak bisa menangkapnya karena angka yang dikutip memang ada
+    di data, cuma di baris yang salah.
+
+    Jadi kebenarannya dikirim, bukan diminta: nilai awal, akhir, terkecil,
+    terbesar, dan berapa kali naik/turun. Semua dihitung dari `state.rows`.
+    """
+    if not state.columns or not state.rows:
+        return "(tidak ada)"
+
+    baris_ringkas: list[str] = []
+    for i, nama in enumerate(state.columns):
+        angka: list[float] = []
+        for r in state.rows:
+            v = r[i] if i < len(r) else None
+            if v is None or isinstance(v, bool):
+                continue
+            try:
+                angka.append(float(v))
+            except (TypeError, ValueError):
+                angka = []
+                break
+        if len(angka) < 2:
+            continue
+
+        naik = sum(1 for a, b in zip(angka, angka[1:]) if b > a)
+        turun = sum(1 for a, b in zip(angka, angka[1:]) if b < a)
+        baris_ringkas.append(
+            f"- {nama}: awal {angka[0]:g}, AKHIR {angka[-1]:g}, "
+            f"min {min(angka):g}, max {max(angka):g}, "
+            f"rata-rata {sum(angka) / len(angka):.2f}, "
+            f"naik {naik}x / turun {turun}x"
+        )
+
+    if not baris_ringkas:
+        return "(tidak ada kolom angka)"
+    return "\n".join(baris_ringkas)
+
+
+async def node_dashboard(state: FounderAnalyticsState) -> None:
+    """Tulis dasbor lengkap dengan LLM koder terpisah.
+
+    Node ini TIDAK boleh menjatuhkan giliran. Founder sudah membaca jawabannya,
+    sudah melihat grafiknya, dan sudah punya tabelnya sebelum node ini mulai —
+    apa pun yang gagal di sini berujung "tidak ada dasbor", yang memang keadaan
+    normal untuk sebagian besar pertanyaan.
+    """
+    mode = _mode_dasbor(state)
+    if not mode:
+        return
+
+    if not coder_llm.tersedia():
+        # Bukan galat. Fitur ini boleh belum dikonfigurasi.
+        state.dashboard_skipped_reason = "LLM koder belum diatur"
+        logger.info("[founder_dashboard] CODER_LLM belum diatur — dilewati")
+        return
+
+    contoh = state.rows[:_BARIS_CONTOH_DASBOR]
+    kolom_teks = "\n".join(f"- {c}" for c in state.columns)
+
+    system = DASHBOARD_SYSTEM.format(
+        row_count=state.row_count,
+        mode=mode,
+        aturan_mode=ATURAN_MODE_DASBOR[mode],
+        columns=kolom_teks,
+        sample=json.dumps(contoh, ensure_ascii=False, default=str)[:2000],
+        ringkasan=_ringkasan_kolom(state),
+        question=state.question_asli or state.question,
+        answer=" ".join((state.answer or "").split())[:600],
+    )
+
+    mulai = time.perf_counter()
+    hasil: coder_llm.HasilKode | None = None
+
+    async with trace_generation(
+        name="founder-dashboard",
+        model=coder_llm.nama_model(),
+        system_prompt=system,
+        user_message="Tulis dasbornya.",
+        metadata={
+            "session_id": state.session_id,
+            "trace_id": state.trace_id,
+            "mode": mode,
+            "provider": coder_llm.penyedia(),
+            "row_count": state.row_count,
+        },
+    ) as span:
+        try:
+            hasil = await coder_llm.generate_dashboard(
+                system=system,
+                user="Tulis dasbornya.",
+                schema_model=DashboardSpec,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[founder_dashboard] penyedia gagal (%s): %s",
+                coder_llm.penyedia(),
+                str(e)[:300],
+            )
+            state.dashboard_skipped_reason = "penulis dasbor sedang tidak tersedia"
+
+        if hasil and span:
+            span.update(
+                output={"ada": hasil.spec is not None, "terpotong": hasil.terpotong},
+                **_usage_details(
+                    {
+                        "input_tokens": hasil.input_tokens,
+                        "output_tokens": hasil.output_tokens,
+                    }
+                ),
+            )
+
+    if not hasil:
+        return
+
+    if hasil.terpotong:
+        # Dicatat sebagai masalah ANGGARAN, bukan sebagai model yang menolak.
+        # `gemini_direct.TeksTerpotong` ada karena pemotongan pernah dilaporkan
+        # sebagai "model menyatakan pertanyaan ini tidak terjawab", dan orang
+        # mencari kekurangan di katalog padahal yang kurang max_output_tokens.
+        state.dashboard_skipped_reason = (
+            "kode dasbor terpotong — CODER_LLM_MAX_OUTPUT_TOKENS kurang"
+        )
+        logger.warning("[founder_dashboard] keluaran terpotong, mode=%s", mode)
+
+    if hasil.spec:
+        state.dashboard_spec = hasil.spec
+        state.dashboard_mode = mode
+        state.dashboard_skipped_reason = None
+    elif not state.dashboard_skipped_reason:
+        state.dashboard_skipped_reason = "keluaran penulis dasbor tidak terbaca"
+
+    # Node ini TIDAK lewat `_llm_text`, jadi nol pencatatan otomatis — dan
+    # `peri-bugi-ai-chat/CLAUDE.md` mencatat bahwa node yang lupa mengisi
+    # `llm_call_logs` membuat angka Pusat Biaya diam-diam mengecil.
+    #
+    # `provider` diisi penyedia KODER, bukan `settings.LLM_PROVIDER`. Menyalin
+    # yang salah berarti pengeluaran Anthropic tercatat sebagai Gemini: angkanya
+    # tetap masuk akal, cuma di kolom yang keliru, dan nol orang akan curiga.
+    state.llm_call_logs.append(
+        {
+            "prompt_key": "founder-dashboard",
+            "model": hasil.model,
+            "provider": hasil.provider or coder_llm.penyedia(),
+            "node": "founder-dashboard",
+            "input_tokens": hasil.input_tokens,
+            "output_tokens": hasil.output_tokens,
+            "total_tokens": (hasil.input_tokens or 0) + (hasil.output_tokens or 0),
+            "latency_ms": int((time.perf_counter() - mulai) * 1000),
+            "success": hasil.spec is not None,
+        }
+    )
+
+
 def _table_for_prompt(state: FounderAnalyticsState) -> str:
-    """Hasil sebagai tabel pipa ringkas — cukup untuk menyusun narasi."""
+    """Hasil sebagai tabel pipa ringkas — cukup untuk menyusun narasi.
+
+    Jumlah barisnya mengikuti mode jawaban. Mode `simple` diminta menjawab dua
+    kalimat; memberinya 50 baris cuma menambah token untuk konteks yang tidak
+    akan ia pakai. Mode `detailed` diminta menyebut pola, jadi ia butuh melihat
+    lebih banyak deret.
+    """
     if not state.columns:
         return "(tidak ada hasil)"
-    baris = state.rows[:_MAX_ROWS_TO_PROMPT]
+    batas = _BARIS_JAWABAN.get(state.response_mode, _MAX_ROWS_TO_PROMPT)
+    baris = state.rows[:batas]
     keluar = [" | ".join(state.columns), "-" * 40]
     for r in baris:
         keluar.append(" | ".join("" if v is None else str(v) for v in r))
@@ -511,28 +877,57 @@ async def run_founder_analytics(payload: dict) -> AsyncIterator[str]:
     lima trace terpisah — span-nya ada, tapi tidak bisa dibaca sebagai satu
     cerita. Diperiksa dengan menanyakan Langfuse, bukan dengan membaca kode.
     """
+    metadata = {"trace_id": payload.get("trace_id")}
+
+    # Langfuse v3 mengambil sesi dan pengguna dari kunci metadata BERAWALAN
+    # `langfuse_` (lihat `observability.py`). Tanpa keduanya, seluruh trace
+    # founder pulang dengan `sessionId=None` dan `userId=None` — semua ada di
+    # daftar, tapi tidak satu pun bisa dikelompokkan jadi satu percakapan di
+    # tampilan Sessions. Diperiksa dengan menanyakan Langfuse, bukan dengan
+    # membaca kode.
+    if payload.get("session_id"):
+        metadata["langfuse_session_id"] = str(payload["session_id"])
+    if payload.get("founder_user_id"):
+        metadata["langfuse_user_id"] = str(payload["founder_user_id"])
+
     async with trace_node(
         name="founder-analytics-turn",
         input_data={
             "question": (payload.get("question") or "")[:500],
             "session_id": payload.get("session_id"),
+            "response_mode": payload.get("response_mode"),
         },
-        metadata={"trace_id": payload.get("trace_id")},
+        metadata=metadata,
     ):
         async for peristiwa in _jalankan(payload):
             yield peristiwa
 
 
 async def _jalankan(payload: dict) -> AsyncIterator[str]:
+    pertanyaan = (payload.get("question") or "").strip()
+    mode = str(payload.get("response_mode") or "medium")
+    if mode not in _URUTAN_MODE:
+        mode = "medium"
+
     state = FounderAnalyticsState(
-        question=(payload.get("question") or "").strip(),
+        question=pertanyaan,
+        question_asli=pertanyaan,
         session_id=payload.get("session_id"),
         founder_user_id=payload.get("founder_user_id"),
         trace_id=payload.get("trace_id"),
         history=payload.get("history") or [],
+        response_mode=mode,
+        allow_dashboard=bool(payload.get("allow_dashboard")),
     )
 
     yield _sse("thinking", {"step": 1, "label": "Memilih data yang perlu dibaca"})
+
+    # Pertanyaan lanjutan disambungkan SEBELUM apa pun membacanya. Sampai hari
+    # ini riwayat dikirim api, disimpan di state, lalu tidak pernah dibaca lagi
+    # — jadi "rincian per bulannya dong" sampai ke node SQL sebagai kalimat
+    # telanjang tanpa antecedent. Dibuktikan dari input prompt sungguhan di
+    # Langfuse, bukan dari membaca kode.
+    await node_rewrite(state)
 
     katalog = await _load_catalog()
     if not katalog:
@@ -675,21 +1070,34 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
     # ── Narasi ──────────────────────────────────────────────────────────────
     yield _sse("thinking", {"step": 4, "label": "Menyusun jawaban"})
 
+    # Riwayat masuk ke prompt jawaban HANYA untuk nada, bukan untuk konteks —
+    # konteksnya sudah diselesaikan `node_rewrite` sebelum SQL ditulis. Dua
+    # giliran cukup; lebih banyak membuat model mengulang jawaban lama.
+    riwayat_nada = _riwayat_untuk_prompt(state, giliran=2)
+    system = ANSWER_SYSTEM.format(
+        panjang=PANJANG_JAWABAN[state.response_mode],
+        riwayat=(
+            ANSWER_RIWAYAT.format(riwayat=riwayat_nada) if riwayat_nada else ""
+        ),
+    )
+
     if state.has_data:
-        system = ANSWER_SYSTEM
         # SQL-nya ikut, dan itu bukan hiasan: tanpa melihat filternya, model
         # mengarang keterangan yang berlawanan dengan query-nya sendiri —
         # terbukti menulis "termasuk akun uji internal" untuk query yang
         # justru memuat `NOT is_internal`.
+        #
+        # Pertanyaan yang dikutip adalah yang FOUNDER TULIS, bukan versi
+        # tulis-ulangnya. Jawaban yang mengulang kalimat hasil tulis-ulang
+        # terbaca seperti mesin yang mengoreksi cara bertanya orang.
         user = (
-            f"Pertanyaan: {state.question}\n\n"
+            f"Pertanyaan: {state.question_asli or state.question}\n\n"
             f"Query yang dijalankan:\n{state.sql}\n\n"
             f"Hasil query ({state.row_count} baris"
             f"{', dipotong' if state.truncated else ''}):\n"
             f"{_table_for_prompt(state)}"
         )
     else:
-        system = ANSWER_SYSTEM
         user = ANSWER_NO_DATA.format(reason=state.failure or "tidak diketahui")
 
     jawaban = ""
@@ -721,7 +1129,10 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
                 # sekali, sehingga node ini tercatat nol token di dashboard
                 # biaya — padahal ia panggilan terbesar di giliran ini.
                 async for bagian, meta_potongan in gemini_direct.stream(
-                    system=system, user=user, model=model_jawab
+                    system=system,
+                    user=user,
+                    model=model_jawab,
+                    max_tokens=_TOKEN_JAWABAN[state.response_mode],
                 ):
                     if bagian:
                         jawaban += bagian
@@ -729,7 +1140,11 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
                     if meta_potongan:
                         pemakaian = meta_potongan
             else:
-                llm = get_llm(temperature=0.3, max_tokens=700, streaming=True)
+                llm = get_llm(
+                    temperature=0.3,
+                    max_tokens=_TOKEN_JAWABAN[state.response_mode],
+                    streaming=True,
+                )
                 async for potongan in llm.astream(
                     [("system", system), ("human", user)]
                 ):
@@ -749,7 +1164,7 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
                 )
                 yield _sse("token", jawaban)
         if span:
-            span.update(output=jawaban[:4000])
+            span.update(output=jawaban[:4000], **_usage_details(pemakaian))
 
     # Node jawaban memakai `astream`, bukan `_llm_text`, jadi ia tidak ikut
     # tercatat otomatis. Sempat terlewat — dan yang terlewat justru panggilan
@@ -769,6 +1184,33 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
         }
     )
 
+    # ── Dasbor ──────────────────────────────────────────────────────────────
+    #
+    # SETELAH narasi selesai, bukan sebelumnya, dan itu keputusan sadar: LLM
+    # koder bisa memakan puluhan detik, dan menaruhnya lebih awal berarti
+    # founder menatap layar kosong menunggu sesuatu yang belum tentu jadi. Di
+    # sini ia sudah membaca jawabannya dan sedang melihat grafik dan tabel.
+    state.answer = jawaban.strip()
+    if state.allow_dashboard:
+        yield _sse("thinking", {"step": 5, "label": "Menyusun dasbor"})
+        await node_dashboard(state)
+
+    if state.dashboard_spec:
+        # Dikirim mentah ke `peri-bugi-api`, TIDAK diteruskan ke browser. Repo
+        # itu yang menjalankan penjaga dan menghitung nilai KPI-nya; browser
+        # mengambil versi bersihnya lewat endpoint tersendiri.
+        yield _sse(
+            "dashboard",
+            {
+                "spec": state.dashboard_spec,
+                "mode": state.dashboard_mode,
+                "provider": coder_llm.penyedia(),
+                "model": coder_llm.nama_model(),
+                "input_tokens": state.llm_call_logs[-1].get("input_tokens"),
+                "output_tokens": state.llm_call_logs[-1].get("output_tokens"),
+            },
+        )
+
     yield _sse(
         "meta",
         {
@@ -784,6 +1226,14 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
             "chart_skipped_reason": state.chart_skipped_reason,
             "elapsed_ms": state.elapsed_ms,
             "failure": state.failure,
+            "response_mode": state.response_mode,
+            # Pertanyaan yang berubah tanpa jejak adalah cara paling halus untuk
+            # membuat jawaban yang benar terasa salah. Kalau ditulis ulang,
+            # founder harus bisa melihat jadi apa.
+            "rewritten": state.rewritten,
+            "question_used": state.question if state.rewritten else None,
+            "dashboard_mode": state.dashboard_mode,
+            "dashboard_skipped_reason": state.dashboard_skipped_reason,
         },
     )
 
@@ -797,6 +1247,8 @@ async def _jalankan(payload: dict) -> AsyncIterator[str]:
                 "attempts": len(state.attempts),
                 "chart_skipped_reason": state.chart_skipped_reason,
                 "failure": state.failure,
+                "response_mode": state.response_mode,
+                "rewritten": state.rewritten,
                 "llm_call_logs": state.llm_call_logs,
             },
         },

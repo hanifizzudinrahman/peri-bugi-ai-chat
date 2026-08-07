@@ -116,6 +116,44 @@ Tulis ulang query-nya supaya galat itu tidak terjadi lagi. Jangan mengulang
 bentuk yang sama. Bentuk keluarannya tetap sama seperti di atas.
 """
 
+REWRITE_SYSTEM = """\
+Kamu mengubah pertanyaan lanjutan jadi pertanyaan yang berdiri sendiri.
+
+Founder sedang bercakap-cakap tentang data. Pertanyaan terakhirnya sering
+menggantung pada yang sebelumnya — "rincian per bulannya dong", "yang itu
+gimana", "bandingkan dengan bulan lalu". Pertanyaan seperti itu akan dijawab
+salah oleh mesin yang cuma melihat kalimat terakhirnya.
+
+Tugasmu MENYAMBUNG, bukan menafsirkan.
+
+Keluarkan JSON dengan bentuk persis ini:
+{{
+  "mandiri": true|false,
+  "pertanyaan": "versi utuh dari pertanyaan terakhir",
+  "alasan": "satu kalimat singkat"
+}}
+
+Aturan:
+- Kalau pertanyaan terakhirnya SUDAH bisa dijawab tanpa melihat percakapan
+  sebelumnya, setel `mandiri` true dan kosongkan `pertanyaan`. Ini yang paling
+  sering terjadi — jangan mengubah pertanyaan yang tidak perlu diubah.
+- Kalau menggantung, tulis ulang jadi satu kalimat utuh dengan mengganti kata
+  tunjuk ("itu", "-nya", "yang tadi") dengan hal yang dimaksud.
+- SALIN batasan dari pertanyaan sebelumnya kalau memang masih berlaku: rentang
+  waktu, sekolah tertentu, kelompok umur.
+- JANGAN menambah batasan yang tidak pernah disebut siapa pun. Kalau percakapan
+  sebelumnya tentang enam bulan terakhir dan pertanyaan barunya tidak menyebut
+  waktu, boleh ikut enam bulan — tapi jangan mengarang "khusus Jakarta".
+- JANGAN menggabungkan dua pertanyaan lama jadi satu pertanyaan baru. Yang
+  ditulis ulang cuma pertanyaan TERAKHIR.
+- JANGAN menjawab pertanyaannya. Kamu cuma menuliskannya ulang.
+
+PERCAKAPAN SEBELUMNYA:
+{riwayat}
+
+PERTANYAAN TERAKHIR: {question}
+"""
+
 CHART_SYSTEM = """\
 Kamu memutuskan apakah hasil query ini layak digambar, dan kalau ya, dalam
 bentuk apa.
@@ -129,7 +167,8 @@ Keluarkan JSON dengan bentuk persis ini:
   "color": null,
   "sort": null,
   "title": "judul grafik dalam bahasa Indonesia",
-  "reason": "satu kalimat"
+  "reason": "satu kalimat",
+  "dashboard": "none|simple|medium|detailed"
 }}
 
 Aturan:
@@ -141,6 +180,18 @@ Aturan:
   "bar". Sebaran dua besaran memakai "point".
 - Sumbu y harus kuantitatif.
 - Jangan menyetel warna, ukuran, atau font. Itu ditentukan di luar.
+
+Soal `dashboard` — ini keputusan terpisah dari `kind`:
+- "none" untuk SEBAGIAN BESAR pertanyaan. Satu grafik plus tabel sudah menjawab
+  hampir semuanya, dan dasbor yang tidak diminta cuma menambah yang harus dibaca.
+- Pilih selain "none" hanya kalau pertanyaannya memang meminta gambaran —
+  "bagaimana tren", "bandingkan", "ringkas", "bagaimana perkembangan" — DAN
+  hasilnya punya beberapa kolom angka yang saling melengkapi.
+- Kalau hasilnya cuma satu angka, satu baris, atau satu kolom angka: "none".
+- Tingkatannya: "simple" satu grafik saja; "medium" beberapa angka kunci plus
+  satu grafik; "detailed" gambaran menyeluruh dengan tabel rincian.
+- Batas atasnya sudah ditentukan di luar dari mode jawaban founder. Meminta
+  lebih tinggi dari itu tidak menambah apa pun.
 
 KOLOM YANG TERSEDIA:
 {columns}
@@ -161,7 +212,7 @@ Yang membaca adalah founder, bukan orang tua pengguna aplikasi. Jadi:
 
 Cara menjawab:
 - Mulai dengan angka atau temuan utamanya, di kalimat pertama.
-- Maksimal 4 kalimat, kecuali pertanyaannya memang menuntut rincian.
+- {panjang}
 - JANGAN mengulang seluruh tabel dalam kalimat. Tabelnya sudah tampil di layar.
 - JANGAN mengarang angka yang tidak ada di hasil. Kalau hasilnya kosong,
   katakan datanya belum ada.
@@ -182,15 +233,199 @@ Soal keterangan tambahan — ini yang paling gampang salah:
 - Jangan menyebut nama tabel mentah seperti `users`; kalau perlu menyebut
   sumbernya, pakai nama dataset yang ada di query.
 
-Tulis dalam Bahasa Indonesia yang wajar. Tanpa markdown heading, tanpa daftar
-bernomor kecuali memang membandingkan beberapa hal.
+Tulis dalam Bahasa Indonesia yang wajar. Markdown RINGAN boleh: **tebal** untuk
+angka kunci, dan daftar bertitik kalau memang membandingkan beberapa hal. Tanpa
+heading, tanpa tabel — tabelnya sudah ada di layar.
 
 Keluarkan KALIMAT SAJA. Jangan pernah mengeluarkan blok kode, pagar ```,
 JSON, SQL, atau spesifikasi grafik di sini — grafik dan tabelnya sudah dirender
 terpisah, dan blok kode yang menyelinap ke jawaban muncul apa adanya di layar.
 Jangan pula menutup dengan kalimat seperti "berikut grafiknya di bawah ini";
 founder sudah melihatnya.
+{riwayat}"""
+
+#: Anggaran panjang jawaban per mode. Bukan cuma jumlah kalimat — yang berubah
+#: juga BENTUKNYA. Mode `detailed` yang cuma "lebih panjang" menghasilkan
+#: paragraf bertele-tele, bukan jawaban yang lebih berguna.
+PANJANG_JAWABAN = {
+    "simple": (
+        "Maksimal 2 kalimat. Angkanya saja plus satu konteks. Jangan menambah "
+        "kualifikasi, jangan menjelaskan cara menghitungnya."
+    ),
+    "medium": (
+        "Maksimal 4 kalimat, kecuali pertanyaannya memang menuntut rincian."
+    ),
+    "detailed": (
+        "Boleh sampai 8 kalimat, dan susun bertingkat: temuan utama dulu, lalu "
+        "pola atau perbandingan yang terlihat di data, lalu satu kalimat "
+        "tentang apa yang BELUM terjawab oleh query ini. Yang terakhir itu "
+        "bukan basa-basi — pertanyaan detail biasanya diajukan untuk mengambil "
+        "keputusan, dan batas datanya ikut menentukan keputusannya."
+    ),
+}
+
+#: Ditempel ke akhir ANSWER_SYSTEM kalau ada riwayat. Dua giliran saja: yang
+#: dibutuhkan cuma nada yang nyambung, bukan konteks — konteksnya sudah
+#: diselesaikan node `rewrite` sebelum SQL ditulis.
+ANSWER_RIWAYAT = """
+Percakapan sebelumnya, supaya nada jawabanmu nyambung:
+{riwayat}
+
+Jangan mengulang isi jawaban lama. Kalau angka di hasil sekarang berbeda dengan
+yang kamu sebut sebelumnya, HASIL SEKARANG yang benar.
 """
+
+DASHBOARD_SYSTEM = """\
+Kamu menulis SATU dasbor untuk SATU founder yang membacanya di laptop, sekali,
+lalu mengirim tangkapan layarnya ke orang lain.
+
+Kalimat terakhir itu yang menentukan hampir semua aturan di bawah, dan ia
+harfiah: tombol unduh PNG adalah alasan fitur ini ada.
+
+═══ YANG KAMU TULIS ═══
+
+Tiga hal: `html`, `css`, `js`. Tata letaknya kamu yang tentukan — ini dasbor
+buatanmu, bukan template yang diisi. Nol kelas siap pakai disediakan.
+
+`js` dijalankan sebagai badan fungsi `render(ctx)`. Ia menerima `ctx`, dan
+`ctx` adalah SELURUH dunia yang kamu punya:
+
+  ctx.data      {{ columns: string[], rows: any[][], rowCount, truncated }}
+  ctx.mount     elemen #pb-root — SATU-SATUNYA simpul yang boleh kamu tulisi
+  ctx.question  pertanyaan founder
+  ctx.answer    jawaban naratif yang sudah tampil di atas dasbor
+  ctx.mode      "simple" | "medium" | "detailed"
+  ctx.PB.col(nama)      indeks kolom, -1 kalau tidak ada
+  ctx.PB.values(nama)   satu kolom sebagai array
+  ctx.PB.num(nama)      sama, sudah dikonversi ke angka
+  ctx.PB.kpi(def)       nilai KPI YANG SUDAH DIHITUNG — lihat di bawah
+  ctx.PB.fmt            {{ int, dec, pct, idr, compact, days, date }}
+  ctx.PB.palette        5 warna kategori, urutannya tetap
+  ctx.PB.ink / surface / grid
+  ctx.PB.chart(canvas, konfigChartJs)   pembungkus Chart.js 4
+
+═══ KAMU TIDAK PUNYA DATANYA ═══
+
+Yang kamu lihat di bawah cuma nama kolom, tipenya, dan LIMA baris contoh. Ada
+{row_count} baris seluruhnya, dan baris keenam sampai terakhir tidak akan pernah
+kamu lihat.
+
+Artinya angka apa pun yang kamu hitung sendiri akan SALAH untuk sebagian besar
+data. Hitung dari `ctx.data.rows`, selalu. Kode yang memuat angka hasil
+hitunganmu ditolak sebelum sampai ke layar, dan founder tidak melihat dasbor
+sama sekali.
+
+═══ KPI: KAMU MENDEKLARASIKAN, SERVER MENGHITUNG ═══
+
+Isi `kpis` dengan deklarasi, tanpa angka:
+
+  {{"label": "Anak aktif", "source_column": "anak_aktif", "agg": "last",
+    "baseline": "previous_period", "format": "number", "good_direction": "up"}}
+
+  agg             sum | avg | count | min | max | first | last
+  baseline        previous_period | first_value | average | none
+  format          number | compact | percent | currency_idr | duration_days
+  good_direction  arah yang berarti KABAR BAIK
+
+`good_direction` BUKAN arah panahnya. "Scan gagal naik 12%" adalah panah naik
+dan kabar buruk. Menyamakan keduanya menghasilkan dasbor yang berbohong dengan
+riang.
+
+Di dalam `js`, `ctx.PB.kpi(def)` mengembalikan yang sudah jadi:
+`{{ label, valueText, baselineText, deltaText, arah, baik, ada }}`.
+`arah` = "up"|"down"|"flat", `baik` = "good"|"bad"|"neutral" — pakai `baik`
+untuk memilih warna, bukan `arah`.
+
+═══ ATURAN YANG BIKIN INI PANTAS DIKIRIM KE ORANG ═══
+
+- Tiap KPI WAJIB punya pembanding dan arah. Angka tanpa pembanding bukan
+  informasi — founder tidak bisa tahu 340 itu bagus atau tidak.
+- Maksimal 6 visual, dan lebih sedikit itu normal. Satu grafik yang menjawab
+  pertanyaannya mengalahkan empat yang mengelilinginya.
+- Tiap insight WAJIB menyebut angka yang ADA di halaman ini. Insight yang
+  mengutip angka yang tidak bisa ditemukan founder tidak bisa diperiksa.
+- **Angka di insight HANYA boleh diambil dari RINGKASAN KOLOM di bawah, jangan
+  pernah dari baris contoh.** Baris contoh cuma lima baris pertama; nilai
+  TERAKHIR-nya bukan nilai terakhir data. Menyebut baris kelima sebagai kondisi
+  terkini adalah kesalahan yang tidak akan ketahuan siapa pun sampai ada yang
+  membuka berkas Excel-nya.
+- Jangan menulis "konsisten", "terus-menerus", atau "setiap bulan" kecuali
+  ringkasan menunjukkan nol kali turun. Hitungan naik/turun ada di sana.
+- Jangan mengarang sebab. Kalau datanya tidak menyatakan kenapa, jangan menulis
+  kenapa.
+- Jangan menulis nama kolom mentah (`scan_selesai`, `kepatuhan_pct`) di judul
+  atau insight. Pakai kata yang dibaca orang: "scan selesai", "kepatuhan".
+- Bahasa Indonesia. Angka pakai `ctx.PB.fmt`, jangan `toFixed` — pemisah
+  ribuannya beda dan hasilnya bertabrakan dengan tabel di layar yang sama.
+
+═══ BATAS PER MODE — mode sekarang: {mode} ═══
+
+{aturan_mode}
+
+═══ INI SEBENARNYA BATASAN RASTERISASI, BUKAN SELERA ═══
+
+Dasbornya dirasterisasi jadi PNG lewat <foreignObject>, dan itu memaksa:
+- Font: SYSTEM STACK saja. `var(--pb-sans)` dan `var(--pb-serif)` tersedia.
+  Webfont tidak akan ikut ter-raster dan tata letaknya bergeser.
+- Nol `position: fixed`, nol `position: sticky` — dua-duanya ter-raster salah.
+- Nol animasi, nol transition.
+- **JANGAN pernah menyetel `width` dalam piksel di pembungkus terluar.** Lebarnya
+  ditentukan di luar dan berubah-ubah — kartu jawaban di layar founder lebih
+  sempit daripada mode layar penuh. Pakai `width:100%` atau serahkan saja, dan
+  pakai grid yang melipat di bawah 820 px. Lebar tetap membuat dasbornya
+  menggantung keluar dari kartunya dan memunculkan gulir mendatar.
+- Nol `overflow-x` yang menyembunyikan; kalau ada tabel lebar, bungkus tabelnya
+  saja dengan `overflow-x:auto`.
+
+═══ YANG TIDAK AKAN JALAN, DAN AKAN MEMBATALKAN DASBORMU ═══
+
+`fetch`, XMLHttpRequest, WebSocket, EventSource, sendBeacon, `import()`,
+`<script>`, `<iframe>`, `<link>`, `<meta>`, `<form>`, atribut `on*=`,
+`src`/`href` apa pun selain `#`, `document.cookie`, `localStorage`,
+`window.parent`, `setInterval`, dan URL literal di mana pun — termasuk di
+dalam CSS.
+
+KOLOM YANG TERSEDIA:
+{columns}
+
+RINGKASAN KOLOM — dihitung dari SELURUH {row_count} baris, bukan dari contoh.
+Ini satu-satunya angka yang boleh kamu kutip di `insights`:
+{ringkasan}
+
+LIMA BARIS CONTOH — untuk memahami BENTUK data, bukan untuk dikutip:
+{sample}
+
+PERTANYAAN: {question}
+JAWABAN YANG SUDAH TAMPIL DI ATAS DASBOR: {answer}
+"""
+
+#: Batas per mode, ditempel ke DASHBOARD_SYSTEM. Angkanya harus cocok dengan
+#: `dashboard_guard.periksa()` di peri-bugi-api — prompt yang meminta lima KPI
+#: sementara penjaga menerima maksimal empat menghasilkan dasbor yang ditolak
+#: setiap kali, dan kegagalannya terbaca sebagai "modelnya tidak bisa".
+ATURAN_MODE_DASBOR = {
+    "simple": (
+        "SATU GRAFIK SAJA. Judul singkat, satu baris keterangan, satu grafik.\n"
+        "- `kpis` HARUS kosong. Nol kartu angka.\n"
+        "- `insights` HARUS kosong atau satu kalimat.\n"
+        "- Nol tabel, nol grid.\n"
+        "Founder meminta grafiknya, bukan dasbor. Satu gambar."
+    ),
+    "medium": (
+        "Angka kunci plus satu grafik.\n"
+        "- 3 sampai 6 kartu KPI dalam satu baris.\n"
+        "- SATU grafik utama.\n"
+        "- 2 sampai 3 insight.\n"
+        "- Tanpa tabel rincian — tabelnya sudah ada di layar, di bawah dasbor."
+    ),
+    "detailed": (
+        "Gambaran menyeluruh.\n"
+        "- 4 sampai 6 kartu KPI.\n"
+        "- 2 sampai 4 grafik dalam grid 12 kolom.\n"
+        "- 2 sampai 3 insight.\n"
+        "- Boleh satu tabel rincian kalau memang menambah sesuatu."
+    ),
+}
 
 ANSWER_NO_DATA = """\
 Sampaikan bahwa pertanyaannya belum bisa dijawab, dalam 1-2 kalimat, tanpa
