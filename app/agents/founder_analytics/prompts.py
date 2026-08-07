@@ -287,7 +287,16 @@ harfiah: tombol unduh PNG adalah alasan fitur ini ada.
 Tiga hal: `html`, `css`, `js`. Tata letaknya kamu yang tentukan — ini dasbor
 buatanmu, bukan template yang diisi. Nol kelas siap pakai disediakan.
 
-`js` dijalankan sebagai badan fungsi `render(ctx)`. Ia menerima `ctx`, dan
+`js` adalah ISI fungsi `render(ctx)`, bukan fungsinya.
+
+JANGAN menulis `function render(ctx) {{ ... }}`. Tulis pernyataannya langsung,
+seolah kamu sudah berada DI DALAM fungsi itu. Menuliskan fungsinya utuh
+menghasilkan fungsi yang tidak pernah dipanggil: HTML-mu tergambar, kodemu
+diam, dan tidak ada satu pun galat yang muncul.
+
+  BENAR  : const root = ctx.mount; root.querySelector('#kpi')...
+  SALAH  : function render(ctx) {{ const root = ctx.mount; ... }}
+
 `ctx` adalah SELURUH dunia yang kamu punya:
 
   ctx.data      {{ columns: string[], rows: any[][], rowCount, truncated }}
@@ -295,10 +304,23 @@ buatanmu, bukan template yang diisi. Nol kelas siap pakai disediakan.
   ctx.question  pertanyaan founder
   ctx.answer    jawaban naratif yang sudah tampil di atas dasbor
   ctx.mode      "simple" | "medium" | "detailed"
+  ctx.title     isi medan `title` yang kamu tulis sendiri
+  ctx.subtitle  isi medan `subtitle` yang kamu tulis sendiri
+  ctx.insights  ARRAY string — isi medan `insights` yang kamu tulis sendiri.
+                Medan `insights` TIDAK dirender otomatis. Kalau kamu membuat
+                kartu untuknya, kamu sendiri yang harus mengisinya dari sini.
+                Kartu "Temuan" yang dibuat lalu dibiarkan kosong adalah kotak
+                putih di tengah dasbor, dan tidak ada galat yang menandainya.
   ctx.PB.col(nama)      indeks kolom, -1 kalau tidak ada
   ctx.PB.values(nama)   satu kolom sebagai array
   ctx.PB.num(nama)      sama, sudah dikonversi ke angka
-  ctx.PB.kpi(def)       nilai KPI YANG SUDAH DIHITUNG — lihat di bawah
+  ctx.kpis      ARRAY KPI yang SUDAH DIHITUNG, urutannya sama persis dengan
+                yang kamu deklarasikan di medan `kpis`. INI yang dipakai untuk
+                menggambar deretan kartu — `ctx.kpis.forEach(k => ...)`.
+                Mendeklarasikan `kpis` TIDAK membuat kartunya muncul. Kalau kamu
+                deklarasikan empat lalu tidak merendernya, penjaga tetap
+                menghitung empat dan layarnya tetap kosong.
+  ctx.PB.kpi(def)       satu KPI, kalau butuh di luar urutan
   ctx.PB.fmt            {{ int, dec, pct, idr, compact, days, date }}
   ctx.PB.palette        5 warna kategori, urutannya tetap
   ctx.PB.ink / surface / grid
@@ -331,10 +353,14 @@ Isi `kpis` dengan deklarasi, tanpa angka:
 dan kabar buruk. Menyamakan keduanya menghasilkan dasbor yang berbohong dengan
 riang.
 
-Di dalam `js`, `ctx.PB.kpi(def)` mengembalikan yang sudah jadi:
+Di dalam `js`, tiap entri `ctx.kpis` sudah berbentuk:
 `{{ label, valueText, baselineText, deltaText, arah, baik, ada }}`.
 `arah` = "up"|"down"|"flat", `baik` = "good"|"bad"|"neutral" — pakai `baik`
 untuk memilih warna, bukan `arah`.
+
+WAJIB untuk mode `medium` dan `detailed`: render deretan kartu KPI dari
+`ctx.kpis`. Itu blok pertama yang dibaca founder, dan dasbor tanpa angka
+kuncinya cuma kumpulan grafik.
 
 ═══ ATURAN YANG BIKIN INI PANTAS DIKIRIM KE ORANG ═══
 
@@ -361,6 +387,81 @@ untuk memilih warna, bukan `arah`.
 ═══ BATAS PER MODE — mode sekarang: {mode} ═══
 
 {aturan_mode}
+
+═══ BAHASA RUPA — INI YANG MEMBEDAKAN "JADI" DARI "PANTAS DIKIRIM" ═══
+
+Tampilan bawaan Chart.js dan kartu ber-border polos menghasilkan dasbor yang
+terlihat seperti contoh tutorial. Ini dibaca founder lalu dikirim ke orang lain.
+Ikuti ini:
+
+TIPOGRAFI
+- Judul utama: `font-family:var(--pb-serif)`, 27px, weight 600,
+  `letter-spacing:-.01em`. Serif untuk judul adalah tanda khasnya — jangan
+  dilewat.
+- Di ATAS judul, satu baris eyebrow: 10px, weight 700, `letter-spacing:.14em`,
+  UPPERCASE, warna `rgba(15,23,42,.42)`. Isinya konteks pendek, bukan judul lagi.
+- Judul kartu: 12.5px weight 600. Keterangan di bawahnya 11px
+  `rgba(15,23,42,.45)`.
+- SEMUA angka: `font-variant-numeric:tabular-nums`. Tanpa ini kolom angka
+  bergoyang dan tabelnya terbaca murahan.
+
+KISI RAMBUT — ini idiom rumah, pakai
+- Deretan kartu KPI BUKAN kartu-kartu terpisah yang berjarak. Ia satu blok:
+  `display:grid; gap:1px; background:rgba(15,23,42,.10);
+   border:1px solid rgba(15,23,42,.10); border-radius:14px; overflow:hidden`
+  dan tiap sel `background:#fff; padding:15px 16px 14px`.
+  Celah 1px itulah garisnya. Hasilnya rapat dan tegas, bukan mengambang.
+
+ANATOMI KARTU KPI — tiga baris, selalu
+  1. label   10.5px, weight 600, `letter-spacing:.05em`, UPPERCASE,
+             `rgba(15,23,42,.45)`
+  2. nilai   26px, weight 600, `letter-spacing:-.02em`, tabular-nums
+  3. delta   11px: panah + persentase (weight 600) lalu "dari <pembanding>"
+             dengan warna `rgba(15,23,42,.45)`
+- Warna delta dari `res.baik`, BUKAN dari `res.arah`:
+  good `#047857`, bad `#B91C1C`, neutral `rgba(15,23,42,.45)`.
+- Panah: ▲ untuk naik, ▼ untuk turun, — untuk datar.
+
+KARTU ISI
+`background:#fff; border:1px solid rgba(15,23,42,.10); border-radius:14px;
+ padding:16px 18px 14px`. Jarak antar blok 14px. Nol bayangan (`box-shadow`).
+
+GRAFIK — matikan tampilan bawaannya
+- `plugins.legend`: mati kalau cuma satu deret. Kalau lebih:
+  `position:'top', align:'end'`, `usePointStyle:true`, `pointStyle:'circle'`,
+  `boxWidth:8, boxHeight:8`, font 11.
+- Sumbu X: `grid:{{display:false}}`, font 11. Sumbu Y: `grid:{{color:ctx.PB.grid,
+  drawTicks:false}}`, `border:{{display:false}}`, `maxTicksLimit:4` atau 5.
+- Batang: `borderRadius:{{topLeft:4,topRight:4}}` dengan
+  `borderSkipped:'bottom'` — dibulatkan HANYA di ujung data. Baseline yang
+  membulat membuat nilai kecil terlihat lebih besar.
+- Garis: `borderWidth:2`, `pointRadius:3`, `pointHoverRadius:5`,
+  `tension:.28`.
+- Tinggi area grafik 190–210px, dan bungkus kanvasnya
+  `<div style="position:relative;height:206px">`.
+- Dua deret dengan besaran yang jauh berbeda (misalnya 550 lawan 15) WAJIB
+  pakai dua sumbu (`yAxisID` + `scales.y1` di kanan). Menumpuknya di satu sumbu
+  membuat deret yang kecil terlihat rata di garis nol — bukan cuma jelek, tapi
+  menyembunyikan pertumbuhannya. Kalau tidak mau dua sumbu, pisahkan jadi dua
+  grafik.
+- Warna dari `ctx.PB.palette` sesuai urutannya. Untuk batang latar di grafik
+  gabungan, pakai versi transparan `rgba(3,105,161,.16)`.
+
+TABEL — kalau ada
+Header 10px UPPERCASE `letter-spacing:.05em` `rgba(15,23,42,.42)` dengan garis
+bawah 1px. Sel angka RATA KANAN, kolom pertama rata kiri. Baris dipisah garis
+`rgba(15,23,42,.06)`, baris terakhir tanpa garis dan weight 600.
+
+INSIGHT
+Daftar tanpa bullet bawaan. Tiap poin diawali lingkaran bernomor 18px:
+`border-radius:50%; background:rgba(3,105,161,.10); color:#0369A1;
+ font-size:10px; font-weight:700`. Teks 12.5px, `line-height:1.5`,
+`rgba(15,23,42,.78)`.
+
+TATA LETAK
+Grid 12 kolom (`repeat(12,1fr)`, gap 14px), dan komposisikan — jangan semua
+selebar penuh. Grafik utama 8 kolom + pendamping 4 kolom terbaca jauh lebih
+baik daripada dua grafik 6-6 yang sama besar.
 
 ═══ INI SEBENARNYA BATASAN RASTERISASI, BUKAN SELERA ═══
 

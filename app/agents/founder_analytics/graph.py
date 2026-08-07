@@ -659,15 +659,36 @@ def _mode_dasbor(state: FounderAnalyticsState) -> str | None:
         return None
 
     diminta = (state.chart_intent.dashboard if state.chart_intent else "none")
-    if diminta == "none":
-        # Ini jalur DEFAULT, bukan kegagalan. Sebagian besar pertanyaan founder
-        # dijawab satu angka, dan dasbor yang tidak diminta cuma menambah yang
-        # harus dibaca.
-        state.dashboard_skipped_reason = "tidak perlu untuk pertanyaan ini"
-        return None
 
-    # Mode sesi adalah BATAS ATAS, bukan usulan. Founder yang memilih "Singkat"
-    # meminta jawaban singkat; memberinya dasbor penuh mengabaikan pilihannya.
+    # Kalau hasilnya LAYAK DIGAMBAR, dasbor selalu dibuat — minimal `simple`.
+    #
+    # Ini keputusan produk, bukan kelonggaran: dasbor buatan LLM MENGGANTIKAN
+    # grafik Vega di layar, tidak mendampinginya. Kalau dasbor cuma dibuat
+    # sesekali, founder melihat dua gaya visual yang berbeda untuk pertanyaan
+    # yang mirip — kadang grafik polos, kadang dasbor. Yang menahan biaya tetap
+    # ada dan tidak berubah: `allow_dashboard` dari api (flag + anggaran harian
+    # + batas per sesi), plus ambang baris dan kolom di atas.
+    if diminta == "none":
+        layak = bool(state.chart_intent and state.chart_intent.kind != "none")
+        if not layak:
+            # Jalur DEFAULT, bukan kegagalan. Sebagian besar pertanyaan founder
+            # dijawab satu angka, dan itu memang tidak layak digambar.
+            state.dashboard_skipped_reason = "hasilnya tidak layak digambar"
+            return None
+
+        # Mengikuti MODE SESI, bukan dipaku "simple".
+        #
+        # Memakukannya ke "simple" menghasilkan hal yang terlihat salah dan
+        # memang salah: founder memilih "Detail", node grafik kebetulan tidak
+        # mengisi `dashboard`, dan yang datang dasbor satu grafik. Terekam di
+        # `metadata_json` sebagai `response_mode: detailed` bersanding dengan
+        # `dashboard_mode: simple` — dua nilai yang tidak mungkin dijelaskan ke
+        # siapa pun. Yang tidak diisi model adalah TINGKATANNYA, dan tingkatan
+        # itu memang sudah dipilih founder lewat tombol mode.
+        diminta = state.response_mode
+
+    # Mode sesi adalah BATAS ATAS. Founder yang memilih "Singkat" meminta
+    # jawaban singkat; memberinya dasbor penuh mengabaikan pilihannya.
     batas = _URUTAN_MODE.index(state.response_mode)
     minta = _URUTAN_MODE.index(diminta) if diminta in _URUTAN_MODE else 0
     return _URUTAN_MODE[min(batas, minta)]

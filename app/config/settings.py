@@ -137,6 +137,23 @@ class Settings(BaseSettings):
     # `/v1/chat/completions` yang sama.
     # ─────────────────────────────────────────────────────────────────────────
     CODER_LLM_PROVIDER: str = "gemini"  # gemini | anthropic | openai
+
+    #: Diuji 7 Agustus 2026 dengan pertanyaan dan data yang sama, tiga mode:
+    #:
+    #:   gemini-3.6-flash        ~12 dtk, murah — tapi satu dari tiga keluaran
+    #:                           merujuk variabel yang tidak pernah ia buat
+    #:                           (`proxyKpis is not defined`), dan dasbornya
+    #:                           gagal seluruhnya.
+    #:   gemini-3.1-pro-preview  ~30 dtk — deret KPI, dua grafik, dan insight
+    #:                           lengkap di ketiga mode, nol galat.
+    #:
+    #: Dipilih yang Pro. Selisih waktunya tidak terasa karena node dasbor jalan
+    #: SETELAH jawaban selesai di-stream — founder sudah membaca jawabannya dan
+    #: sedang melihat tabel. Yang terasa adalah dasbor yang gagal.
+    #:
+    #: Catatan yang perlu diingat: dokumen Google justru menyebut 3.6-flash
+    #: unggul di "code generation". Untuk beban kerja ini, di prompt ini,
+    #: pengukuran berkata lain.
     CODER_LLM_MODEL: str = ""
     CODER_LLM_API_KEY: str = ""
     CODER_LLM_BASE_URL: str = ""  # kosong = bawaan penyedia

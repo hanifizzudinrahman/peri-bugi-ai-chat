@@ -243,7 +243,7 @@ async def _anthropic(*, system: str, user: str, schema: dict, max_tokens: int,
                 "content-type": "application/json",
             },
         )
-        r.raise_for_status()
+        _bangkitkan_galat(r, "Anthropic")
         data = r.json()
 
     hasil.terpotong = data.get("stop_reason") == "max_tokens"
@@ -268,6 +268,86 @@ async def _anthropic(*, system: str, user: str, schema: dict, max_tokens: int,
 # ------------------------------------------------- OpenAI dan yang kompatibel
 
 
+#: Keluarga OpenAI yang memakai kontrak parameter penalaran, bukan yang lama.
+#: Pencocokannya awalan nama, jadi endpoint OpenAI-compatible (DeepSeek, GLM,
+#: Moonshot) yang memakai nama model sendiri tetap jatuh ke jalur lama —
+#: memang itu yang benar untuk mereka.
+_OPENAI_PENALARAN = ("gpt-5", "o1", "o3", "o4")
+
+
+def _model_penalaran(model: str) -> bool:
+    nama = (model or "").strip().lower()
+    return any(nama.startswith(k) for k in _OPENAI_PENALARAN)
+
+
+def _bangkitkan_galat(r: httpx.Response, penyedia_nama: str) -> None:
+    """Lempar galat yang MEMBAWA pesan penyedia, bukan cuma kode statusnya.
+
+    `raise_for_status()` polos menghasilkan "Client error '400 Bad Request'" dan
+    membuang badan responsnya — padahal di situlah sebabnya ditulis, sering kali
+    persis nama parameter yang salah ("Unsupported parameter: 'max_tokens' is
+    not supported with this model. Use 'max_completion_tokens' instead."). Tanpa
+    itu, satu-satunya jalan mendiagnosis adalah menebak.
+    """
+    if r.status_code < 400:
+        return
+    isi = ""
+    try:
+        badan = r.json()
+        isi = (badan.get("error") or {}).get("message") or json.dumps(badan)[:400]
+    except Exception:  # noqa: BLE001
+        isi = (r.text or "")[:400]
+    raise RuntimeError(f"{penyedia_nama} menjawab {r.status_code}: {isi}")
+
+
+def _ketatkan_skema(simpul: Any) -> Any:
+    """Ubah JSON Schema Pydantic jadi bentuk yang diterima mode `strict` OpenAI.
+
+    Dua tuntutan yang tidak dipenuhi `model_json_schema()`, dan dua-duanya
+    dijawab 400 — bukan diabaikan:
+
+      "Invalid schema for response_format: 'additionalProperties' is required
+       to be supplied and to be false."
+
+    dan setiap properti WAJIB masuk `required`. Medan yang punya nilai bawaan
+    di Pydantic tidak ikut `required`, jadi tanpa langkah ini hampir semua
+    skema kita ditolak.
+
+    Menandai semuanya wajib aman di sini: seluruh medan `DashboardSpec` memang
+    diharapkan diisi model, dan yang boleh kosong (`subtitle`, `notes`) cukup
+    diisi string kosong.
+
+    Anthropic dan endpoint OpenAI-compatible mode `json_object` TIDAK melewati
+    fungsi ini — keduanya menerima skema apa adanya.
+    """
+    if isinstance(simpul, dict):
+        keluar = {k: _ketatkan_skema(v) for k, v in simpul.items()}
+        if keluar.get("type") == "object" or "properties" in keluar:
+            keluar["additionalProperties"] = False
+            if keluar.get("properties"):
+                keluar["required"] = list(keluar["properties"].keys())
+        return keluar
+    if isinstance(simpul, list):
+        return [_ketatkan_skema(v) for v in simpul]
+    return simpul
+
+
+def _reasoning_effort() -> str:
+    """Petakan `CODER_LLM_THINKING_LEVEL` ke kosakata OpenAI.
+
+    Satu env var untuk tiga penyedia yang menamai hal yang sama dengan cara
+    berbeda: Gemini `thinking_level`, OpenAI `reasoning_effort`. Menyimpan dua
+    env var untuk satu keputusan menjamin keduanya berselisih suatu hari.
+    """
+    peta = {
+        "MINIMAL": "minimal",
+        "LOW": "low",
+        "MEDIUM": "medium",
+        "HIGH": "high",
+    }
+    return peta.get((settings.CODER_LLM_THINKING_LEVEL or "LOW").upper(), "medium")
+
+
 async def _openai(*, system: str, user: str, schema: dict, max_tokens: int,
                   timeout: float) -> HasilKode:
     model = nama_model()
@@ -280,7 +360,7 @@ async def _openai(*, system: str, user: str, schema: dict, max_tokens: int,
             "json_schema": {
                 "name": "dashboard",
                 "strict": True,
-                "schema": schema,
+                "schema": _ketatkan_skema(schema),
             },
         }
     else:
@@ -288,16 +368,26 @@ async def _openai(*, system: str, user: str, schema: dict, max_tokens: int,
         # dijamin, jadi `_ambil_json` yang menanggung sisanya.
         response_format = {"type": "json_object"}
 
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
-        "max_tokens": max_tokens,
-        "temperature": settings.CODER_LLM_TEMPERATURE,
         "response_format": response_format,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
     }
+
+    if _model_penalaran(model):
+        # Keluarga penalaran OpenAI (GPT-5.x, o-series) MENOLAK `max_tokens` dan
+        # `temperature` di /chat/completions — jawabannya 400 dengan pesan
+        # "Unsupported parameter", bukan diabaikan diam-diam. Nama medannya
+        # `max_completion_tokens`, dan kedalaman berpikirnya lewat
+        # `reasoning_effort`, bukan suhu.
+        payload["max_completion_tokens"] = max_tokens
+        payload["reasoning_effort"] = _reasoning_effort()
+    else:
+        payload["max_tokens"] = max_tokens
+        payload["temperature"] = settings.CODER_LLM_TEMPERATURE
 
     async with httpx.AsyncClient(timeout=timeout) as klien:
         r = await klien.post(
@@ -308,7 +398,7 @@ async def _openai(*, system: str, user: str, schema: dict, max_tokens: int,
                 "Content-Type": "application/json",
             },
         )
-        r.raise_for_status()
+        _bangkitkan_galat(r, "OpenAI")
         data = r.json()
 
     pakai = data.get("usage") or {}
