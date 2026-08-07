@@ -145,7 +145,29 @@ async def _stream_founder_with_logging(payload: dict) -> AsyncIterator[str]:
     from app.agents.founder_analytics import run_founder_analytics
 
     llm_call_logs: list[dict] = []
-    session_id: str = payload.get("session_id") or ""
+
+    # `session_id` SENGAJA tidak diteruskan, dan ini bukan kelalaian.
+    #
+    # `llm_call_logs.session_id` punya foreign key ke `chat_sessions` — tabel
+    # jalur ORANG TUA. Sesi founder hidup di `founder_analytics_sessions`, tabel
+    # yang berbeda, jadi mengirimkannya menghasilkan:
+    #
+    #   ForeignKeyViolationError: insert or update on table "llm_call_logs"
+    #   violates foreign key constraint "llm_call_logs_session_id_fkey"
+    #
+    # dan karena satu request memuat SELURUH log satu giliran, satu baris yang
+    # ditolak menjatuhkan semuanya. Akibatnya biaya tiap giliran founder yang
+    # datang dari UI hilang total dari Pusat Biaya — persis mode gagal yang
+    # docstring di bawah ini peringatkan, cuma lewat pintu yang berbeda.
+    #
+    # Terlihat baik-baik saja selama ini karena eval memanggil graph TANPA
+    # session_id: barisnya masuk dengan `session_id` NULL dan lolos. 273 baris
+    # founder di database, semuanya NULL — nol yang berasal dari pemakaian
+    # sungguhan.
+    #
+    # Sesinya tidak hilang, cuma pindah tempat: ia masuk ke `metadata` di bawah,
+    # dan `founder_analytics_messages` tetap memegang kaitan sesi yang sah.
+    sesi_founder: str = payload.get("session_id") or ""
 
     async for event_str in run_founder_analytics(payload):
         yield event_str
@@ -163,7 +185,16 @@ async def _stream_founder_with_logging(payload: dict) -> AsyncIterator[str]:
 
     if llm_call_logs:
         import asyncio
-        asyncio.create_task(send_llm_call_logs(llm_call_logs, session_id))
+
+        # Sesi founder disimpan di metadata, BUKAN di kolom `session_id` —
+        # kolom itu punya FK ke `chat_sessions` milik jalur orang tua.
+        if sesi_founder:
+            for log in llm_call_logs:
+                meta = log.get("metadata") or {}
+                meta["founder_session_id"] = sesi_founder
+                log["metadata"] = meta
+
+        asyncio.create_task(send_llm_call_logs(llm_call_logs, ""))
 
 
 # =============================================================================
