@@ -488,7 +488,7 @@ hilang, dan founder tidak melihat apa pun kecuali grafik biasa.
 - Hindari template literal BERSARANG (backtick di dalam backtick). Kalau butuh
   menyusun HTML, pakai penggabungan string biasa atau
   `document.createElement`.
-- Hitung kurungmu. Kesalahan yang paling sering terjadi adalah `)` atau `}`
+- Hitung kurungmu. Kesalahan yang paling sering terjadi adalah `)` atau `}}`
   yang kurang di akhir blok panjang.
 - Jangan memakai sintaks yang perlu transpilasi. Ini dijalankan apa adanya di
   browser modern — `const`, arrow function, dan template literal sederhana
