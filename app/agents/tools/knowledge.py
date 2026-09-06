@@ -71,7 +71,32 @@ def _get_qdrant_retriever_with_filter(
     return vector_store.as_retriever(search_kwargs=search_kwargs)
 
 
-def _build_is_active_filter(extra_must: Optional[list] = None) -> dict:
+def kunci_fitur_mati(fitur_mati: Optional[list] = None) -> set[str]:
+    """
+    Kunci saklar dari payload `fitur_mati`, tahan bentuk yang tidak terduga.
+
+    Bentuk yang dikirim api adalah `[{"kunci": ..., "label": ...}]`. Entri yang
+    bukan dict, atau tanpa `kunci`, dibuang diam-diam — daftar ini datang lewat
+    HTTP dari layanan lain, dan satu entri cacat tidak boleh menjatuhkan seluruh
+    percakapan. Yang TIDAK boleh terjadi: entri cacat membuat seluruh daftar
+    diabaikan, karena itu membuka kembali fitur yang sedang dimatikan.
+    """
+    keluar: set[str] = set()
+    for f in fitur_mati or []:
+        if isinstance(f, dict):
+            k = f.get("kunci")
+            if isinstance(k, str) and k:
+                keluar.add(k)
+        elif isinstance(f, str) and f:
+            # Toleransi bentuk lama/sederhana kalau suatu saat dikirim begitu.
+            keluar.add(f)
+    return keluar
+
+
+def _build_is_active_filter(
+    extra_must: Optional[list] = None,
+    exclude_features: Optional[set[str]] = None,
+) -> dict:
     """
     Build Qdrant filter that EXCLUDES chunks with metadata.is_active=false.
 
@@ -87,6 +112,16 @@ def _build_is_active_filter(extra_must: Optional[list] = None) -> dict:
     Args:
         extra_must: Additional filter conditions to AND with is_active filter.
                     e.g., [{"key": "metadata.feature", "match": {"value": "mata_peri"}}]
+        exclude_features: Kunci saklar yang sedang DIMATIKAN founder. Dokumen
+                    FAQ milik fitur itu dibuang lewat `must_not`, terpisah dari
+                    `is_active` yang diatur manual per-chunk oleh admin.
+
+    KENAPA `must_not`, BUKAN MEMPERSEMPIT `must`
+    --------------------------------------------
+    `must` menyatakan "hanya yang cocok"; itu jalur `feature_filter` milik LLM,
+    dan LLM memilih paling banyak SATU fitur. Yang dibutuhkan di sini kebalikan
+    arahnya: buang beberapa fitur, biarkan sisanya — termasuk chunk yang tidak
+    punya field `feature` sama sekali (legacy), yang harus tetap terbaca.
 
     Returns:
         Qdrant filter dict ready for `search_kwargs["filter"]`.
@@ -97,6 +132,13 @@ def _build_is_active_filter(extra_must: Optional[list] = None) -> dict:
     must_not_conditions = [
         {"key": "metadata.is_active", "match": {"value": False}}
     ]
+
+    # Saklar founder (6 September 2026). Diurutkan supaya filternya deterministik
+    # dan enak dibaca di jejak Langfuse.
+    for kunci in sorted(exclude_features or ()):
+        must_not_conditions.append(
+            {"key": "metadata.feature", "match": {"value": kunci}}
+        )
 
     filter_dict: dict = {"must_not": must_not_conditions}
     if must_conditions:
@@ -222,10 +264,17 @@ def make_search_dental_knowledge_tool(
 def make_search_app_faq_tool(
     embedding_provider_override: Optional[str] = None,
     embedding_model_override: Optional[str] = None,
+    fitur_mati: Optional[list] = None,
 ):
     """
     Factory: build search_app_faq tool with embedding override closure.
+
+    `fitur_mati` datang dari payload api ([{"kunci", "label"}]). Dokumen FAQ
+    milik fitur yang saklarnya dimatikan dibuang di tingkat RETRIEVAL, bukan
+    dengan menyuruh LLM tidak menyebutnya: dokumen yang tidak pernah masuk ke
+    konteks tidak bisa dikutip, disimpulkan, atau bocor lewat parafrase.
     """
+    _mati = kunci_fitur_mati(fitur_mati)
 
     @tool
     async def search_app_faq(
@@ -294,6 +343,20 @@ def make_search_app_faq_tool(
             )
             feature_filter = None
 
+        # LLM meminta fitur yang justru sedang DIMATIKAN.
+        #
+        # Jangan jatuh ke "cari semua" — itu perilaku untuk filter yang tidak
+        # sah, dan di sini justru membuka apa yang seharusnya ditutup: model
+        # bertanya soal Mata Peri, filternya dibuang, lalu ia menerima dokumen
+        # Mata Peri lewat kemiripan vektor. Kembalikan kosong.
+        if feature_filter and feature_filter in _mati:
+            logger.info(
+                "[tool:search_app_faq] feature_filter=%s sedang dimatikan founder "
+                "— mengembalikan nol dokumen.",
+                feature_filter,
+            )
+            return {"docs": [], "source_count": 0}
+
         async with trace_node(
             name="tool:search_app_faq",
             state=None,
@@ -301,6 +364,7 @@ def make_search_app_faq_tool(
                 "query": query[:300] if isinstance(query, str) else "",
                 "top_k": top_k,
                 "feature_filter": feature_filter,
+                "fitur_mati": sorted(_mati),
             },
         ) as span:
             docs: list[str] = []
@@ -323,7 +387,9 @@ def make_search_app_faq_tool(
 
                 search_kwargs = {
                     "k": top_k,
-                    "filter": _build_is_active_filter(extra_must=extra_must),
+                    "filter": _build_is_active_filter(
+                        extra_must=extra_must, exclude_features=_mati
+                    ),
                 }
                 retriever = _get_qdrant_retriever_with_filter(
                     collection=faq_collection,
@@ -336,7 +402,13 @@ def make_search_app_faq_tool(
                 docs = [doc.page_content for doc in results]
             except Exception as e:
                 logger.warning(f"[tool:search_app_faq] qdrant error: {e}")
-                docs = _get_hardcoded_faq(query)
+                # Jalur cadangan WAJIB ikut disaring.
+                #
+                # `_get_hardcoded_faq` menjelaskan setiap fitur satu per satu —
+                # termasuk yang sedang dimatikan. Menyaring Qdrant saja
+                # meninggalkan pintu yang justru terbuka ketika ada gangguan,
+                # yaitu saat paling sedikit orang memperhatikan.
+                docs = _get_hardcoded_faq(query, exclude_features=_mati)
                 used_fallback = True
 
             if span:
@@ -344,6 +416,7 @@ def make_search_app_faq_tool(
                     "doc_count": len(docs),
                     "used_fallback": used_fallback,
                     "feature_filter_applied": feature_filter,
+                    "fitur_mati_dikecualikan": sorted(_mati),
                     "is_active_filter_applied": True,
                     "docs_preview": [d[:200] for d in docs[:3]],
                     "docs": _safe_dict_for_trace(docs),

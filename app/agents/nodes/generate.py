@@ -332,6 +332,55 @@ def _get_allowed_agents_from_state(state) -> set:
     return set()
 
 
+def _get_fitur_mati_from_state(state) -> list[dict]:
+    """Saklar fitur yang sedang DIMATIKAN founder — [{"kunci", "label"}].
+
+    Jalur lookup-nya meniru `_get_allowed_agents_from_state` di atas persis,
+    karena `generate.py` dipanggil dari dua bentuk state yang berbeda (Pydantic
+    `AgentState` saat invoke langsung, dict legacy di jalur produksi).
+    """
+    if hasattr(state, "get"):
+        top = state.get("fitur_mati")
+        if top:
+            return list(top)
+
+    if hasattr(state, "control"):
+        ctrl = getattr(state.control, "fitur_mati", None)
+        if ctrl:
+            return list(ctrl)
+
+    return []
+
+
+def _nama_fitur_dimatikan(state) -> set[str]:
+    """Nama ramah-pengguna untuk fitur yang dimatikan founder.
+
+    KENAPA LEWAT `AGENT_KEY_TO_FEATURE_NAME`, BUKAN LANGSUNG `label`
+    ---------------------------------------------------------------
+    Daftar "fitur tidak aktif" di prompt disusun dari nama ramah milik REGISTRY
+    TOOL ("Mata Peri (Scan Gigi)", "Rapot Sikat Gigi"), sementara `label` dari
+    api memakai nama produk ("Mata Peri", "Rapot Peri"). Kalau dua kosakata itu
+    dicampur, satu fitur bisa muncul DUA KALI di prompt yang sama dengan dua
+    nama berbeda — dan model menyimpulkan itu dua hal.
+
+    Jadi kuncinya dipetakan lewat registry dulu; `label` cuma dipakai kalau
+    registry tidak mengenalnya (fitur tanpa agent, mis. `dunia_game`).
+    """
+    from app.agents.tools.registry import AGENT_KEY_TO_FEATURE_NAME
+
+    nama: set[str] = set()
+    for f in _get_fitur_mati_from_state(state):
+        if not isinstance(f, dict):
+            continue
+        kunci = f.get("kunci")
+        label = f.get("label")
+        if isinstance(kunci, str) and kunci:
+            nama.add(AGENT_KEY_TO_FEATURE_NAME.get(kunci) or label or kunci)
+        elif isinstance(label, str) and label:
+            nama.add(label)
+    return nama
+
+
 def _get_unavailable_features_for_state(state) -> list[str]:
     """Return list of friendly feature names yang OFF di akun user.
     
@@ -636,6 +685,20 @@ def _build_system_prompt(state: AgentState) -> str:
             if feature and feature not in unavailable_features:
                 unavailable_features = sorted(unavailable_features + [feature])
 
+    # Saklar founder (6 September 2026) — dua sebab, dua kalimat.
+    #
+    # Sesudah `peri-bugi-api` menyaring `allowed_agents` dengan saklar fitur,
+    # daftar "tidak aktif" di bawah menyusut karena DUA alasan yang berbeda:
+    # akun ini memang tidak diberi izin, atau founder mematikan fiturnya untuk
+    # semua orang. Kalimatnya tidak boleh sama — "belum tersedia di akun kamu"
+    # untuk sesuatu yang dimatikan seluruh aplikasi membuat orang tua bertanya
+    # "kenapa akun saya beda?", dan itu pertanyaan yang tidak punya jawaban.
+    dimatikan_founder = _nama_fitur_dimatikan(state)
+    # Fitur yang dimatikan tapi tidak punya tool sama sekali (mis. `dunia_game`)
+    # tetap harus disebut — orang tua bisa menanyakannya walau tak ada agentnya.
+    unavailable_features = sorted(set(unavailable_features) | dimatikan_founder)
+    belum_diizinkan = [f for f in unavailable_features if f not in dimatikan_founder]
+
     if unavailable_features:
         # Build list strings
         available_text = (
@@ -643,7 +706,61 @@ def _build_system_prompt(state: AgentState) -> str:
             if available_features
             else "- (tidak ada — semua fitur sedang tidak aktif)"
         )
-        unavailable_text = "\n".join(f"- {f}" for f in unavailable_features)
+        blok_tidak_aktif = ""
+        if dimatikan_founder:
+            blok_tidak_aktif += (
+                "Fitur yang SEDANG DIMATIKAN SEMENTARA (untuk semua pengguna, "
+                "bukan cuma akun ini):\n"
+                + "\n".join(f"- {f}" for f in sorted(dimatikan_founder))
+                + "\n\n"
+            )
+        if belum_diizinkan:
+            blok_tidak_aktif += (
+                "Fitur yang BELUM tersedia untuk akun ini:\n"
+                + "\n".join(f"- {f}" for f in belum_diizinkan)
+                + "\n\n"
+            )
+        unavailable_text = blok_tidak_aktif.rstrip("\n")
+
+        aturan_satu = (
+            f"1. Kalau user nanya tentang fitur yang SEDANG DIMATIKAN SEMENTARA "
+            f"(atau aspek apapun dari fitur itu — streak, modul, riwayat, scan, "
+            f"badge, kuesioner, dll), bilang fiturnya sedang dirapikan dulu dan "
+            f"nanti muncul lagi. JANGAN bilang 'belum tersedia di akun kamu' — "
+            f"ini berlaku untuk semua pengguna, bukan cuma {user_name}. "
+            f"Contoh: \"{user_name}, fitur [X] lagi kami rapikan dulu ya. Nanti "
+            f"kalau sudah siap, muncul lagi di menu.\" Lalu sarankan fitur yang "
+            f"AKTIF.\n"
+            if dimatikan_founder
+            else ""
+        )
+        aturan_dua = (
+            f"{2 if dimatikan_founder else 1}. Kalau user nanya tentang fitur "
+            f"yang BELUM tersedia untuk akun ini, JAWAB HONEST: \"Maaf "
+            f"{user_name}, saat ini fitur [X] belum tersedia di akun "
+            f"{child_name}.\" Sarankan alternative dari fitur yang AKTIF.\n"
+            if belum_diizinkan
+            else ""
+        )
+
+        # Nomor aturan menyesuaikan berapa banyak kalimat pembuka yang dipakai,
+        # supaya tidak pernah ada dua "2." di daftar yang sama.
+        _n = (1 if dimatikan_founder else 0) + (1 if belum_diizinkan else 0)
+        _contoh = (
+            (
+                f"Contoh respons baik (kalau user nanya fitur yang sedang dimatikan):\n"
+                f'"{user_name}, fitur [nama fitur] lagi kami rapikan dulu ya. Nanti '
+                f"kalau sudah siap, muncul lagi di menu. Sementara ini Peri masih "
+                f'bisa bantu untuk yang lain ya! 🧚✨"\n'
+            )
+            if dimatikan_founder
+            else (
+                f"Contoh respons baik (kalau user nanya feature OFF):\n"
+                f'"Maaf {user_name}, saat ini fitur [nama fitur] belum tersedia di '
+                f"akun {child_name}. Tapi Peri masih bisa bantu untuk fitur lain "
+                f'yang aktif ya! 🧚✨"\n'
+            )
+        )
 
         system += (
             f"\n\n⚠️ INFO PENTING — TOOLS YANG TERSEDIA UNTUK USER INI:\n"
@@ -651,30 +768,25 @@ def _build_system_prompt(state: AgentState) -> str:
             f"Fitur yang AKTIF (kamu bisa panggil tool / jawab pakai data):\n"
             f"{available_text}\n"
             f"\n"
-            f"Fitur yang TIDAK AKTIF (BELUM tersedia untuk akun ini):\n"
             f"{unavailable_text}\n"
             f"\n"
             f"ATURAN MUTLAK:\n"
-            f"1. Kalau user nanya tentang fitur yang TIDAK AKTIF (atau aspek apapun "
-            f"dari fitur itu — streak, modul, riwayat, scan, badge, kuesioner, dll), "
-            f"JAWAB HONEST: \"Maaf {user_name}, saat ini fitur [X] belum tersedia "
-            f"di akun {child_name}.\" Sarankan alternative dari fitur yang AKTIF.\n"
-            f"2. JANGAN karang/halusinasi data fitur yang TIDAK AKTIF (streak X hari, "
-            f"modul Y selesai, scan Z, badge yang dapat, dll). Kamu TIDAK PUNYA data "
-            f"current untuk fitur OFF.\n"
-            f"3. JANGAN sebut alasan teknis (admin, allowed_agents, gated, off, dll) "
-            f"— cukup bilang 'belum tersedia'.\n"
-            f"4. Kalau user nanya tentang fitur AKTIF, jawab normal pakai data dari "
-            f"tool call atau konteks yang tersedia.\n"
-            f"5. PENTING: Walaupun di 'Ringkasan percakapan sebelumnya' (DI BAWAH) "
-            f"ada info tentang fitur OFF dari session lama (e.g., 'Modul 4 terkunci', "
-            f"'streak X hari'), JANGAN gunakan sebagai DATA CURRENT. Itu cuma "
-            f"context historis dari session lama; fitur-nya sekarang OFF.\n"
+            f"{aturan_satu}"
+            f"{aturan_dua}"
+            f"{_n + 1}. JANGAN karang/halusinasi data fitur yang TIDAK AKTIF "
+            f"(streak X hari, modul Y selesai, scan Z, badge yang dapat, dll). "
+            f"Kamu TIDAK PUNYA data current untuk fitur OFF.\n"
+            f"{_n + 2}. JANGAN sebut alasan teknis (admin, allowed_agents, gated, "
+            f"off, saklar, toggle, founder, dll) — cukup kalimat biasa.\n"
+            f"{_n + 3}. Kalau user nanya tentang fitur AKTIF, jawab normal pakai "
+            f"data dari tool call atau konteks yang tersedia.\n"
+            f"{_n + 4}. PENTING: Walaupun di 'Ringkasan percakapan sebelumnya' "
+            f"(DI BAWAH) ada info tentang fitur OFF dari session lama (e.g., "
+            f"'Modul 4 terkunci', 'streak X hari'), JANGAN gunakan sebagai DATA "
+            f"CURRENT. Itu cuma context historis dari session lama; fitur-nya "
+            f"sekarang OFF.\n"
             f"\n"
-            f"Contoh respons baik (kalau user nanya feature OFF):\n"
-            f"\"Maaf {user_name}, saat ini fitur [nama fitur] belum tersedia di akun "
-            f"{child_name}. Tapi Peri masih bisa bantu untuk fitur lain yang aktif "
-            f"ya! 🧚✨\"\n"
+            f"{_contoh}"
         )
 
     # ── Memory context (L2 + L3) ──────────────────────────────────────────────

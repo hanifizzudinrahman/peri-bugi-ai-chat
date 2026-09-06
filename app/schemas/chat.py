@@ -48,6 +48,21 @@ class ChatRequest(BaseModel):
             "seperti sebelum Text-to-SQL ada."
         ),
     )
+    fitur_mati: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "Saklar fitur yang sedang DIMATIKAN founder, bentuk "
+            "[{'kunci': 'mata_peri', 'label': 'Mata Peri'}]. Diputuskan di "
+            "peri-bugi-api; repo ini tidak pernah membaca /features sendiri "
+            "dan tidak menyimpan daftar kunci fitur. "
+            "Label ikut dikirim SENGAJA: kalau repo ini menerjemahkan kunci "
+            "jadi label sendiri, ia butuh daftar cermin yang basi begitu ada "
+            "fitur ke-13. Dengan bentuk ini, menambah fitur cukup menyentuh "
+            "peri-bugi-api. "
+            "Default kosong supaya versi api yang belum mengirimnya "
+            "berperilaku persis seperti sebelum saklar ini ada."
+        ),
+    )
     image_url: Optional[str] = None
     image_url_public: Optional[str] = Field(
         default=None,
