@@ -188,6 +188,33 @@ def _build_system_prompt(state: AgentState, tools: Optional[list] = None) -> str
     return result
 
 
+def _nama_fitur_dimatikan(state: AgentState) -> set[str]:
+    """Nama ramah-pengguna untuk fitur yang saklarnya dimatikan founder.
+
+    Kembarannya ada di `nodes/generate.py`. Sengaja tidak dipakai bersama lewat
+    satu helper: kedua node membaca bentuk state yang berbeda (node ini selalu
+    `AgentState` Pydantic, `generate.py` juga menerima dict legacy), dan
+    menyatukannya berarti salah satu harus menebak bentuk yang bukan miliknya.
+    """
+    try:
+        from app.agents.tools.registry import AGENT_KEY_TO_FEATURE_NAME
+
+        nama: set[str] = set()
+        for f in getattr(state.control, "fitur_mati", None) or []:
+            if not isinstance(f, dict):
+                continue
+            kunci = f.get("kunci")
+            label = f.get("label")
+            if isinstance(kunci, str) and kunci:
+                nama.add(AGENT_KEY_TO_FEATURE_NAME.get(kunci) or label or kunci)
+            elif isinstance(label, str) and label:
+                nama.add(label)
+        return nama
+    except Exception as e:  # pragma: no cover - defensif, sama pola tetangganya
+        logger.warning(f"[_nama_fitur_dimatikan] Failed: {e}")
+        return set()
+
+
 def _get_unavailable_features(state: AgentState) -> list[str]:
     """Get list of feature names yang OFF di allowed_agents.
     
@@ -250,10 +277,24 @@ def _build_tool_guard(tools: Optional[list], state: AgentState) -> str:
     for name in available_tool_names:
         guard += f"  ✓ {name}\n"
     
-    if unavailable_features:
-        features_list = ", ".join(sorted(unavailable_features))
+    # Saklar founder (6 September 2026) — sebutkan sebabnya, karena kalimat
+    # yang dipilih model berbeda untuk dua sebab itu. Sama seperti pemisahan di
+    # `nodes/generate.py`; kalau yang ini tidak ikut, node pemilih tool
+    # menyuruh model bilang "belum tersedia di akun kamu" sementara node
+    # penjawab menyuruhnya bilang "sedang dirapikan".
+    dimatikan = _nama_fitur_dimatikan(state)
+    belum_diizinkan = [f for f in sorted(unavailable_features) if f not in dimatikan]
+
+    if dimatikan:
         guard += (
-            f"\nFitur yang TIDAK AKTIF di akun user ini: {features_list}\n"
+            f"\nFitur yang SEDANG DIMATIKAN SEMENTARA (semua pengguna, bukan cuma "
+            f"akun ini): {', '.join(sorted(dimatikan))}\n"
+            f"Tools-nya TIDAK ADA di list di atas dan TIDAK BOLEH dipanggil.\n"
+        )
+    if belum_diizinkan:
+        guard += (
+            f"\nFitur yang BELUM tersedia di akun user ini: "
+            f"{', '.join(belum_diizinkan)}\n"
             f"Tools-nya TIDAK ADA di list di atas dan TIDAK BOLEH dipanggil.\n"
         )
     

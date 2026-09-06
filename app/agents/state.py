@@ -65,6 +65,17 @@ class AgentControl(BaseModel):
     #: tools | hybrid | sql — diputuskan di api, dipakai make_tools() untuk
     #: menentukan apakah query_family_data ikut dirakit di turn ini.
     data_strategy: str = "tools"
+    #: Saklar fitur yang sedang dimatikan founder — [{"kunci", "label"}].
+    #:
+    #: `allowed_agents` di atas SUDAH disaring api, jadi tool-nya memang tidak
+    #: dirakit. Daftar ini perlu untuk dua hal yang tidak bisa disimpulkan dari
+    #: penyaringan itu:
+    #:   1. menyaring dokumen FAQ di retrieval Qdrant (`metadata.feature`)
+    #:   2. memilih KALIMAT — "sedang dirapikan" untuk fitur yang dimatikan,
+    #:      "belum tersedia di akun ini" untuk yang memang tidak diberi izin
+    #: Tanpa ini keduanya terlihat sama, dan orang tua bertanya "kenapa akun
+    #: saya beda?"
+    fitur_mati: list[dict] = Field(default_factory=list)
 
 
 class MemorySnapshot(BaseModel):

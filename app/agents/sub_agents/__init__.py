@@ -249,8 +249,18 @@ async def app_faq_agent(state: AgentState) -> dict[str, Any]:
         return {"docs": docs, "source_count": len(docs)}
 
 
-def _get_hardcoded_faq(query: str) -> list[str]:
-    """FAQ hardcoded sebagai fallback saat Qdrant collection kosong."""
+def _get_hardcoded_faq(
+    query: str, exclude_features: set[str] | None = None
+) -> list[str]:
+    """FAQ hardcoded sebagai fallback saat Qdrant collection kosong.
+
+    `exclude_features` adalah kunci saklar yang sedang DIMATIKAN founder.
+
+    Kenapa jalur ini ikut disaring: butir di bawah menjelaskan setiap fitur
+    satu per satu, dengan namanya. Menyaring Qdrant saja meninggalkan pintu
+    yang justru terbuka ketika Qdrant bermasalah -- yaitu saat paling sedikit
+    orang memperhatikan, dan saat jawaban yang salah paling sulit dilacak.
+    """
     faq_items = [
         "Rapot Peri adalah fitur untuk memantau kebiasaan sikat gigi anak setiap hari. "
         "Orang tua bisa checklist pagi dan malam untuk melacak streak sikat gigi.",
@@ -282,6 +292,47 @@ def _get_hardcoded_faq(query: str) -> list[str]:
         "Streak sikat gigi akan reset ke 0 jika melewatkan 1 hari tanpa checklist. "
         "Pastikan checklist pagi dan malam setiap hari.",
     ]
+
+    # Pemilik tiap butir, sejajar dengan `faq_items` di atas. `None` = butir
+    # lintas fitur (daftar, sandi, PWA, data anak) yang tidak pernah dimatikan.
+    #
+    # Ditulis sebagai daftar sejajar, bukan tuple berpasangan, supaya perubahan
+    # di `faq_items` yang lupa disusul di sini langsung terlihat panjangnya
+    # tidak sama -- dan `assert` di bawah menangkapnya.
+    pemilik: list[str | None] = [
+        "rapot_peri",   # 0 - tracking sikat gigi
+        "mata_peri",    # 1 - scan gigi
+        "tanya_peri",   # 2 - chatbot ini sendiri
+        "janji_peri",   # 3 - booking dokter
+        "cerita_peri",  # 4 - modul cerita
+        None,           # 5 - cara mendaftar
+        None,           # 6 - lupa password
+        None,           # 7 - PWA / alamat aplikasi
+        None,           # 8 - ubah data anak
+        "rapot_peri",   # 9 - aturan streak
+    ]
+    assert len(pemilik) == len(faq_items), (
+        "Daftar pemilik FAQ hardcoded tidak sejajar dengan isinya. "
+        "Menambah butir tanpa menambah pemiliknya membuat butir itu lolos "
+        "penyaringan saklar fitur."
+    )
+
+    mati = exclude_features or set()
+    if mati:
+        faq_items = [
+            butir
+            for butir, milik in zip(faq_items, pemilik)
+            if milik not in mati
+        ]
+        # Peta kata kunci di bawah menunjuk INDEKS lama, jadi ia tidak bisa
+        # dipakai lagi setelah daftarnya menyusut. Untuk jalur cadangan yang
+        # memang kasar, pencocokan kata kunci sederhana atas isi butir sudah
+        # cukup -- dan lebih jujur daripada indeks yang bergeser diam-diam.
+        query_lower = query.lower()
+        cocok = [b for b in faq_items if any(
+            k in b.lower() for k in query_lower.split() if len(k) > 3
+        )]
+        return (cocok or faq_items)[:3]
 
     query_lower = query.lower()
     relevant = []

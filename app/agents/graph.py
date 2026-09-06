@@ -118,6 +118,7 @@ def build_initial_state(request: ChatRequest) -> AgentState:
         allowed_agents=request.allowed_agents or [],
         agent_configs=request.agent_configs or {},
         data_strategy=getattr(request, "data_strategy", None) or "tools",
+        fitur_mati=list(getattr(request, "fitur_mati", None) or []),
     )
 
     memory = MemorySnapshot(**(request.memory_context or {}))

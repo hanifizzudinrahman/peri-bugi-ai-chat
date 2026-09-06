@@ -147,9 +147,15 @@ def make_tools(state: AgentState) -> list[Any]:
         ))
 
     if "app_faq" in allowed:
+        # Saklar fitur (6 September 2026). `app_faq` sendiri lintas fitur dan
+        # tidak pernah dimatikan — yang disaring ISINYA. Tanpa ini, Mata Peri
+        # dimatikan tapi orang tua yang bertanya "gimana cara scan gigi?" tetap
+        # dijawab lengkap dengan langkah-langkahnya, ke fitur yang menunya
+        # sudah lenyap.
         tools.append(make_search_app_faq_tool(
             embedding_provider_override=rnd_emb_provider,
             embedding_model_override=rnd_emb_model,
+            fitur_mati=list(getattr(state.control, "fitur_mati", None) or []),
         ))
 
     # ── User profile tool (gated by user_profile) ────────────────────────────

@@ -116,6 +116,12 @@ def _build_legacy_dict_state(state: AgentState) -> dict:
         "source": state.session.source,
         # Control
         "allowed_agents": state.control.allowed_agents,
+        # Saklar founder (6 September 2026). Ikut dibawa ke state legacy
+        # karena `generate.py` memakai jalur ini di produksi, dan tanpa
+        # daftarnya kalimat "sedang dirapikan" jatuh kembali ke "belum
+        # tersedia di akun ini" -- benar secara mesin, salah untuk yang
+        # membacanya.
+        "fitur_mati": list(getattr(state.control, "fitur_mati", None) or []),
         "agent_configs": state.control.agent_configs,
         "response_mode": state.session.response_mode,
         "memory_context": state.memory.model_dump(),
