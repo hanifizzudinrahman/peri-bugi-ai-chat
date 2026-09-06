@@ -122,6 +122,40 @@ yang longgar cuma menyulitkan parser.
 Jalur Tanya Peri **tidak** disentuh dan masih memakai LangChain. Penyatuannya
 menunggu upgrade tumpukan — utang tercatat di workspace `docs/OPEN_ITEMS.md`.
 
+## Saklar fitur founder — repo ini menerima fakta, bukan mencarinya
+
+`ChatRequest.fitur_mati: [{"kunci", "label"}]` datang dari `peri-bugi-api`.
+Repo ini **tidak pernah** membaca `/features`, tidak menyimpan daftar kunci
+fitur, dan tidak menerjemahkan kunci jadi label sendiri — label ikut dikirim
+supaya menambah fitur ke-13 cukup menyentuh repo sebelah. Polanya sama dengan
+`data_strategy` dan `allow_dashboard`.
+
+Tiga tempat yang membacanya:
+
+| Tempat | Yang dilakukan |
+| --- | --- |
+| `tools/knowledge.py` | `must_not` pada `metadata.feature` saat retrieval FAQ. Kalau LLM sendiri meminta `feature_filter` fitur yang mati, tool mengembalikan NOL dokumen — bukan jatuh ke "cari semua", karena itu justru membuka apa yang seharusnya ditutup |
+| `sub_agents/__init__.py` | `_get_hardcoded_faq` ikut disaring. Daftar itu menjelaskan setiap fitur satu per satu, dan ia dipakai justru ketika Qdrant bermasalah — pintu yang terbuka saat paling sedikit orang memperhatikan |
+| `nodes/generate.py` + `nodes/agent.py` | memisahkan "sedang dimatikan sementara" dari "belum tersedia di akun ini". Dua sebab, dua kalimat |
+
+`allowed_agents` sendiri **sudah** disaring di api, jadi tool fitur yang mati
+memang tidak dirakit. `fitur_mati` perlu untuk dua hal yang tidak bisa
+disimpulkan dari penyaringan itu: menyaring dokumen, dan memilih kalimat.
+
+Nama fitur di prompt diambil lewat `AGENT_KEY_TO_FEATURE_NAME` dulu, baru
+`label`. Mencampur dua kosakata ("Mata Peri (Scan Gigi)" dari registry vs "Mata
+Peri" dari api) membuat satu fitur muncul dua kali dengan dua nama, dan model
+menyimpulkan itu dua hal.
+
+> ⚠️ **Cacat lama yang belum dibereskan, ditemukan 6 September 2026:** blok
+> "fitur tidak aktif" kadang menyatakan fitur yang HIDUP sebagai "belum
+> tersedia di akun". Prompt jelas mencantumkannya di daftar AKTIF, retrieval
+> mengembalikan dokumennya dengan benar, dan model tetap menolak. **Bisa
+> direproduksi di `main` tanpa perubahan apa pun** — bukan dari pekerjaan
+> saklar. Kandidat pertama: blok injeksi selektif `mata_peri_last_result` yang
+> bernilai `None` untuk akun tanpa riwayat scan. Selama ini belum dibereskan,
+> seluruh blok itu tidak sepenuhnya bisa dipercaya.
+
 ## Integrasi dengan Mata Peri
 Tool `analyze_chat_image` meneruskan foto ke `peri-bugi-ai-cv` lewat `peri-bugi-api`.
 Hasilnya masuk sebagai konteks terstruktur (`structured_report`) yang di-*rephrase*
